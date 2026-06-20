@@ -1,91 +1,10 @@
-// import { fetch } from 'wix-fetch';
-// import { getISendConfig } from 'backend/isendConfig';
-// function trimTrailingSlash(value) {
-//   return String(value || '').replace(/\/+$/, '');
-// }
-// function getBaseUrl(config) {
-//   return trimTrailingSlash(config.sandboxUrl);
-// }
-// async function postJson(url, body, headers = {}) {
-//   const response = await fetch(url, {
-//     method: 'POST',
-//     headers: {
-//       'Content-Type': 'application/json',
-//       ...headers,
-//     },
-//     body: JSON.stringify(body),
-//   });
-//   const text = await response.text();
-//   let data;
-//   try {
-//     data = text ? JSON.parse(text) : {};
-//   } catch (error) {
-//     throw new Error(`iStore iSend returned non-JSON response (${response.status}): ${text.slice(0, 300)}`);
-//   }
-//   if (!response.ok) {
-//     throw new Error(`iStore iSend HTTP ${response.status}: ${JSON.stringify(data)}`);
-//   }
-//   return data;
-// }
-// export async function loginToISend() {
-//   const config = await getISendConfig();
-//   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/Public/login/`;
-//   const data = await postJson(url, {
-//     userNo: config.userNo,
-//     userPassword: config.userPassword,
-//   });
-//   if (data.success && data.returnObject) {
-//     return data.returnObject;
-//   }
-//   throw new Error(`iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`);
-// }
-// export async function testISendLogin() {
-//   const session = await loginToISend();
-//   return {
-//     success: true,
-//     hasSessionId: Boolean(session.sessionId),
-//     hasSessionPassword: Boolean(session.sessionPassword),
-//     checkedAt: new Date().toISOString(),
-//   };
-// }
-// function getShippingDetails(order) {
-//   const shippingInfo = order.shippingInfo || {};
-//   return shippingInfo.shipmentDetails || shippingInfo.shippingDetails || {};
-// }
-// function getLineItems(order) {
-//   return order.lineItems || order.items || [];
-// }
-// function mapOrderToISend(order, config) {
-//   const shipping = getShippingDetails(order);
-//   const lineItems = getLineItems(order);
-//   const orderId = order._id || order.id || order.number;
-//   return {
-//     storageClientNo: config.storageClientNo,
-//     orderOrigin: config.orderOrigin,
-//     userId: config.userId,
-//     orderId,
-//     orderNumber: order.number ? String(order.number) : String(orderId),
-//     orderSource: config.orderSource,
-//     orderDate: new Date().toLocaleDateString('en-GB'),
-//     orderStatus: 'PROCESSING',
-//     clickAndCollectFlag: false,
-//     codFlag: false,
-//     consigneeName: shipping.fullName || `${shipping.firstName || ''} ${shipping.lastName || ''}`.trim(),
-//     consigneeEmail: shipping.email || order.buyerInfo?.email || '',
-//     consigneePhone: shipping.phone || order.buyerInfo?.phone || '',
-//     address1: shipping.addressLine1 || shipping.address?.addressLine || '',
-//     address2: shipping.addressLine2 || '',
-//     city: shipping.city || shipping.address?.city || '',
-//     state: shipping.subdivision || shipping.address?.subdivision || '',
-//     postCode: shipping.zipCode || shipping.postalCode || shipping.address?.postalCode || '',
-//     country: shipping.country || shipping.address?.country || '',
-//     orderItemList: lineItems.map((item) => ({
-//       sku: item.sku || item.catalogReference?.catalogItemId || item.productId,
-//       itemNo: item.sku || item.catalogReference?.catalogItemId || item.productId,
-//       quantity: Number(item.quantity || 1),
-//     })),
 import { fetch } from 'wix-fetch';
 import { getISendConfig } from 'backend/isendConfig';
+
+const MYT_OFFSET_MINUTES = 8 * 60;
+const SERVICE_START_HOUR_MYT = 9;
+const SERVICE_END_HOUR_MYT = 23;
+const REQUEST_TIMEOUT_MS = 20000;
 
 function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
@@ -95,16 +14,49 @@ function getBaseUrl(config) {
   return trimTrailingSlash(config.sandboxUrl);
 }
 
+function getMytDate(now) {
+  const utcMillis = now.getTime() + now.getTimezoneOffset() * 60000;
+  return new Date(utcMillis + MYT_OFFSET_MINUTES * 60000);
+}
+
+function isWithinISendServiceWindow(now) {
+  const mytDate = getMytDate(now || new Date());
+  const hour = mytDate.getHours();
+  return hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT;
+}
+
+function getServiceWindowStatus(now) {
+  const checkedAt = now || new Date();
+  const mytDate = getMytDate(checkedAt);
+  return {
+    timezone: 'MYT',
+    serviceStart: '09:00',
+    serviceEnd: '23:00',
+    checkedAt: checkedAt.toISOString(),
+    checkedAtMYT: mytDate.toISOString().replace('Z', '+08:00'),
+    withinServiceWindow: isWithinISendServiceWindow(checkedAt),
+  };
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  return Promise.race([
+    promise,
+    new Promise((resolve, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]);
+}
+
 async function postJson(url, body, headers = {}) {
   const requestHeaders = Object.assign({
     'Content-Type': 'application/json',
   }, headers);
 
-  const response = await fetch(url, {
+  const response = await withTimeout(fetch(url, {
     method: 'POST',
     headers: requestHeaders,
     body: JSON.stringify(body),
-  });
+  }), REQUEST_TIMEOUT_MS, 'iStore iSend request');
 
   const text = await response.text();
   let data;
@@ -136,13 +88,26 @@ export async function loginToISend() {
   throw new Error(`iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`);
 }
 
-export async function testISendLogin() {
+export async function testISendLogin(options = {}) {
+  const serviceWindow = getServiceWindowStatus(new Date());
+
+  if (!serviceWindow.withinServiceWindow && !options.force) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'Outside iStore iSend service window',
+      serviceWindow,
+    };
+  }
+
   const session = await loginToISend();
   return {
     success: true,
+    skipped: false,
     hasSessionId: Boolean(session.sessionId),
     hasSessionPassword: Boolean(session.sessionPassword),
     checkedAt: new Date().toISOString(),
+    serviceWindow,
   };
 }
 
@@ -215,6 +180,16 @@ function mapOrderToISend(order, config) {
 }
 
 export async function sendOrderToISend(order) {
+  const serviceWindow = getServiceWindowStatus(new Date());
+  if (!serviceWindow.withinServiceWindow) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'Outside iStore iSend service window',
+      serviceWindow,
+    };
+  }
+
   const config = await getISendConfig();
   const session = await loginToISend();
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WebApiOrder/doAddWebApiOrder`;
@@ -227,6 +202,16 @@ export async function sendOrderToISend(order) {
 }
 
 export async function getTrackingInfo(customerOrderNo) {
+  const serviceWindow = getServiceWindowStatus(new Date());
+  if (!serviceWindow.withinServiceWindow) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'Outside iStore iSend service window',
+      serviceWindow,
+    };
+  }
+
   const config = await getISendConfig();
   const session = await loginToISend();
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WhseOrder/doQueryOrderPage`;
