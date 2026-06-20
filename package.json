@@ -8,6 +8,7 @@
   "scripts": {
     "postinstall": "wix sync-types",
     "dev": "wix dev",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "check:isend": "node scripts/check-isend.js"
   }
 }

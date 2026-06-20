@@ -60,7 +60,11 @@ import { testISendLogin } from 'backend/isendService';
 
 export async function get_testISendLoginFromWix(request) {
   try {
-    const result = await testISendLogin();
+    const rawEnv = request && request.query && request.query.env ? (Array.isArray(request.query.env) ? request.query.env[0] : request.query.env) : '';
+    const env = String(rawEnv || '').toLowerCase();
+    const useSandbox = !(env === 'production' || env === 'prod');
+
+    const result = await testISendLogin({ useSandbox });
     return ok({
       headers: {
         'Content-Type': 'application/json',

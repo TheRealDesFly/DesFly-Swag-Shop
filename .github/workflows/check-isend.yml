@@ -1,0 +1,35 @@
+name: Check iSend connectivity
+
+on:
+  schedule:
+    # every 30 minutes (UTC)
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+
+jobs:
+  check-isend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run iSend connectivity check
+        env:
+          ISTORE_ISEND_API_USER_ID: ${{ secrets.ISTORE_ISEND_API_USER_ID }}
+          ISTORE_ISEND_API_PASSWORD: ${{ secrets.ISTORE_ISEND_API_PASSWORD }}
+          ISTORE_ISEND_SANDBOX_URL: ${{ secrets.ISTORE_ISEND_SANDBOX_URL }}
+          ISTORE_ISEND_PRODUCTION_URL: ${{ secrets.ISTORE_ISEND_PRODUCTION_URL }}
+          CHECK_ISEND_TIMEOUT: ${{ secrets.CHECK_ISEND_TIMEOUT }}
+        run: |
+          npm run check:isend --silent

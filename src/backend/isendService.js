@@ -121,8 +121,8 @@ async function postJson(url, body, headers = {}) {
   return data;
 }
 
-export async function loginToISend() {
-  const config = await getISendConfig();
+export async function loginToISend(options = {}) {
+  const config = await getISendConfig(options);
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/Public/login/`;
   const data = await postJson(url, {
     userNo: config.userNo,
@@ -136,8 +136,8 @@ export async function loginToISend() {
   throw new Error(`iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`);
 }
 
-export async function testISendLogin() {
-  const session = await loginToISend();
+export async function testISendLogin(options = {}) {
+  const session = await loginToISend(options);
   return {
     success: true,
     hasSessionId: Boolean(session.sessionId),
