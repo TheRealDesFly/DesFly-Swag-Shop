@@ -1,3 +1,8 @@
+/**
+ * Backend service module for iStore iSend integration.
+ * This module logs into iSend, converts Wix orders into iSend payloads,
+ * sends orders to iSend, and retrieves tracking/status information.
+ */
 import { fetch } from 'wix-fetch';
 import { getISendConfig } from 'backend/isendConfig';
 
@@ -6,26 +11,47 @@ const SERVICE_START_HOUR_MYT = 9;
 const SERVICE_END_HOUR_MYT = 23;
 const REQUEST_TIMEOUT_MS = 20000;
 
+/**
+ * Remove any trailing slashes from a URL string.
+ * This avoids duplicate slashes when building endpoint URLs.
+ */
 function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
 }
 
+/**
+ * Return the configured base URL for iSend API calls.
+ * The current implementation always uses sandboxUrl.
+ */
 function getBaseUrl(config) {
 
   return trimTrailingSlash(config.sandboxUrl);
 }
 
+/**
+ * Convert a JavaScript Date to Malaysia Time (MYT).
+ * iSend service windows are defined in MYT, so this helper
+ * keeps the service window checks consistent.
+ */
 function getMytDate(now) {
   const utcMillis = now.getTime() + now.getTimezoneOffset() * 60000;
   return new Date(utcMillis + MYT_OFFSET_MINUTES * 60000);
 }
 
+/**
+ * Return true when the current time is within iSend's service window.
+ * This helps avoid calls outside supported operating hours.
+ */
 function isWithinISendServiceWindow(now) {
   const mytDate = getMytDate(now || new Date());
   const hour = mytDate.getHours();
   return hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT;
 }
 
+/**
+ * Build a status object describing the current service window state.
+ * This is useful for diagnostic responses and skipped operations.
+ */
 function getServiceWindowStatus(now) {
   const checkedAt = now || new Date();
   const mytDate = getMytDate(checkedAt);
@@ -39,6 +65,9 @@ function getServiceWindowStatus(now) {
   };
 }
 
+/**
+ * Wrap a promise with a timeout so requests do not hang forever.
+ */
 function withTimeout(promise, timeoutMs, label) {
   return Promise.race([
     promise,
@@ -48,6 +77,10 @@ function withTimeout(promise, timeoutMs, label) {
   ]);
 }
 
+/**
+ * Send a POST request to iSend with JSON payload and parse the response.
+ * Throws an error for non-OK responses or invalid JSON.
+ */
 async function postJson(url, body, headers = {}) {
   const requestHeaders = Object.assign({
     'Content-Type': 'application/json',
@@ -74,6 +107,10 @@ async function postJson(url, body, headers = {}) {
   return data;
 }
 
+/**
+ * Log in to iSend to obtain a session token.
+ * The returned session data is required for all subsequent iSend calls.
+ */
 export async function loginToISend() {
   const config = await getISendConfig();
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/Public/login/`;
@@ -89,6 +126,10 @@ export async function loginToISend() {
   throw new Error(`iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`);
 }
 
+/**
+ * Test whether the iSend API credentials are valid.
+ * This endpoint also skips the call outside the service window unless forced.
+ */
 export async function testISendLogin(options = {}) {
   const serviceWindow = getServiceWindowStatus(new Date());
 
@@ -112,11 +153,17 @@ export async function testISendLogin(options = {}) {
   };
 }
 
+/**
+ * Normalize different shipping field formats into a single object.
+ */
 function getShippingDetails(order) {
   const shippingInfo = order.shippingInfo || {};
   return shippingInfo.shipmentDetails || shippingInfo.shippingDetails || {};
 }
 
+/**
+ * Normalize different line item fields into a list.
+ */
 function getLineItems(order) {
   return order.lineItems || order.items || [];
 }
@@ -146,6 +193,10 @@ function getItemSku(item) {
   return item.sku || getCatalogItemId(item) || item.productId || '';
 }
 
+/**
+ * Convert a Wix order object into the format expected by iSend.
+ * This function normalizes shipping and item fields into a single payload.
+ */
 function mapOrderToISend(order, config) {
   const shipping = getShippingDetails(order);
   const lineItems = getLineItems(order);
@@ -180,6 +231,10 @@ function mapOrderToISend(order, config) {
   };
 }
 
+/**
+ * Send a Wix order to iSend by creating a new order in the iSend system.
+ * Returns the raw iSend response so the caller can inspect success or failure.
+ */
 export async function sendOrderToISend(order) {
   const serviceWindow = getServiceWindowStatus(new Date());
   if (!serviceWindow.withinServiceWindow) {
@@ -202,6 +257,9 @@ export async function sendOrderToISend(order) {
   });
 }
 
+/**
+ * Query iSend for tracking and order status information for a given customer order number.
+ */
 export async function getTrackingInfo(customerOrderNo) {
   const serviceWindow = getServiceWindowStatus(new Date());
   if (!serviceWindow.withinServiceWindow) {

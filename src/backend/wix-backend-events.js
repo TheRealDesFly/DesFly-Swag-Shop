@@ -1,3 +1,8 @@
+/**
+ * Wix Stores backend event handlers.
+ * This file contains functions that are triggered by Wix store events,
+ * such as when a new order is placed.
+ */
 import { sendOrderToISend } from 'backend/isendService';
 
 export async function wixStores_onNewOrder(event) {

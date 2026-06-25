@@ -35,6 +35,14 @@ function parseArgs() {
   return opts;
 }
 
+/**
+ * Send a POST request with JSON payload and return the parsed response.
+ * This helper is used by the CLI to call the iSend login endpoint.
+ */
+/**
+ * Send a POST request to the iSend login endpoint and parse the JSON response.
+ * The CLI uses this helper to verify credentials for staging or production instances.
+ */
 function postJson(urlString, body, timeout) {
   return new Promise((resolve, reject) => {
     let parsed;
@@ -96,6 +104,10 @@ async function checkLogin(baseUrl, user, pass, timeout) {
   }
 }
 
+/**
+ * Main CLI entrypoint.
+ * It reads command-line flags, validates required credentials, and checks staging/production login endpoints.
+ */
 (async function main() {
   const opts = parseArgs();
   const env = (opts.env || 'both').toLowerCase();

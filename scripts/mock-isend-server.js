@@ -1,5 +1,9 @@
 const http = require('http');
 
+/**
+ * Simple mock server for iSend login requests.
+ * Useful for local testing when the real iSend API is unavailable.
+ */
 const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url.startsWith('/IsisWMS-War/Json/Public/login')) {
     const chunks = [];

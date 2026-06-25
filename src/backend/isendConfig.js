@@ -9,6 +9,10 @@ const SECRET_NAMES = {
   productionUrl: 'ISTORE_ISEND_PRODUCTION_URL',
 };
 
+/**
+ * Read a Wix secret and fail if the secret is missing.
+ * The secrets store is used for sensitive values like API usernames and passwords.
+ */
 async function readRequiredSecret(name) {
   const value = await getSecret(name);
   if (!value) {

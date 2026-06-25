@@ -19,6 +19,7 @@ To set up your local environment and start coding locally, do the following:
 1. Clone the repo by running `git clone <your-repository-url>`.
 1. Navigate to the repo's directory by running `cd <directory-name>`.
 1. Install the repo's dependencies by running `npm install` or `yarn install`.
+1. If you need refreshed Wix type definitions, run `npm run sync-types` from an interactive terminal.
 1. Install the Wix CLI by running `npm install -g @wix/cli` or `yarn global add @wix/cli`.  
    Once you've installed the CLI globally, you can use it with any Wix site's repo.
 
