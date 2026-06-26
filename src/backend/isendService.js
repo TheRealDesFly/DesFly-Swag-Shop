@@ -9,7 +9,8 @@ import { getISendConfig } from 'backend/isendConfig';
 const MYT_OFFSET_MINUTES = 8 * 60;
 const SERVICE_START_HOUR_MYT = 9;
 const SERVICE_END_HOUR_MYT = 23;
-const REQUEST_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = 60000;
+
 
 /**
  * Remove any trailing slashes from a URL string.
