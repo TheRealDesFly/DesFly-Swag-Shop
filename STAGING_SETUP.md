@@ -36,6 +36,12 @@ Check whether local configuration is present:
 npm run check:staging:setup
 ```
 
+Run redacted endpoint diagnostics:
+
+```bash
+npm run check:staging:diagnose
+```
+
 Then run:
 
 ```bash
@@ -54,6 +60,8 @@ It does not print secret values.
 - `connect ETIMEDOUT [address]` on `direct-isend-staging`: the configured iSend staging host is not reachable from the local network on its configured port. Check VPN, firewall, allowlist, endpoint host, and whether the iSend staging service is up.
 - `Wix staging iSend endpoint failed with status 404`: `WIX_SITE_BASE_URL` is reachable, but the published site at that URL does not expose `/_functions/testISendLoginFromWix`. Check that the URL points to the intended Wix site/environment and that the backend code is published there.
 - `unable to verify the first certificate`: on Windows, retry with Node's system certificate store, for example `NODE_OPTIONS=--use-system-ca npm run check:staging`.
+
+`npm run check:staging:diagnose` reports Wix route status codes and iSend port reachability without printing the configured hostnames or secrets.
 
 ## GitHub Actions Secrets
 

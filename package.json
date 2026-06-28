@@ -11,6 +11,7 @@
     "lint": "eslint .",
     "check:isend": "node scripts/check-isend.js",
     "check:staging": "node scripts/check-staging-connection.js",
-    "check:staging:setup": "node scripts/check-staging-connection.js --validate-setup"
+    "check:staging:setup": "node scripts/check-staging-connection.js --validate-setup",
+    "check:staging:diagnose": "node scripts/check-staging-connection.js --diagnose"
   }
 }

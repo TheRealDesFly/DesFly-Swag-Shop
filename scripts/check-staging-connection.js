@@ -11,6 +11,7 @@ No secret values are printed.
 
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 
@@ -141,6 +142,98 @@ function requestJson(method, urlString, body, timeout) {
   });
 }
 
+function requestStatus(urlString, timeout) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(urlString);
+    } catch (error) {
+      resolve({ status: 'invalid-url' });
+      return;
+    }
+
+    const lib = parsed.protocol === 'https:' ? https : http;
+    const req = lib.request({
+      method: 'GET',
+      hostname: parsed.hostname,
+      path: parsed.pathname + (parsed.search || ''),
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      timeout,
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode }));
+    });
+
+    req.on('error', (error) => resolve({ status: 'error', code: error.code || error.message }));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ status: 'timeout' });
+    });
+    req.end();
+  });
+}
+
+function checkTcp(host, port, timeout) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    const done = (reachable) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(reachable);
+    };
+    socket.setTimeout(timeout);
+    socket.on('connect', () => done(true));
+    socket.on('timeout', () => done(false));
+    socket.on('error', () => done(false));
+  });
+}
+
+async function diagnose(options) {
+  const report = {};
+
+  if (options.wixSiteUrl) {
+    const base = trimTrailingSlash(options.wixSiteUrl);
+    const wixPaths = [
+      '/_functions/testISendLoginFromWix?force=true&env=staging',
+      '/_functions-dev/testISendLoginFromWix?force=true&env=staging',
+      '/_functions/testISendLoginFromWix',
+      '/_functions-dev/testISendLoginFromWix',
+      '/_functions/isendWebhook',
+      '/_functions-dev/isendWebhook',
+    ];
+    report.wixRoutes = [];
+    for (const routePath of wixPaths) {
+      report.wixRoutes.push({
+        path: routePath,
+        ...(await requestStatus(base + routePath, options.timeout)),
+      });
+    }
+  }
+
+  if (options.stagingUrl) {
+    const parsed = new URL(options.stagingUrl);
+    const configuredPort = parsed.port
+      ? Number(parsed.port)
+      : (parsed.protocol === 'http:' ? 80 : 443);
+    const ports = Array.from(new Set([configuredPort, 443, 80, 8080, 8443]));
+    report.iSendEndpoint = {
+      scheme: parsed.protocol.replace(':', ''),
+      configuredPort,
+      hasPath: Boolean(parsed.pathname && parsed.pathname !== '/'),
+      ports: [],
+    };
+
+    for (const port of ports) {
+      report.iSendEndpoint.ports.push({
+        port,
+        reachable: await checkTcp(parsed.hostname, port, options.timeout),
+      });
+    }
+  }
+
+  return report;
+}
+
 async function checkDirectISend(options) {
   const url = `${trimTrailingSlash(options.stagingUrl)}/IsisWMS-War/Json/Public/login/`;
   const result = await requestJson('POST', url, {
@@ -199,6 +292,12 @@ async function main() {
     stagingUrl: opts['staging-url'] || process.env.ISTORE_ISEND_SANDBOX_URL,
     wixSiteUrl: opts['wix-site-url'] || process.env.WIX_SITE_BASE_URL,
   };
+
+  if (opts.diagnose) {
+    const report = await diagnose(options);
+    console.log(JSON.stringify({ success: true, diagnostics: report }, null, 2));
+    process.exit(0);
+  }
 
   const shouldCheckDirect = !opts['skip-direct'] && options.user && options.password && options.stagingUrl;
   const shouldCheckWix = !opts['skip-wix'] && options.wixSiteUrl;
