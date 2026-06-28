@@ -11,6 +11,31 @@ No secret values are printed.
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+
+function loadDotEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+
+  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const index = trimmed.indexOf('=');
+    if (index === -1) continue;
+
+    const key = trimmed.slice(0, index).trim();
+    let value = trimmed.slice(index + 1).trim();
+    if (!key || process.env[key]) continue;
+
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
+}
 
 function parseArgs() {
   const argv = process.argv.slice(2);
@@ -127,6 +152,8 @@ async function checkWixEndpoint(options) {
 }
 
 async function main() {
+  loadDotEnv(path.join(process.cwd(), '.env'));
+
   const opts = parseArgs();
   const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || '10000', 10);
   const options = {

@@ -28,6 +28,8 @@ Set these local environment variables when testing from your machine:
 - `ISTORE_ISEND_SANDBOX_URL`
 - `WIX_SITE_BASE_URL`
 
+You can put them in an untracked `.env` file. Start from `.env.example`; the smoke script loads `.env` automatically and does not print secret values.
+
 Then run:
 
 ```bash
