@@ -30,6 +30,12 @@ Set these local environment variables when testing from your machine:
 
 You can put them in an untracked `.env` file. Start from `.env.example`; the smoke script loads `.env` automatically and does not print secret values.
 
+Check whether local configuration is present:
+
+```bash
+npm run check:staging:setup
+```
+
 Then run:
 
 ```bash
@@ -42,6 +48,12 @@ The script performs whichever checks it has enough configuration for:
 - Published Wix endpoint check at `/_functions/testISendLoginFromWix?force=true&env=staging`.
 
 It does not print secret values.
+
+## Troubleshooting Local Smoke Tests
+
+- `connect ETIMEDOUT [address]` on `direct-isend-staging`: the configured iSend staging host is not reachable from the local network on its configured port. Check VPN, firewall, allowlist, endpoint host, and whether the iSend staging service is up.
+- `Wix staging iSend endpoint failed with status 404`: `WIX_SITE_BASE_URL` is reachable, but the published site at that URL does not expose `/_functions/testISendLoginFromWix`. Check that the URL points to the intended Wix site/environment and that the backend code is published there.
+- `unable to verify the first certificate`: on Windows, retry with Node's system certificate store, for example `NODE_OPTIONS=--use-system-ca npm run check:staging`.
 
 ## GitHub Actions Secrets
 

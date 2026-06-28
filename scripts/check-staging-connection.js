@@ -55,6 +55,36 @@ function parseArgs() {
   return opts;
 }
 
+function presence(name) {
+  return Boolean(process.env[name]);
+}
+
+function validateSetup() {
+  const directKeys = [
+    'ISTORE_ISEND_API_USER_ID',
+    'ISTORE_ISEND_API_PASSWORD',
+    'ISTORE_ISEND_SANDBOX_URL',
+  ];
+  const wixKeys = ['WIX_SITE_BASE_URL'];
+  const directMissing = directKeys.filter((name) => !presence(name));
+  const wixMissing = wixKeys.filter((name) => !presence(name));
+
+  return {
+    directISendReady: directMissing.length === 0,
+    wixEndpointReady: wixMissing.length === 0,
+    directMissing,
+    wixMissing,
+  };
+}
+
+function sanitizeError(error) {
+  return String(error && error.message ? error.message : error)
+    .replace(/https?:\/\/[^\s/$.?#].[^\s]*/gi, '[url]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b/g, '[address]')
+    .replace(/userPassword["']?\s*:\s*["'][^"']+["']/gi, 'userPassword:"[redacted]"')
+    .replace(/password["']?\s*:\s*["'][^"']+["']/gi, 'password:"[redacted]"');
+}
+
 function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
 }
@@ -155,6 +185,12 @@ async function main() {
   loadDotEnv(path.join(process.cwd(), '.env'));
 
   const opts = parseArgs();
+  if (opts['validate-setup']) {
+    const setup = validateSetup();
+    console.log(JSON.stringify({ success: setup.directISendReady || setup.wixEndpointReady, setup }, null, 2));
+    process.exit(setup.directISendReady || setup.wixEndpointReady ? 0 : 2);
+  }
+
   const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || '10000', 10);
   const options = {
     timeout,
@@ -168,8 +204,8 @@ async function main() {
   const shouldCheckWix = !opts['skip-wix'] && options.wixSiteUrl;
   const checks = [];
 
-  if (shouldCheckDirect) checks.push(() => checkDirectISend(options));
-  if (shouldCheckWix) checks.push(() => checkWixEndpoint(options));
+  if (shouldCheckDirect) checks.push({ name: 'direct-isend-staging', run: () => checkDirectISend(options) });
+  if (shouldCheckWix) checks.push({ name: 'wix-isend-staging', run: () => checkWixEndpoint(options) });
 
   if (!checks.length) {
     console.error('No staging checks can run. Provide direct iSend env vars and/or WIX_SITE_BASE_URL.');
@@ -180,10 +216,20 @@ async function main() {
 
   const results = [];
   for (const check of checks) {
-    results.push(await check());
+    try {
+      results.push(await check.run());
+    } catch (error) {
+      results.push({
+        name: check.name,
+        ok: false,
+        error: sanitizeError(error),
+      });
+    }
   }
 
-  console.log(JSON.stringify({ success: true, checks: results }, null, 2));
+  const success = results.every((result) => result.ok);
+  console.log(JSON.stringify({ success, checks: results }, null, 2));
+  process.exit(success ? 0 : 1);
 }
 
 main().catch((error) => {
