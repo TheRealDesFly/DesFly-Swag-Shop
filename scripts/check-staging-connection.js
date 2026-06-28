@@ -4,7 +4,8 @@ Local staging smoke test for the Wix + iStore iSend integration.
 
 Checks supported:
   1. Direct iSend staging login with local env/args.
-  2. Published Wix endpoint `/_functions/testISendLoginFromWix?force=true&env=staging`.
+  2. Published Wix endpoint `/_functions/testISendLoginFromWix?env=staging`.
+  3. Optional direct iSend inventory query with `--inventory`.
 
 No secret values are printed.
 */
@@ -14,6 +15,11 @@ const https = require('https');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+
+const MYT_OFFSET_MINUTES = 8 * 60;
+const SERVICE_START_HOUR_MYT = 10;
+const SERVICE_END_HOUR_MYT = 22;
+const DEFAULT_TIMEOUT_MS = 20000;
 
 function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -73,6 +79,7 @@ function validateSetup() {
   return {
     directISendReady: directMissing.length === 0,
     wixEndpointReady: wixMissing.length === 0,
+    inventoryReady: directMissing.length === 0 && presence('ISTORE_ISEND_STORAGE_CLIENT_NO'),
     directMissing,
     wixMissing,
   };
@@ -90,7 +97,57 @@ function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
 }
 
-function requestJson(method, urlString, body, timeout) {
+function buildISendUrl(baseUrl, path) {
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${trimTrailingSlash(baseUrl)}${normalizedPath}`;
+}
+
+function getMytDate(now) {
+  return new Date(now.getTime() + MYT_OFFSET_MINUTES * 60000);
+}
+
+function getServiceWindowStatus(now) {
+  const checkedAt = now || new Date();
+  const mytDate = getMytDate(checkedAt);
+  const hour = mytDate.getUTCHours();
+  return {
+    timezone: 'MYT',
+    serviceStart: '10:00',
+    serviceEnd: '22:00',
+    checkedAt: checkedAt.toISOString(),
+    checkedAtMYT: mytDate.toISOString().replace('Z', '+08:00'),
+    withinServiceWindow: hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT,
+  };
+}
+
+function skippedOutsideServiceWindow(name, options) {
+  if (options.force || options.serviceWindow.withinServiceWindow) return null;
+
+  return {
+    name,
+    ok: true,
+    skipped: true,
+    reason: 'Outside iStore iSend service window',
+    serviceWindow: options.serviceWindow,
+  };
+}
+
+function getSessionHeaders(session, cookie) {
+  const headers = {};
+  if (session && session.sessionId) headers.sessionId = session.sessionId;
+  if (session && session.sessionPassword) headers.sessionPassword = session.sessionPassword;
+  if (cookie) headers.Cookie = cookie;
+  return headers;
+}
+
+function getCookieHeader(headers) {
+  const cookies = headers && headers['set-cookie'];
+  if (!cookies) return '';
+  const list = Array.isArray(cookies) ? cookies : [cookies];
+  return list.map((cookie) => String(cookie).split(';')[0]).filter(Boolean).join('; ');
+}
+
+function requestJson(method, urlString, body, timeout, headers = {}) {
   return new Promise((resolve, reject) => {
     let parsed;
     try {
@@ -102,15 +159,17 @@ function requestJson(method, urlString, body, timeout) {
 
     const lib = parsed.protocol === 'https:' ? https : http;
     const data = body ? JSON.stringify(body) : undefined;
+    const requestHeaders = Object.assign({}, headers);
+    if (data) {
+      requestHeaders['Content-Type'] = 'application/json';
+      requestHeaders['Content-Length'] = Buffer.byteLength(data);
+    }
     const req = lib.request({
       method,
       hostname: parsed.hostname,
       path: parsed.pathname + (parsed.search || ''),
       port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      headers: data ? {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-      } : {},
+      headers: requestHeaders,
       timeout,
     }, (res) => {
       const chunks = [];
@@ -126,6 +185,7 @@ function requestJson(method, urlString, body, timeout) {
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
           statusCode: res.statusCode,
+          headers: res.headers || {},
           body: parsedBody,
         });
       });
@@ -194,6 +254,8 @@ async function diagnose(options) {
   if (options.wixSiteUrl) {
     const base = trimTrailingSlash(options.wixSiteUrl);
     const wixPaths = [
+      '/_functions/testISendLoginFromWix?env=staging',
+      '/_functions-dev/testISendLoginFromWix?env=staging',
       '/_functions/testISendLoginFromWix?force=true&env=staging',
       '/_functions-dev/testISendLoginFromWix?force=true&env=staging',
       '/_functions/testISendLoginFromWix',
@@ -235,7 +297,10 @@ async function diagnose(options) {
 }
 
 async function checkDirectISend(options) {
-  const url = `${trimTrailingSlash(options.stagingUrl)}/IsisWMS-War/Json/Public/login/`;
+  const skipped = skippedOutsideServiceWindow('direct-isend-staging', options);
+  if (skipped) return skipped;
+
+  const url = buildISendUrl(options.stagingUrl, '/Json/Public/login/');
   const result = await requestJson('POST', url, {
     userNo: options.user,
     userPassword: options.password,
@@ -253,11 +318,59 @@ async function checkDirectISend(options) {
   };
 }
 
-async function checkWixEndpoint(options) {
-  const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix?force=true&env=staging`;
-  const result = await requestJson('GET', url, null, options.timeout);
+async function checkDirectInventory(options) {
+  const skipped = skippedOutsideServiceWindow('direct-isend-inventory', options);
+  if (skipped) return skipped;
+
+  const loginUrl = buildISendUrl(options.stagingUrl, '/Json/Public/login/');
+  const loginResult = await requestJson('POST', loginUrl, {
+    userNo: options.user,
+    userPassword: options.password,
+  }, options.timeout);
+
+  if (!loginResult.ok || !loginResult.body || !loginResult.body.success) {
+    throw new Error(`Direct iSend login before inventory failed with status ${loginResult.statusCode}`);
+  }
+
+  const session = loginResult.body.returnObject || {};
+  const cookie = getCookieHeader(loginResult.headers);
+  const url = buildISendUrl(options.stagingUrl, '/Json/InvEntity/doQueryStorageClientInventoryPage');
+  const result = await requestJson('POST', url, {
+    storageClientInventoryQuery: {
+      storageClientNo: options.storageClientNo,
+      country: 'MALAYSIA',
+      storageClientSkuNo: '',
+      skuStatus: 'ACTIVE',
+    },
+    pageData: {
+      currentLength: 1000,
+      currentOffset: 0,
+    },
+  }, options.timeout, getSessionHeaders(session, cookie));
 
   if (!result.ok || !result.body || !result.body.success) {
+    throw new Error(`Direct iSend inventory query failed with status ${result.statusCode}`);
+  }
+
+  const returnObject = result.body.returnObject || {};
+  return {
+    name: 'direct-isend-inventory',
+    ok: true,
+    statusCode: result.statusCode,
+    totalRecord: Number(returnObject.totalRecord || 0),
+    totalSize: Number(returnObject.totalSize || 0),
+  };
+}
+
+async function checkWixEndpoint(options) {
+  const skipped = skippedOutsideServiceWindow('wix-isend-staging', options);
+  if (skipped) return skipped;
+
+  const forceParam = options.force ? '&force=true' : '';
+  const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix?env=staging${forceParam}`;
+  const result = await requestJson('GET', url, null, options.timeout);
+
+  if (!result.ok || !result.body || (!result.body.success && !result.body.skipped)) {
     const message = result.body && (result.body.message || result.body.reason)
       ? `: ${result.body.message || result.body.reason}`
       : '';
@@ -267,6 +380,7 @@ async function checkWixEndpoint(options) {
   return {
     name: 'wix-isend-staging',
     ok: true,
+    skipped: Boolean(result.body.skipped),
     statusCode: result.statusCode,
     environment: result.body.environment || 'staging',
     hasSessionId: Boolean(result.body.hasSessionId),
@@ -284,13 +398,16 @@ async function main() {
     process.exit(setup.directISendReady || setup.wixEndpointReady ? 0 : 2);
   }
 
-  const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || '10000', 10);
+  const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || String(DEFAULT_TIMEOUT_MS), 10);
   const options = {
     timeout,
+    force: Boolean(opts.force),
+    serviceWindow: getServiceWindowStatus(new Date()),
     user: opts.user || process.env.ISTORE_ISEND_API_USER_ID || process.env.ISTORE_ISEND_API_USER,
     password: opts.password || process.env.ISTORE_ISEND_API_PASSWORD || process.env.ISTORE_ISEND_API_PASS,
     stagingUrl: opts['staging-url'] || process.env.ISTORE_ISEND_SANDBOX_URL,
     wixSiteUrl: opts['wix-site-url'] || process.env.WIX_SITE_BASE_URL,
+    storageClientNo: opts['storage-client-no'] || process.env.ISTORE_ISEND_STORAGE_CLIENT_NO,
   };
 
   if (opts.diagnose) {
@@ -300,10 +417,12 @@ async function main() {
   }
 
   const shouldCheckDirect = !opts['skip-direct'] && options.user && options.password && options.stagingUrl;
+  const shouldCheckInventory = opts.inventory && options.storageClientNo && options.stagingUrl && options.user && options.password;
   const shouldCheckWix = !opts['skip-wix'] && options.wixSiteUrl;
   const checks = [];
 
   if (shouldCheckDirect) checks.push({ name: 'direct-isend-staging', run: () => checkDirectISend(options) });
+  if (shouldCheckInventory) checks.push({ name: 'direct-isend-inventory', run: () => checkDirectInventory(options) });
   if (shouldCheckWix) checks.push({ name: 'wix-isend-staging', run: () => checkWixEndpoint(options) });
 
   if (!checks.length) {

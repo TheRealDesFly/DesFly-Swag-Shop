@@ -7,9 +7,9 @@ import { fetch } from 'wix-fetch';
 import { getISendConfig } from 'backend/isendConfig';
 
 const MYT_OFFSET_MINUTES = 8 * 60;
-const SERVICE_START_HOUR_MYT = 9;
-const SERVICE_END_HOUR_MYT = 23;
-const REQUEST_TIMEOUT_MS = 60000;
+const SERVICE_START_HOUR_MYT = 10;
+const SERVICE_END_HOUR_MYT = 22;
+const REQUEST_TIMEOUT_MS = 20000;
 
 
 /**
@@ -27,14 +27,19 @@ function getBaseUrl(config) {
   return trimTrailingSlash(config.baseUrl);
 }
 
+function buildISendUrl(config, path) {
+  const baseUrl = getBaseUrl(config);
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${baseUrl}${normalizedPath}`;
+}
+
 /**
  * Convert a JavaScript Date to Malaysia Time (MYT).
  * iSend service windows are defined in MYT, so this helper
  * keeps the service window checks consistent.
  */
 function getMytDate(now) {
-  const utcMillis = now.getTime() + now.getTimezoneOffset() * 60000;
-  return new Date(utcMillis + MYT_OFFSET_MINUTES * 60000);
+  return new Date(now.getTime() + MYT_OFFSET_MINUTES * 60000);
 }
 
 /**
@@ -43,7 +48,7 @@ function getMytDate(now) {
  */
 function isWithinISendServiceWindow(now) {
   const mytDate = getMytDate(now || new Date());
-  const hour = mytDate.getHours();
+  const hour = mytDate.getUTCHours();
   return hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT;
 }
 
@@ -56,8 +61,8 @@ function getServiceWindowStatus(now) {
   const mytDate = getMytDate(checkedAt);
   return {
     timezone: 'MYT',
-    serviceStart: '09:00',
-    serviceEnd: '23:00',
+    serviceStart: '10:00',
+    serviceEnd: '22:00',
     checkedAt: checkedAt.toISOString(),
     checkedAtMYT: mytDate.toISOString().replace('Z', '+08:00'),
     withinServiceWindow: isWithinISendServiceWindow(checkedAt),
@@ -112,7 +117,7 @@ async function postJson(url, body, headers = {}) {
  */
 export async function loginToISend(options = {}) {
   const config = options.config || await getISendConfig(options);
-  const url = `${getBaseUrl(config)}/IsisWMS-War/Json/Public/login/`;
+  const url = buildISendUrl(config, '/Json/Public/login/');
   const data = await postJson(url, {
     userNo: config.userNo,
     userPassword: config.userPassword,
@@ -250,7 +255,7 @@ export async function sendOrderToISend(order, options = {}) {
 
   const config = await getISendConfig(options);
   const session = await loginToISend({ config });
-  const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WebApiOrder/doAddWebApiOrder`;
+  const url = buildISendUrl(config, '/Json/WebApiOrder/doAddWebApiOrder');
   const payload = mapOrderToISend(order, config);
 
   return postJson(url, payload, {
@@ -275,7 +280,7 @@ export async function getTrackingInfo(customerOrderNo, options = {}) {
 
   const config = await getISendConfig(options);
   const session = await loginToISend({ config });
-  const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WhseOrder/doQueryOrderPage`;
+  const url = buildISendUrl(config, '/Json/WhseOrder/doQueryOrderPage');
 
   return postJson(url, {
     orderQuery: {
@@ -285,6 +290,39 @@ export async function getTrackingInfo(customerOrderNo, options = {}) {
     pageData: {
       currentLength: 1,
       currentOffset: 0,
+    },
+  }, {
+    sessionId: session.sessionId,
+    sessionPassword: session.sessionPassword,
+  });
+}
+
+export async function queryStorageClientInventory(options = {}) {
+  const serviceWindow = getServiceWindowStatus(new Date());
+  if (!serviceWindow.withinServiceWindow && !options.force) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'Outside iStore iSend service window',
+      serviceWindow,
+    };
+  }
+
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
+  const url = buildISendUrl(config, '/Json/InvEntity/doQueryStorageClientInventoryPage');
+  const storageClientNo = options.storageClientNo || config.storageClientNo;
+
+  return postJson(url, {
+    storageClientInventoryQuery: {
+      storageClientNo,
+      country: options.country || 'MALAYSIA',
+      storageClientSkuNo: options.storageClientSkuNo || '',
+      skuStatus: options.skuStatus || 'ACTIVE',
+    },
+    pageData: {
+      currentLength: Number(options.currentLength || 1000),
+      currentOffset: Number(options.currentOffset || 0),
     },
   }, {
     sessionId: session.sessionId,
