@@ -9,6 +9,7 @@
     "sync-types": "wix sync-types",
     "dev": "wix dev",
     "lint": "eslint .",
-    "check:isend": "node scripts/check-isend.js"
+    "check:isend": "node scripts/check-isend.js",
+    "check:staging": "node scripts/check-staging-connection.js"
   }
 }

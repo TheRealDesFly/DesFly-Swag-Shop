@@ -64,8 +64,9 @@ Functions:
 
 - `getISendConfig(options = {})`
   - Reads the required iSend configuration values from secrets.
-  - Supports `useSandbox` to choose sandbox vs production URL.
-  - Returns an object with `storageClientNo`, `userNo`, `userPassword`, `orderOrigin`, `userId`, `orderSource`, and `sandboxUrl`.
+  - Supports `environment` or `useSandbox` to choose staging vs production URL.
+  - Uses the Wix secret `ISTORE_ISEND_ENV` when no option is passed.
+  - Returns an object with `storageClientNo`, `userNo`, `userPassword`, `orderOrigin`, `userId`, `orderSource`, `baseUrl`, and `environment`.
 
 This module is the central source of truth for iSend credentials and endpoints.
 
@@ -84,6 +85,16 @@ Functions:
 - `markProcessed(idempotencyKey, meta = {})`
   - Inserts a new record into `ISendProcessedEvents`.
   - Stores optional metadata along with the key.
+
+- `claimProcessed(idempotencyKey, meta = {})`
+  - Inserts a processing claim before an external side effect.
+  - Returns a duplicate result when the idempotency key already exists.
+
+- `updateProcessed(idempotencyKey, meta = {})`
+  - Updates metadata for an existing idempotency key.
+
+- `releaseProcessed(idempotencyKey)`
+  - Removes a processing claim after a failed side effect so a future retry can run.
 
 This pattern is used by webhook processing and fulfillment creation to avoid duplicate work.
 
@@ -285,32 +296,21 @@ Functions:
 
 - `post_createFulfillmentFromWix(request)`
   - HTTP POST endpoint to create a Wix fulfillment from an external request.
+  - Protected by header `X-ISEND-FULFILLMENT-SECRET` and the Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET`.
 
 This file connects backend logic to external HTTP calls.
 
 ---
 
-## src/backend/events.js and src/backend/wix-backend-events.js
+## src/backend/events.js
 
-These are Wix event handler files.
+This is the Wix event handler file.
 
 - `wixStores_onNewOrder(event)`
   - Triggered automatically when a new Wix store order is created.
+  - Skips processing when a Wix-to-iSend mapping already exists.
   - Sends the new order to iSend.
   - Saves the mapping between the Wix order and the iSend order number.
-
-`events.js` also includes a more complete mapping save flow, while `wix-backend-events.js` contains a simpler version of the same event handler.
-
----
-
-## src/backend/istoreTest.jsw and src/backend/new-module*.web.js
-
-These files are sample web modules.
-
-- `istoreTest.jsw` exports a `multiply` function using `webMethod`.
-- `new-module*.web.js` files also export a sample `multiply` function.
-
-These files demonstrate how backend functions can be called from frontend page code.
 
 ---
 

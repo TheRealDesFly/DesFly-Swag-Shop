@@ -1,5 +1,5 @@
 import wixStoresBackend from 'wix-stores-backend';
-import { hasProcessed, markProcessed } from 'backend/isendIdempotency';
+import { claimProcessed, releaseProcessed, updateProcessed } from 'backend/isendIdempotency';
 
 /**
  * Create a fulfillment on a Wix order with idempotency.
@@ -17,10 +17,10 @@ import { hasProcessed, markProcessed } from 'backend/isendIdempotency';
 export async function createFulfillment(orderId, options = {}) {
   const { lineItems = [], trackingNumber, shippingProvider, trackingLink, idempotencyKey } = options;
 
-  // If idempotency key provided and already processed, skip creating fulfillment.
+  // Claim before creating the fulfillment so concurrent retries do not duplicate it.
   if (idempotencyKey) {
-    const processed = await hasProcessed(idempotencyKey);
-    if (processed) {
+    const claim = await claimProcessed(idempotencyKey, { orderId, trackingNumber });
+    if (!claim.claimed) {
       return { skipped: true, reason: 'idempotency', idempotencyKey };
     }
   }
@@ -41,18 +41,23 @@ export async function createFulfillment(orderId, options = {}) {
   try {
     const result = await wixStoresBackend.createFulfillment(orderId, fulfillment);
 
-    // Mark idempotency key processed with returned fulfillment metadata
     if (idempotencyKey) {
       try {
-        await markProcessed(idempotencyKey, { orderId, result });
+        await updateProcessed(idempotencyKey, { orderId, result, status: 'completed' });
       } catch (e) {
-        // Don't fail the main flow if logging the idempotency record fails
-        console.error('markProcessed failed', e.message);
+        console.error('updateProcessed failed', e.message);
       }
     }
 
     return result;
   } catch (err) {
+    if (idempotencyKey) {
+      try {
+        await releaseProcessed(idempotencyKey);
+      } catch (releaseError) {
+        console.error('releaseProcessed failed', releaseError.message);
+      }
+    }
     // Re-throw with context
     throw new Error(`createFulfillment failed for order ${orderId}: ${err.message}`);
   }

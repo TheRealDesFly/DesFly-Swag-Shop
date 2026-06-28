@@ -106,7 +106,8 @@ export async function handleWebhook(request) {
   }
 
   const eventType = (eventHeader || payload.eventType || payload.type || '').toLowerCase();
-  const idKey = deliveryId || `${payload.eventType || 'isend'}:${Date.now()}`;
+  const payloadHash = crypto.createHash('sha256').update(rawBody || JSON.stringify(payload || {})).digest('hex');
+  const idKey = deliveryId || `${payload.eventType || eventHeader || 'isend'}:${payloadHash}`;
 
     if (await hasProcessed(idKey)) {
     return { success: true, skipped: true, reason: 'idempotency', idempotencyKey: idKey };

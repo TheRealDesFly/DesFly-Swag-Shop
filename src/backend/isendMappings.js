@@ -10,6 +10,17 @@ export async function saveMapping(wixOrderId, iSendOrderNo, meta = {}) {
   if (!wixOrderId || !iSendOrderNo) {
     throw new Error('saveMapping requires wixOrderId and iSendOrderNo');
   }
+
+  const existingWixMapping = await getByWixOrderId(wixOrderId);
+  if (existingWixMapping) {
+    return existingWixMapping;
+  }
+
+  const existingISendMapping = await getByISendOrderNo(iSendOrderNo);
+  if (existingISendMapping) {
+    return existingISendMapping;
+  }
+
   const item = {
     wixOrderId: String(wixOrderId),
     iSendOrderNo: String(iSendOrderNo),

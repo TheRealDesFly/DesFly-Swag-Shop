@@ -8,7 +8,7 @@ import wixStoresBackend from 'wix-stores-backend';
 import { findMappings } from 'backend/isendMappings';
 import { getTrackingInfo } from 'backend/isendService';
 import { createFulfillment } from 'backend/orderFulfillment';
-import { hasProcessed, markProcessed } from 'backend/isendIdempotency';
+import { hasProcessed } from 'backend/isendIdempotency';
 import { updateMappingStatus, mapISendStatus } from 'backend/isendStatusMapping';
 
 /**
@@ -41,77 +41,81 @@ function extractTrackingNumbers(obj) {
  * It can also handle inventory updates in the future.
  */
 export async function runPoller(options = {}) {
-  const types = options.types || ['tracking', 'status', 'inventory'];
+  const types = options.types || ['tracking', 'status'];
   const limit = options.limit || 100;
+  const maxPages = options.maxPages || 20;
+  const environment = options.environment;
 
-  const mappings = await findMappings(limit, 0);
   const results = [];
+  let page = 0;
+  let processedMappings = 0;
 
-  for (const m of mappings) {
-    const iSendNo = m.iSendOrderNo;
-    const wixOrderId = m.wixOrderId;
+  while (page < maxPages) {
+    const mappings = await findMappings(limit, page * limit);
+    if (!mappings.length) break;
 
-    if (types.includes('tracking') || types.includes('status')) {
-      try {
-        const res = await getTrackingInfo(iSendNo);
-        // quick guard
-        if (!res) continue;
+    for (const m of mappings) {
+      processedMappings += 1;
+      const iSendNo = m.iSendOrderNo;
+      const wixOrderId = m.wixOrderId;
 
-        // attempt to find status and update mapping
-        const possibleStatus = res.orderStatus || res.status || (res.returnObject && (res.returnObject.status || res.returnObject.orderStatus)) || null;
-        if (possibleStatus) {
-          try {
-            await updateMappingStatus(iSendNo, mapISendStatus(possibleStatus) || possibleStatus);
-          } catch (e) {
-            console.error('updateMappingStatus failed in poller', e.message);
+      if (types.includes('tracking') || types.includes('status')) {
+        try {
+          const res = await getTrackingInfo(iSendNo, { environment });
+          if (!res || res.skipped) {
+            results.push({ iSendNo, wixOrderId, skipped: true, reason: res && res.reason });
+            continue;
           }
-        }
 
-        // attempt to find tracking numbers
-        const trackingNumbers = extractTrackingNumbers(res) || [];
-
-        if (trackingNumbers.length) {
-          // fetch wix order to get line item indices
-          let wixOrder;
-          try {
-            wixOrder = await wixStoresBackend.getOrder(wixOrderId);
-          } catch (e) {
-            wixOrder = null;
-          }
-          const lineItems = (wixOrder && wixOrder.order && Array.isArray(wixOrder.order.lineItems))
-            ? wixOrder.order.lineItems.map((li) => ({ index: li.index, quantity: li.quantity }))
-            : [];
-
-          for (const tn of trackingNumbers) {
-            const idempotencyKey = `isend:${iSendNo}:tracking:${tn}`;
-            if (await hasProcessed(idempotencyKey)) continue;
+          const possibleStatus = res.orderStatus || res.status || (res.returnObject && (res.returnObject.status || res.returnObject.orderStatus)) || null;
+          if (possibleStatus) {
             try {
-              await createFulfillment(wixOrderId, { lineItems, trackingNumber: tn, idempotencyKey });
-              results.push({ iSendNo, wixOrderId, tracking: tn, created: true });
-            } catch (err) {
-              console.error('Poller createFulfillment failed', err.message);
-              results.push({ iSendNo, wixOrderId, tracking: tn, error: err.message });
+              await updateMappingStatus(iSendNo, mapISendStatus(possibleStatus) || possibleStatus);
+            } catch (e) {
+              console.error('updateMappingStatus failed in poller', e.message);
             }
           }
+
+          const trackingNumbers = extractTrackingNumbers(res) || [];
+
+          if (trackingNumbers.length) {
+            let wixOrder;
+            try {
+              wixOrder = await wixStoresBackend.getOrder(wixOrderId);
+            } catch (e) {
+              wixOrder = null;
+            }
+            const lineItems = (wixOrder && wixOrder.order && Array.isArray(wixOrder.order.lineItems))
+              ? wixOrder.order.lineItems.map((li) => ({ index: li.index, quantity: li.quantity }))
+              : [];
+
+            for (const tn of trackingNumbers) {
+              const idempotencyKey = `isend:${iSendNo}:tracking:${tn}`;
+              if (await hasProcessed(idempotencyKey)) continue;
+              try {
+                await createFulfillment(wixOrderId, { lineItems, trackingNumber: tn, idempotencyKey });
+                results.push({ iSendNo, wixOrderId, tracking: tn, created: true });
+              } catch (err) {
+                console.error('Poller createFulfillment failed', err.message);
+                results.push({ iSendNo, wixOrderId, tracking: tn, error: err.message });
+              }
+            }
+          }
+        } catch (err) {
+          console.error('getTrackingInfo failed for', iSendNo, err.message);
         }
-      } catch (err) {
-        console.error('getTrackingInfo failed for', iSendNo, err.message);
       }
     }
 
-    if (types.includes('inventory')) {
-      // Inventory sync requires iStore inventory API details; placeholder
-      try {
-        // TODO: implement inventory API call once endpoint confirmed
-        // For now just log
-        console.log('Inventory sync placeholder for iSend order', iSendNo);
-      } catch (e) {
-        console.error('Inventory poll error', e.message);
-      }
-    }
+    if (mappings.length < limit) break;
+    page += 1;
   }
 
-  return { success: true, processed: results.length, details: results };
+  if (types.includes('inventory')) {
+    results.push({ type: 'inventory', skipped: true, reason: 'inventory-sync-not-configured' });
+  }
+
+  return { success: true, processedMappings, processed: results.length, details: results };
 }
 
 export default { runPoller };

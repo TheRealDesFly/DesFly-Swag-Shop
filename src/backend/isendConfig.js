@@ -5,6 +5,7 @@ const SECRET_NAMES = {
   apiUserId: 'ISTORE_ISEND_API_USER_ID',
   apiPassword: 'ISTORE_ISEND_API_PASSWORD',
   orderOrigin: 'ISTORE_ISEND_ORDER_ORIGIN',
+  environment: 'ISTORE_ISEND_ENV',
   sandboxUrl: 'ISTORE_ISEND_SANDBOX_URL',
   productionUrl: 'ISTORE_ISEND_PRODUCTION_URL',
 };
@@ -30,29 +31,52 @@ async function readOptionalSecret(name) {
   }
 }
 
-// options: { useSandbox: boolean }
-export async function getISendConfig(options = {}) {
-  const { useSandbox = true } = options;
+function normalizeEnvironment(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['production', 'prod', 'live'].includes(normalized)) {
+    return 'production';
+  }
+  if (['staging', 'stage', 'sandbox', 'test'].includes(normalized)) {
+    return 'staging';
+  }
+  if (!normalized) {
+    return undefined;
+  }
+  throw new Error(`Invalid iSend environment "${value}". Use "staging" or "production".`);
+}
 
+// options: { environment: 'staging'|'production', useSandbox: boolean }
+export async function getISendConfig(options = {}) {
   const [
     storageClientNo,
     apiUserId,
     apiPassword,
     orderOrigin,
+    configuredEnvironment,
   ] = await Promise.all([
     readRequiredSecret(SECRET_NAMES.storageClientNo),
     readRequiredSecret(SECRET_NAMES.apiUserId),
     readRequiredSecret(SECRET_NAMES.apiPassword),
     readRequiredSecret(SECRET_NAMES.orderOrigin),
+    readOptionalSecret(SECRET_NAMES.environment),
   ]);
 
   const sandboxUrl = await readOptionalSecret(SECRET_NAMES.sandboxUrl);
   const productionUrl = await readOptionalSecret(SECRET_NAMES.productionUrl);
-
-  const baseUrl = useSandbox ? sandboxUrl : (productionUrl || sandboxUrl);
+  const requestedEnvironment = options.environment || (
+    typeof options.useSandbox === 'boolean'
+      ? (options.useSandbox ? 'staging' : 'production')
+      : undefined
+  );
+  const environment = normalizeEnvironment(requestedEnvironment || configuredEnvironment);
+  if (!environment) {
+    throw new Error(`Missing Wix secret: ${SECRET_NAMES.environment}`);
+  }
+  const useSandbox = environment !== 'production';
+  const baseUrl = useSandbox ? sandboxUrl : productionUrl;
 
   if (!baseUrl) {
-    throw new Error(`Missing iSend URL for ${useSandbox ? 'sandbox' : 'production'} environment`);
+    throw new Error(`Missing iSend URL for ${environment} environment`);
   }
 
   return {
@@ -62,7 +86,10 @@ export async function getISendConfig(options = {}) {
     orderOrigin,
     userId: apiUserId,
     orderSource: 'Wix Store',
-    sandboxUrl: baseUrl,
+    baseUrl,
+    sandboxUrl,
+    productionUrl,
+    environment,
     useSandbox,
   };
 }
