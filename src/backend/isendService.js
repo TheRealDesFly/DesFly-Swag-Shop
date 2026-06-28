@@ -9,7 +9,7 @@ import { getISendConfig } from 'backend/isendConfig';
 const MYT_OFFSET_MINUTES = 8 * 60;
 const SERVICE_START_HOUR_MYT = 10;
 const SERVICE_END_HOUR_MYT = 22;
-const REQUEST_TIMEOUT_MS = 60000;
+const REQUEST_TIMEOUT_MS = 20000;
 
 
 /**
@@ -39,8 +39,7 @@ function buildISendUrl(config, path) {
  * keeps the service window checks consistent.
  */
 function getMytDate(now) {
-  const utcMillis = now.getTime() + now.getTimezoneOffset() * 60000;
-  return new Date(utcMillis + MYT_OFFSET_MINUTES * 60000);
+  return new Date(now.getTime() + MYT_OFFSET_MINUTES * 60000);
 }
 
 /**
@@ -49,7 +48,7 @@ function getMytDate(now) {
  */
 function isWithinISendServiceWindow(now) {
   const mytDate = getMytDate(now || new Date());
-  const hour = mytDate.getHours();
+  const hour = mytDate.getUTCHours();
   return hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT;
 }
 
@@ -310,6 +309,7 @@ export async function queryStorageClientInventory(options = {}) {
   }
 
   const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
   const url = buildISendUrl(config, '/Json/InvEntity/doQueryStorageClientInventoryPage');
   const storageClientNo = options.storageClientNo || config.storageClientNo;
 
@@ -324,6 +324,9 @@ export async function queryStorageClientInventory(options = {}) {
       currentLength: Number(options.currentLength || 1000),
       currentOffset: Number(options.currentOffset || 0),
     },
+  }, {
+    sessionId: session.sessionId,
+    sessionPassword: session.sessionPassword,
   });
 }
 

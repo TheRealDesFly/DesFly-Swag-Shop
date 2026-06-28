@@ -58,6 +58,7 @@ This repo includes an iStore/iSend integration with webhook receiver and a polle
 - Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`.
 - iStore/iSend base URLs should be the API context root from their Postman `cmd_ctr_base_url`; backend code appends `/Json/...` endpoint paths.
 - The configured service window is 10:00 AM-10:00 PM Malaysia Time.
+- Backend iStore/iSend requests use a 20-second timeout so Wix does not wait until a gateway timeout before returning a controlled error.
 
 GitHub Actions workflow is provided to run staging smoke checks. To enable it, add these repository secrets:
 
@@ -130,7 +131,7 @@ To run the staging smoke-tests workflow you must add the following **repository*
 Once the secrets are added and you've pushed these workflow files to `main` (or your default branch), go to the Actions tab and run the `iSend Staging Smoke Tests` workflow (or trigger it via the `Run workflow` button). The workflow will:
 
 - Run `npm run lint`.
-- Run `npm run check:staging`, which validates direct iSend staging login and calls `/_functions/testISendLoginFromWix?force=true&env=staging` when `WIX_SITE_BASE_URL` is configured.
+- Run `npm run check:staging`, which validates direct iSend staging login and calls `/_functions/testISendLoginFromWix?env=staging` when `WIX_SITE_BASE_URL` is configured. Outside the configured iSend service window, the local smoke script skips live iSend/Wix login probes unless `--force` is provided.
 
 Make sure the Wix site is published and the Backend Secrets are set (Backend-only) before running the workflow.
 
