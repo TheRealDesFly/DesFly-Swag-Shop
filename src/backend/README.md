@@ -63,6 +63,7 @@ GitHub Actions workflows are provided to run the poller automatically. To enable
 Workflows (auto-created):
 - `.github/workflows/isend-poller-tracking.yml` — runs every 15 minutes and triggers tracking/status poller.
 - `.github/workflows/isend-poller-inventory.yml` — runs hourly and triggers inventory poller.
+- `.github/workflows/isend-poller-inventory.yml` — runs hourly and triggers inventory poller.
 
 Wix Data collections required:
 - `ISendOrderMap` — maps `wixOrderId` ↔ `iSendOrderNo`.
