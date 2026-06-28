@@ -1,0 +1,32 @@
+name: iSend Staging Smoke Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+jobs:
+  staging-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check staging iSend connectivity
+        run: npm run check:staging
+        env:
+          ISTORE_ISEND_API_USER_ID: ${{ secrets.ISTORE_ISEND_API_USER_ID }}
+          ISTORE_ISEND_API_PASSWORD: ${{ secrets.ISTORE_ISEND_API_PASSWORD }}
+          ISTORE_ISEND_SANDBOX_URL: ${{ secrets.ISTORE_ISEND_SANDBOX_URL }}
+          WIX_SITE_BASE_URL: ${{ secrets.WIX_SITE_BASE_URL }}

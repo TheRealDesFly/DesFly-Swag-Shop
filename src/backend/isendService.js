@@ -22,11 +22,9 @@ function trimTrailingSlash(value) {
 
 /**
  * Return the configured base URL for iSend API calls.
- * The current implementation always uses sandboxUrl.
  */
 function getBaseUrl(config) {
-
-  return trimTrailingSlash(config.sandboxUrl);
+  return trimTrailingSlash(config.baseUrl);
 }
 
 /**
@@ -112,8 +110,8 @@ async function postJson(url, body, headers = {}) {
  * Log in to iSend to obtain a session token.
  * The returned session data is required for all subsequent iSend calls.
  */
-export async function loginToISend() {
-  const config = await getISendConfig();
+export async function loginToISend(options = {}) {
+  const config = options.config || await getISendConfig(options);
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/Public/login/`;
   const data = await postJson(url, {
     userNo: config.userNo,
@@ -143,10 +141,13 @@ export async function testISendLogin(options = {}) {
     };
   }
 
-  const session = await loginToISend();
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
   return {
     success: true,
     skipped: false,
+    environment: config.environment,
+    baseUrl: getBaseUrl(config),
     hasSessionId: Boolean(session.sessionId),
     hasSessionPassword: Boolean(session.sessionPassword),
     checkedAt: new Date().toISOString(),
@@ -236,7 +237,7 @@ function mapOrderToISend(order, config) {
  * Send a Wix order to iSend by creating a new order in the iSend system.
  * Returns the raw iSend response so the caller can inspect success or failure.
  */
-export async function sendOrderToISend(order) {
+export async function sendOrderToISend(order, options = {}) {
   const serviceWindow = getServiceWindowStatus(new Date());
   if (!serviceWindow.withinServiceWindow) {
     return {
@@ -247,8 +248,8 @@ export async function sendOrderToISend(order) {
     };
   }
 
-  const config = await getISendConfig();
-  const session = await loginToISend();
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WebApiOrder/doAddWebApiOrder`;
   const payload = mapOrderToISend(order, config);
 
@@ -261,7 +262,7 @@ export async function sendOrderToISend(order) {
 /**
  * Query iSend for tracking and order status information for a given customer order number.
  */
-export async function getTrackingInfo(customerOrderNo) {
+export async function getTrackingInfo(customerOrderNo, options = {}) {
   const serviceWindow = getServiceWindowStatus(new Date());
   if (!serviceWindow.withinServiceWindow) {
     return {
@@ -272,8 +273,8 @@ export async function getTrackingInfo(customerOrderNo) {
     };
   }
 
-  const config = await getISendConfig();
-  const session = await loginToISend();
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
   const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WhseOrder/doQueryOrderPage`;
 
   return postJson(url, {

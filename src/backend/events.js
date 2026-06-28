@@ -21,7 +21,7 @@
 
 *******************/
 import { sendOrderToISend } from 'backend/isendService';
-import { saveMapping } from 'backend/isendMappings';
+import { getByWixOrderId, saveMapping } from 'backend/isendMappings';
 
 /**
  * Wix Stores event handler for new orders.
@@ -30,18 +30,30 @@ import { saveMapping } from 'backend/isendMappings';
  */
 export async function wixStores_onNewOrder(event) {
   const order = event.order;
+  const wixOrderId = order?._id || order?.id;
 
   try {
+    if (wixOrderId) {
+      const existingMapping = await getByWixOrderId(wixOrderId);
+      if (existingMapping) {
+        console.log('Skipping iStore iSend submit; mapping already exists', {
+          wixOrderId,
+          iSendOrderNo: existingMapping.iSendOrderNo,
+        });
+        return;
+      }
+    }
+
     const result = await sendOrderToISend(order);
     console.log('iStore iSend order submit result', {
-      orderId: order?._id || order?.id,
+      orderId: wixOrderId,
       success: result?.success,
+      skipped: result?.skipped,
       messageCount: result?.msgList?.msgList?.length || 0,
     });
 
     // Attempt to extract iSend order number from the response and save mapping
     try {
-      const wixOrderId = order?._id || order?.id;
       const iSendOrderNo = (result && (
         result.returnObject && (result.returnObject.custOrderNo || result.returnObject.orderNo || result.returnObject.orderId)
       )) || result.custOrderNo || result.orderNo || result.orderId || null;
@@ -57,7 +69,7 @@ export async function wixStores_onNewOrder(event) {
     }
   } catch (error) {
     console.error('iStore iSend order submit failed', {
-      orderId: order?._id || order?.id,
+      orderId: wixOrderId,
       message: error.message,
     });
   }

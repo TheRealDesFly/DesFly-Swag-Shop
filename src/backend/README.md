@@ -54,24 +54,30 @@ This repo includes an iStore/iSend integration with webhook receiver and a polle
 
 - Webhook endpoint: `POST /_functions/isendWebhook` — expects HMAC-SHA256 signature header `X-ISEND-Signature` using secret `ISTORE_ISEND_WEBHOOK_SECRET`.
 - Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`.
+- Manual fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET` matching Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET`.
+- Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`.
 
-GitHub Actions workflows are provided to run the poller automatically. To enable them, add these repository secrets:
+GitHub Actions workflow is provided to run staging smoke checks. To enable it, add these repository secrets:
 
 - `WIX_SITE_BASE_URL` — e.g. `https://your-site.com` (no trailing slash)
-- `ISEND_POLLER_TRIGGER_SECRET` — the same value stored in Wix Secrets as `ISEND_POLLER_TRIGGER_SECRET`
+- `ISTORE_ISEND_API_USER_ID`
+- `ISTORE_ISEND_API_PASSWORD`
+- `ISTORE_ISEND_SANDBOX_URL`
 
-Workflows (auto-created):
-- `.github/workflows/isend-poller-tracking.yml` — runs every 15 minutes and triggers tracking/status poller.
-- `.github/workflows/isend-poller-inventory.yml` — runs hourly and triggers inventory poller.
-- `.github/workflows/isend-poller-inventory.yml` — runs hourly and triggers inventory poller.
+Workflow:
+- `.github/workflows/isend-staging-smoke.yml` — runs lint and staging connectivity checks every 30 minutes and on demand.
 
 Wix Data collections required:
 - `ISendOrderMap` — maps `wixOrderId` ↔ `iSendOrderNo`.
 - `ISendProcessedEvents` — stores idempotency keys (`idempotencyKey`).
 - `ISendWebhookEvents` — persisted raw webhook events for auditing.
-- `ISendInventory` — optional, stores SKU inventory snapshots.
- - `ISendInventory` — optional, stores SKU inventory snapshots.
- - `ISendPendingEmails` — optional, stores pending outbound emails for Wix Automations (fields: `to`, `subject`, `body`, `wixOrderId`, `iSendOrderNo`, `createdAt`, `sent`).
+- `ISendInventory` — optional, stores SKU inventory snapshots from webhook events.
+- `ISendPendingEmails` — optional, stores pending outbound emails for Wix Automations (fields: `to`, `subject`, `body`, `wixOrderId`, `iSendOrderNo`, `createdAt`, `sent`).
+
+Recommended indexes:
+- `ISendOrderMap.wixOrderId` unique.
+- `ISendOrderMap.iSendOrderNo` unique.
+- `ISendProcessedEvents.idempotencyKey` unique.
 
 ### Webhook secret
 
@@ -93,13 +99,11 @@ curl -X POST "<SITE_URL>/_functions/isendWebhook" \
   -d '{"orderNo":"TEST123","tracking":{"trackingNo":"TN12345"}}'
 ```
 
-### Poll intervals
+### Poll trigger
 
-- Tracking: 15 minutes (GitHub Actions workflow `.github/workflows/isend-poller-tracking.yml`)
-- Order Status: 15 minutes (same workflow)
-- Inventory: 60 minutes (workflow `.github/workflows/isend-poller-inventory.yml`)
-
-Store the poller trigger secret as a Backend-only Wix Secret named `ISEND_POLLER_TRIGGER_SECRET` and also add it as a GitHub repo secret named `ISEND_POLLER_TRIGGER_SECRET` (used by the workflows).
+Store the poller trigger secret as a Backend-only Wix Secret named `ISEND_POLLER_TRIGGER_SECRET`.
+Call `POST /_functions/runISendPoller` with `X-ISEND-POLLER-SECRET`.
+The poller syncs tracking and order status by default. Inventory polling is not enabled until the iStore inventory API contract is confirmed.
 
 ### DELIVERED handling
 
@@ -116,14 +120,14 @@ To send the email automatically, create a Wix Automation that triggers on new it
 To run the staging smoke-tests workflow you must add the following **repository** secrets in your GitHub repository (Settings → Secrets & variables → Actions):
 
 - `WIX_SITE_BASE_URL` — e.g. `https://your-site.com` (no trailing slash)
-- `ISEND_POLLER_TRIGGER_SECRET` — same value stored in Wix Secrets `ISEND_POLLER_TRIGGER_SECRET`
-- `ISTORE_ISEND_WEBHOOK_SECRET` — the webhook secret (only required if you want the workflow to simulate webhooks)
+- `ISTORE_ISEND_API_USER_ID`
+- `ISTORE_ISEND_API_PASSWORD`
+- `ISTORE_ISEND_SANDBOX_URL`
 
 Once the secrets are added and you've pushed these workflow files to `main` (or your default branch), go to the Actions tab and run the `iSend Staging Smoke Tests` workflow (or trigger it via the `Run workflow` button). The workflow will:
 
-- Call `/_functions/testISendLoginFromWix` to validate login.
-- POST a simulated webhook to `/_functions/isendWebhook` (HMAC checked using `ISTORE_ISEND_WEBHOOK_SECRET`).
-- POST `/_functions/runISendPoller` with `ISEND_POLLER_TRIGGER_SECRET` to trigger tracking/status poller.
+- Run `npm run lint`.
+- Run `npm run check:staging`, which validates direct iSend staging login and calls `/_functions/testISendLoginFromWix?force=true&env=staging` when `WIX_SITE_BASE_URL` is configured.
 
 Make sure the Wix site is published and the Backend Secrets are set (Backend-only) before running the workflow.
 

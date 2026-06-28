@@ -6,10 +6,10 @@
           "invoke": true
         },
         "siteMember": {
-          "invoke": true
+          "invoke": false
         },
         "anonymous": {
-          "invoke": true
+          "invoke": false
         }
       }
     }
