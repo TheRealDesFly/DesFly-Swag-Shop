@@ -92,7 +92,7 @@ function postJson(urlString, body, timeout) {
 }
 
 async function checkLogin(baseUrl, user, pass, timeout) {
-  const url = String(baseUrl).replace(/\/+$|\/$/g, '').replace(/\/$/, '') + '/IsisWMS-War/Json/Public/login/';
+  const url = String(baseUrl).replace(/\/+$/, '') + '/Json/Public/login/';
   try {
     const res = await postJson(url, { userNo: user, userPassword: pass }, timeout);
     if (res.ok && res.body && res.body.success) {

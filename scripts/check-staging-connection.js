@@ -5,6 +5,7 @@ Local staging smoke test for the Wix + iStore iSend integration.
 Checks supported:
   1. Direct iSend staging login with local env/args.
   2. Published Wix endpoint `/_functions/testISendLoginFromWix?force=true&env=staging`.
+  3. Optional direct iSend inventory query with `--inventory`.
 
 No secret values are printed.
 */
@@ -73,6 +74,7 @@ function validateSetup() {
   return {
     directISendReady: directMissing.length === 0,
     wixEndpointReady: wixMissing.length === 0,
+    inventoryReady: directMissing.length === 0 && presence('ISTORE_ISEND_STORAGE_CLIENT_NO'),
     directMissing,
     wixMissing,
   };
@@ -88,6 +90,11 @@ function sanitizeError(error) {
 
 function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
+}
+
+function buildISendUrl(baseUrl, path) {
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${trimTrailingSlash(baseUrl)}${normalizedPath}`;
 }
 
 function requestJson(method, urlString, body, timeout) {
@@ -235,7 +242,7 @@ async function diagnose(options) {
 }
 
 async function checkDirectISend(options) {
-  const url = `${trimTrailingSlash(options.stagingUrl)}/IsisWMS-War/Json/Public/login/`;
+  const url = buildISendUrl(options.stagingUrl, '/Json/Public/login/');
   const result = await requestJson('POST', url, {
     userNo: options.user,
     userPassword: options.password,
@@ -250,6 +257,35 @@ async function checkDirectISend(options) {
     ok: true,
     statusCode: result.statusCode,
     hasSession: Boolean(result.body.returnObject && result.body.returnObject.sessionId),
+  };
+}
+
+async function checkDirectInventory(options) {
+  const url = buildISendUrl(options.stagingUrl, '/Json/InvEntity/doQueryStorageClientInventoryPage');
+  const result = await requestJson('POST', url, {
+    storageClientInventoryQuery: {
+      storageClientNo: options.storageClientNo,
+      country: 'MALAYSIA',
+      storageClientSkuNo: '',
+      skuStatus: 'ACTIVE',
+    },
+    pageData: {
+      currentLength: 1000,
+      currentOffset: 0,
+    },
+  }, options.timeout);
+
+  if (!result.ok || !result.body || !result.body.success) {
+    throw new Error(`Direct iSend inventory query failed with status ${result.statusCode}`);
+  }
+
+  const returnObject = result.body.returnObject || {};
+  return {
+    name: 'direct-isend-inventory',
+    ok: true,
+    statusCode: result.statusCode,
+    totalRecord: Number(returnObject.totalRecord || 0),
+    totalSize: Number(returnObject.totalSize || 0),
   };
 }
 
@@ -291,6 +327,7 @@ async function main() {
     password: opts.password || process.env.ISTORE_ISEND_API_PASSWORD || process.env.ISTORE_ISEND_API_PASS,
     stagingUrl: opts['staging-url'] || process.env.ISTORE_ISEND_SANDBOX_URL,
     wixSiteUrl: opts['wix-site-url'] || process.env.WIX_SITE_BASE_URL,
+    storageClientNo: opts['storage-client-no'] || process.env.ISTORE_ISEND_STORAGE_CLIENT_NO,
   };
 
   if (opts.diagnose) {
@@ -300,10 +337,12 @@ async function main() {
   }
 
   const shouldCheckDirect = !opts['skip-direct'] && options.user && options.password && options.stagingUrl;
+  const shouldCheckInventory = opts.inventory && options.storageClientNo && options.stagingUrl;
   const shouldCheckWix = !opts['skip-wix'] && options.wixSiteUrl;
   const checks = [];
 
   if (shouldCheckDirect) checks.push({ name: 'direct-isend-staging', run: () => checkDirectISend(options) });
+  if (shouldCheckInventory) checks.push({ name: 'direct-isend-inventory', run: () => checkDirectInventory(options) });
   if (shouldCheckWix) checks.push({ name: 'wix-isend-staging', run: () => checkWixEndpoint(options) });
 
   if (!checks.length) {

@@ -56,6 +56,8 @@ This repo includes an iStore/iSend integration with webhook receiver and a polle
 - Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`.
 - Manual fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET` matching Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET`.
 - Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`.
+- iStore/iSend base URLs should be the API context root from their Postman `cmd_ctr_base_url`; backend code appends `/Json/...` endpoint paths.
+- The configured service window is 10:00 AM-10:00 PM Malaysia Time.
 
 GitHub Actions workflow is provided to run staging smoke checks. To enable it, add these repository secrets:
 
@@ -63,6 +65,7 @@ GitHub Actions workflow is provided to run staging smoke checks. To enable it, a
 - `ISTORE_ISEND_API_USER_ID`
 - `ISTORE_ISEND_API_PASSWORD`
 - `ISTORE_ISEND_SANDBOX_URL`
+- `ISTORE_ISEND_STORAGE_CLIENT_NO`
 
 Workflow:
 - `.github/workflows/isend-staging-smoke.yml` — runs lint and staging connectivity checks every 30 minutes and on demand.

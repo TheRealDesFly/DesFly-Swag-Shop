@@ -26,9 +26,12 @@ Set these local environment variables when testing from your machine:
 - `ISTORE_ISEND_API_USER_ID`
 - `ISTORE_ISEND_API_PASSWORD`
 - `ISTORE_ISEND_SANDBOX_URL`
+- `ISTORE_ISEND_STORAGE_CLIENT_NO`
 - `WIX_SITE_BASE_URL`
 
-You can put them in an untracked `.env` file. Start from `.env.example`; the smoke script loads `.env` automatically and does not print secret values.
+Use the iStore/iSend API context root for `ISTORE_ISEND_SANDBOX_URL`, matching the Postman `cmd_ctr_base_url` value. The code appends `/Json/...` paths such as `/Json/Public/login/`.
+
+You can put these values in an untracked `.env` file. Start from `.env.example`; the smoke script loads `.env` automatically and does not print secret values.
 
 Check whether local configuration is present:
 
@@ -48,6 +51,12 @@ Then run:
 npm run check:staging
 ```
 
+To also call the inventory endpoint from the iStore/iSend Postman example:
+
+```bash
+npm run check:staging -- --inventory
+```
+
 The script performs whichever checks it has enough configuration for:
 
 - Direct iSend staging login using local iSend credentials.
@@ -57,6 +66,7 @@ It does not print secret values.
 
 ## Troubleshooting Local Smoke Tests
 
+- iStore/iSend staging may only be active during the partner-provided service window. Current code uses 10:00 AM-10:00 PM Malaysia Time.
 - `connect ETIMEDOUT [address]` on `direct-isend-staging`: the configured iSend staging host is not reachable from the local network on its configured port. Check VPN, firewall, allowlist, endpoint host, and whether the iSend staging service is up.
 - `Wix staging iSend endpoint failed with status 404`: `WIX_SITE_BASE_URL` is reachable, but the published site at that URL does not expose `/_functions/testISendLoginFromWix`. Check that the URL points to the intended Wix site/environment and that the backend code is published there.
 - `unable to verify the first certificate`: on Windows, retry with Node's system certificate store, for example `NODE_OPTIONS=--use-system-ca npm run check:staging`.
