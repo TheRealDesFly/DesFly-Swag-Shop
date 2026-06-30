@@ -7,9 +7,9 @@ import { fetch } from 'wix-fetch';
 import { getISendConfig } from 'backend/isendConfig';
 
 const MYT_OFFSET_MINUTES = 8 * 60;
-const SERVICE_START_HOUR_MYT = 9;
-const SERVICE_END_HOUR_MYT = 23;
-const REQUEST_TIMEOUT_MS = 60000;
+const SERVICE_START_HOUR_MYT = 10;
+const SERVICE_END_HOUR_MYT = 22;
+const REQUEST_TIMEOUT_MS = 20000;
 
 
 /**
@@ -22,11 +22,15 @@ function trimTrailingSlash(value) {
 
 /**
  * Return the configured base URL for iSend API calls.
- * The current implementation always uses sandboxUrl.
  */
 function getBaseUrl(config) {
+  return trimTrailingSlash(config.baseUrl);
+}
 
-  return trimTrailingSlash(config.sandboxUrl);
+function buildISendUrl(config, path) {
+  const baseUrl = getBaseUrl(config);
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${baseUrl}${normalizedPath}`;
 }
 
 /**
@@ -35,8 +39,7 @@ function getBaseUrl(config) {
  * keeps the service window checks consistent.
  */
 function getMytDate(now) {
-  const utcMillis = now.getTime() + now.getTimezoneOffset() * 60000;
-  return new Date(utcMillis + MYT_OFFSET_MINUTES * 60000);
+  return new Date(now.getTime() + MYT_OFFSET_MINUTES * 60000);
 }
 
 /**
@@ -45,7 +48,7 @@ function getMytDate(now) {
  */
 function isWithinISendServiceWindow(now) {
   const mytDate = getMytDate(now || new Date());
-  const hour = mytDate.getHours();
+  const hour = mytDate.getUTCHours();
   return hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT;
 }
 
@@ -58,8 +61,8 @@ function getServiceWindowStatus(now) {
   const mytDate = getMytDate(checkedAt);
   return {
     timezone: 'MYT',
-    serviceStart: '09:00',
-    serviceEnd: '23:00',
+    serviceStart: '10:00',
+    serviceEnd: '22:00',
     checkedAt: checkedAt.toISOString(),
     checkedAtMYT: mytDate.toISOString().replace('Z', '+08:00'),
     withinServiceWindow: isWithinISendServiceWindow(checkedAt),
@@ -112,9 +115,9 @@ async function postJson(url, body, headers = {}) {
  * Log in to iSend to obtain a session token.
  * The returned session data is required for all subsequent iSend calls.
  */
-export async function loginToISend() {
-  const config = await getISendConfig();
-  const url = `${getBaseUrl(config)}/IsisWMS-War/Json/Public/login/`;
+export async function loginToISend(options = {}) {
+  const config = options.config || await getISendConfig(options);
+  const url = buildISendUrl(config, '/Json/Public/login/');
   const data = await postJson(url, {
     userNo: config.userNo,
     userPassword: config.userPassword,
@@ -143,10 +146,13 @@ export async function testISendLogin(options = {}) {
     };
   }
 
-  const session = await loginToISend();
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
   return {
     success: true,
     skipped: false,
+    environment: config.environment,
+    baseUrl: getBaseUrl(config),
     hasSessionId: Boolean(session.sessionId),
     hasSessionPassword: Boolean(session.sessionPassword),
     checkedAt: new Date().toISOString(),
@@ -236,7 +242,7 @@ function mapOrderToISend(order, config) {
  * Send a Wix order to iSend by creating a new order in the iSend system.
  * Returns the raw iSend response so the caller can inspect success or failure.
  */
-export async function sendOrderToISend(order) {
+export async function sendOrderToISend(order, options = {}) {
   const serviceWindow = getServiceWindowStatus(new Date());
   if (!serviceWindow.withinServiceWindow) {
     return {
@@ -247,9 +253,9 @@ export async function sendOrderToISend(order) {
     };
   }
 
-  const config = await getISendConfig();
-  const session = await loginToISend();
-  const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WebApiOrder/doAddWebApiOrder`;
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
+  const url = buildISendUrl(config, '/Json/WebApiOrder/doAddWebApiOrder');
   const payload = mapOrderToISend(order, config);
 
   return postJson(url, payload, {
@@ -261,7 +267,7 @@ export async function sendOrderToISend(order) {
 /**
  * Query iSend for tracking and order status information for a given customer order number.
  */
-export async function getTrackingInfo(customerOrderNo) {
+export async function getTrackingInfo(customerOrderNo, options = {}) {
   const serviceWindow = getServiceWindowStatus(new Date());
   if (!serviceWindow.withinServiceWindow) {
     return {
@@ -272,9 +278,9 @@ export async function getTrackingInfo(customerOrderNo) {
     };
   }
 
-  const config = await getISendConfig();
-  const session = await loginToISend();
-  const url = `${getBaseUrl(config)}/IsisWMS-War/Json/WhseOrder/doQueryOrderPage`;
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
+  const url = buildISendUrl(config, '/Json/WhseOrder/doQueryOrderPage');
 
   return postJson(url, {
     orderQuery: {
@@ -284,6 +290,39 @@ export async function getTrackingInfo(customerOrderNo) {
     pageData: {
       currentLength: 1,
       currentOffset: 0,
+    },
+  }, {
+    sessionId: session.sessionId,
+    sessionPassword: session.sessionPassword,
+  });
+}
+
+export async function queryStorageClientInventory(options = {}) {
+  const serviceWindow = getServiceWindowStatus(new Date());
+  if (!serviceWindow.withinServiceWindow && !options.force) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'Outside iStore iSend service window',
+      serviceWindow,
+    };
+  }
+
+  const config = await getISendConfig(options);
+  const session = await loginToISend({ config });
+  const url = buildISendUrl(config, '/Json/InvEntity/doQueryStorageClientInventoryPage');
+  const storageClientNo = options.storageClientNo || config.storageClientNo;
+
+  return postJson(url, {
+    storageClientInventoryQuery: {
+      storageClientNo,
+      country: options.country || 'MALAYSIA',
+      storageClientSkuNo: options.storageClientSkuNo || '',
+      skuStatus: options.skuStatus || 'ACTIVE',
+    },
+    pageData: {
+      currentLength: Number(options.currentLength || 1000),
+      currentOffset: Number(options.currentOffset || 0),
     },
   }, {
     sessionId: session.sessionId,

@@ -1,7 +1,5 @@
 # dependencies
 node_modules/
-
-# editor and local workspace files
 .vscode/
 .idea/
 .wix/

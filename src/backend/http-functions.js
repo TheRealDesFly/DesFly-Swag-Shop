@@ -5,6 +5,34 @@ import { handleWebhook } from 'backend/isendWebhookHandler';
 import { runPoller } from 'backend/isendPoller';
 import { getSecret } from 'wix-secrets-backend';
 
+function jsonResponse(status, body) {
+  return {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  };
+}
+
+function getHeader(request, name) {
+  const headers = request && request.headers ? request.headers : {};
+  const lower = name.toLowerCase();
+  for (const headerName of Object.keys(headers || {})) {
+    if (headerName.toLowerCase() === lower) {
+      return headers[headerName];
+    }
+  }
+  return undefined;
+}
+
+async function requireSecretHeader(request, headerName, secretName) {
+  const providedSecret = getHeader(request, headerName);
+  const expectedSecret = await getSecret(secretName);
+  if (!expectedSecret || providedSecret !== expectedSecret) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * A simple HTTP GET endpoint to validate iSend credentials from Wix.
  * This function is called from the frontend or a webhook tester.
@@ -16,7 +44,8 @@ import { getSecret } from 'wix-secrets-backend';
 export async function get_testISendLoginFromWix(request) {
   try {
     const force = request && request.query && request.query.force === 'true';
-    const result = await testISendLogin({ force });
+    const environment = request && request.query && (request.query.env || request.query.environment);
+    const result = await testISendLogin({ force, environment });
     return ok({
       headers: {
         'Content-Type': 'application/json',
@@ -55,26 +84,17 @@ export async function post_isendWebhook(request) {
  */
 export async function post_runISendPoller(request) {
   try {
-    // validate trigger secret header
-    const headers = request && request.headers ? request.headers : {};
-    const headerNames = Object.keys(headers || {});
-    const findHeader = (name) => {
-      const lower = name.toLowerCase();
-      for (const h of headerNames) if (h.toLowerCase() === lower) return headers[h];
-      return undefined;
-    };
-    const providedSecret = findHeader('x-isend-poller-secret');
-    const expectedSecret = await getSecret('ISEND_POLLER_TRIGGER_SECRET');
-    if (!expectedSecret || providedSecret !== expectedSecret) {
-      return serverError({ headers: { 'Content-Type': 'application/json' }, body: { success: false, message: 'Unauthorized' } });
+    if (!await requireSecretHeader(request, 'x-isend-poller-secret', 'ISEND_POLLER_TRIGGER_SECRET')) {
+      return jsonResponse(401, { success: false, message: 'Unauthorized' });
     }
 
     let payload = {};
     if (request && request.body) {
       try { payload = typeof request.body === 'string' ? JSON.parse(request.body) : request.body; } catch (e) { payload = request.body; }
     }
-    const types = payload && payload.types ? payload.types : ['tracking', 'status', 'inventory'];
-    const result = await runPoller({ types });
+    const types = payload && payload.types ? payload.types : ['tracking', 'status'];
+    const environment = payload && (payload.env || payload.environment);
+    const result = await runPoller({ types, environment });
     return ok({ headers: { 'Content-Type': 'application/json' }, body: result });
   } catch (error) {
     return serverError({ headers: { 'Content-Type': 'application/json' }, body: { success: false, message: error.message } });
@@ -87,6 +107,10 @@ export async function post_runISendPoller(request) {
  */
 export async function post_createFulfillmentFromWix(request) {
   try {
+    if (!await requireSecretHeader(request, 'x-isend-fulfillment-secret', 'ISEND_FULFILLMENT_TRIGGER_SECRET')) {
+      return jsonResponse(401, { success: false, message: 'Unauthorized' });
+    }
+
     let payload = {};
     if (request && request.body) {
       try {
@@ -99,10 +123,7 @@ export async function post_createFulfillmentFromWix(request) {
     const { orderId, lineItems, trackingNumber, shippingProvider, trackingLink, idempotencyKey } = payload || {};
 
     if (!orderId) {
-      return serverError({
-        headers: { 'Content-Type': 'application/json' },
-        body: { success: false, message: 'Missing orderId' },
-      });
+      return jsonResponse(400, { success: false, message: 'Missing orderId' });
     }
 
     const result = await createFulfillment(orderId, { lineItems, trackingNumber, shippingProvider, trackingLink, idempotencyKey });
