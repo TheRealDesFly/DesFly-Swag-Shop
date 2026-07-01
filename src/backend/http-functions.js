@@ -60,6 +60,11 @@ export async function get_testISendLoginFromWix(request) {
       body: {
         success: false,
         message: error.message,
+        diagnostics: {
+          requestPath: error.requestPath,
+          upstreamStatus: error.upstreamStatus,
+          upstreamContentType: error.upstreamContentType,
+        },
       },
     });
   }

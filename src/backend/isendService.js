@@ -50,6 +50,15 @@ function buildISendUrl(config, path) {
   return `${baseUrl}${normalizedPath}`;
 }
 
+function getUrlPath(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname;
+  } catch (error) {
+    return undefined;
+  }
+}
+
 /**
  * Convert a JavaScript Date to Malaysia Time (MYT).
  * iSend service windows are defined in MYT, so this helper
@@ -118,11 +127,23 @@ async function postJson(url, body, headers = {}) {
   try {
     data = text ? JSON.parse(text) : {};
   } catch (error) {
-    throw new Error(`iStore iSend returned non-JSON response (${response.status}): ${text.slice(0, 300)}`);
+    const responseError = new Error(`iStore iSend returned non-JSON response (${response.status}): ${text.slice(0, 300)}`);
+    responseError.upstreamStatus = response.status;
+    responseError.upstreamContentType = response.headers && response.headers.get
+      ? response.headers.get('content-type')
+      : undefined;
+    responseError.requestPath = getUrlPath(url);
+    throw responseError;
   }
 
   if (!response.ok) {
-    throw new Error(`iStore iSend HTTP ${response.status}: ${JSON.stringify(data)}`);
+    const responseError = new Error(`iStore iSend HTTP ${response.status}: ${JSON.stringify(data)}`);
+    responseError.upstreamStatus = response.status;
+    responseError.upstreamContentType = response.headers && response.headers.get
+      ? response.headers.get('content-type')
+      : undefined;
+    responseError.requestPath = getUrlPath(url);
+    throw responseError;
   }
 
   return data;

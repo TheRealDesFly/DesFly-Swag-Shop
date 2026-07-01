@@ -395,7 +395,10 @@ async function checkWixEndpoint(options) {
     const message = result.body && (result.body.message || result.body.reason)
       ? `: ${result.body.message || result.body.reason}`
       : '';
-    throw new Error(`Wix staging iSend endpoint failed with status ${result.statusCode}${message}`);
+    const diagnostics = result.body && result.body.diagnostics
+      ? ` diagnostics=${JSON.stringify(result.body.diagnostics)}`
+      : '';
+    throw new Error(`Wix staging iSend endpoint failed with status ${result.statusCode}${message}${diagnostics}`);
   }
 
   return {
