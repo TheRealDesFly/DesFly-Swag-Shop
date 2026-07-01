@@ -24,7 +24,24 @@ function trimTrailingSlash(value) {
  * Return the configured base URL for iSend API calls.
  */
 function getBaseUrl(config) {
-  return trimTrailingSlash(config.baseUrl);
+  let baseUrl = trimTrailingSlash(config.baseUrl);
+  const endpointSuffixes = [
+    '/Json/Public/login',
+    '/api/login',
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of endpointSuffixes) {
+      if (baseUrl.toLowerCase().endsWith(suffix.toLowerCase())) {
+        baseUrl = trimTrailingSlash(baseUrl.slice(0, -suffix.length));
+        changed = true;
+      }
+    }
+  }
+
+  return baseUrl;
 }
 
 function buildISendUrl(config, path) {

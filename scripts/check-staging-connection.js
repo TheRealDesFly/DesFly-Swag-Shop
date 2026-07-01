@@ -97,9 +97,30 @@ function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
 }
 
+function normalizeISendBaseUrl(value) {
+  let baseUrl = trimTrailingSlash(value);
+  const endpointSuffixes = [
+    '/Json/Public/login',
+    '/api/login',
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of endpointSuffixes) {
+      if (baseUrl.toLowerCase().endsWith(suffix.toLowerCase())) {
+        baseUrl = trimTrailingSlash(baseUrl.slice(0, -suffix.length));
+        changed = true;
+      }
+    }
+  }
+
+  return baseUrl;
+}
+
 function buildISendUrl(baseUrl, path) {
   const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
-  return `${trimTrailingSlash(baseUrl)}${normalizedPath}`;
+  return `${normalizeISendBaseUrl(baseUrl)}${normalizedPath}`;
 }
 
 function getMytDate(now) {
