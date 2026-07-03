@@ -123,6 +123,23 @@ function buildISendUrl(baseUrl, path) {
   return `${normalizeISendBaseUrl(baseUrl)}${normalizedPath}`;
 }
 
+function getUrlPath(urlString) {
+  try {
+    return new URL(urlString).pathname;
+  } catch (error) {
+    return undefined;
+  }
+}
+
+function getLoginUrls(baseUrl) {
+  const urls = [buildISendUrl(baseUrl, '/Json/Public/login/')];
+  const configuredUrl = trimTrailingSlash(baseUrl);
+  if (configuredUrl.toLowerCase().endsWith('/api/login')) {
+    urls.push(configuredUrl);
+  }
+  return urls.filter((url, index, list) => list.indexOf(url) === index);
+}
+
 function getMytDate(now) {
   return new Date(now.getTime() + MYT_OFFSET_MINUTES * 60000);
 }
@@ -321,36 +338,75 @@ async function checkDirectISend(options) {
   const skipped = skippedOutsideServiceWindow('direct-isend-staging', options);
   if (skipped) return skipped;
 
-  const url = buildISendUrl(options.stagingUrl, '/Json/Public/login/');
-  const result = await requestJson('POST', url, {
-    userNo: options.user,
-    userPassword: options.password,
-  }, options.timeout);
+  const attempts = [];
+  for (const url of getLoginUrls(options.stagingUrl)) {
+    let result;
+    try {
+      result = await requestJson('POST', url, {
+        userNo: options.user,
+        userPassword: options.password,
+      }, options.timeout);
+    } catch (error) {
+      attempts.push({
+        requestPath: getUrlPath(url),
+        error: error.message,
+      });
+      continue;
+    }
 
-  if (!result.ok || !result.body || !result.body.success) {
-    throw new Error(`Direct iSend staging login failed with status ${result.statusCode}`);
+    if (result.ok && result.body && result.body.success) {
+      return {
+        name: 'direct-isend-staging',
+        ok: true,
+        statusCode: result.statusCode,
+        loginPath: getUrlPath(url),
+        hasSession: Boolean(result.body.returnObject && result.body.returnObject.sessionId),
+      };
+    }
+
+    attempts.push({
+      requestPath: getUrlPath(url),
+      statusCode: result.statusCode,
+      contentType: result.headers && result.headers['content-type'],
+    });
   }
 
-  return {
-    name: 'direct-isend-staging',
-    ok: true,
-    statusCode: result.statusCode,
-    hasSession: Boolean(result.body.returnObject && result.body.returnObject.sessionId),
-  };
+  throw new Error(`Direct iSend staging login failed for all endpoint candidates: ${JSON.stringify(attempts)}`);
 }
 
 async function checkDirectInventory(options) {
   const skipped = skippedOutsideServiceWindow('direct-isend-inventory', options);
   if (skipped) return skipped;
 
-  const loginUrl = buildISendUrl(options.stagingUrl, '/Json/Public/login/');
-  const loginResult = await requestJson('POST', loginUrl, {
-    userNo: options.user,
-    userPassword: options.password,
-  }, options.timeout);
+  let loginResult;
+  const attempts = [];
+  for (const loginUrl of getLoginUrls(options.stagingUrl)) {
+    let candidateResult;
+    try {
+      candidateResult = await requestJson('POST', loginUrl, {
+        userNo: options.user,
+        userPassword: options.password,
+      }, options.timeout);
+    } catch (error) {
+      attempts.push({
+        requestPath: getUrlPath(loginUrl),
+        error: error.message,
+      });
+      continue;
+    }
+    if (candidateResult.ok && candidateResult.body && candidateResult.body.success) {
+      loginResult = candidateResult;
+      break;
+    }
+    attempts.push({
+      requestPath: getUrlPath(loginUrl),
+      statusCode: candidateResult.statusCode,
+      contentType: candidateResult.headers && candidateResult.headers['content-type'],
+    });
+  }
 
-  if (!loginResult.ok || !loginResult.body || !loginResult.body.success) {
-    throw new Error(`Direct iSend login before inventory failed with status ${loginResult.statusCode}`);
+  if (!loginResult) {
+    throw new Error(`Direct iSend login before inventory failed for all endpoint candidates: ${JSON.stringify(attempts)}`);
   }
 
   const session = loginResult.body.returnObject || {};

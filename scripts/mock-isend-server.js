@@ -7,7 +7,8 @@ const http = require('http');
 const server = http.createServer((req, res) => {
   if (req.method === 'POST' && (
     req.url.startsWith('/Json/Public/login') ||
-    req.url.startsWith('/IsisWMS-War/Json/Public/login')
+    req.url.startsWith('/IsisWMS-War/Json/Public/login') ||
+    req.url.endsWith('/api/login')
   )) {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));

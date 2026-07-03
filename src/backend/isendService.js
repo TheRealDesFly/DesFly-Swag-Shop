@@ -50,6 +50,15 @@ function buildISendUrl(config, path) {
   return `${baseUrl}${normalizedPath}`;
 }
 
+function getLoginUrls(config) {
+  const urls = [buildISendUrl(config, '/Json/Public/login/')];
+  const configuredUrl = trimTrailingSlash(config.baseUrl);
+  if (configuredUrl.toLowerCase().endsWith('/api/login')) {
+    urls.push(configuredUrl);
+  }
+  return urls.filter((url, index, list) => list.indexOf(url) === index);
+}
+
 function getUrlPath(url) {
   try {
     const parsed = new URL(url);
@@ -155,17 +164,47 @@ async function postJson(url, body, headers = {}) {
  */
 export async function loginToISend(options = {}) {
   const config = options.config || await getISendConfig(options);
-  const url = buildISendUrl(config, '/Json/Public/login/');
-  const data = await postJson(url, {
-    userNo: config.userNo,
-    userPassword: config.userPassword,
-  });
+  const attempts = [];
 
-  if (data.success && data.returnObject) {
-    return data.returnObject;
+  for (const url of getLoginUrls(config)) {
+    try {
+      const data = await postJson(url, {
+        userNo: config.userNo,
+        userPassword: config.userPassword,
+      });
+
+      if (data.success && data.returnObject) {
+        return {
+          ...data.returnObject,
+          loginPath: getUrlPath(url),
+        };
+      }
+
+      attempts.push({
+        requestPath: getUrlPath(url),
+        message: `iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`,
+      });
+    } catch (error) {
+      attempts.push({
+        requestPath: error.requestPath || getUrlPath(url),
+        upstreamStatus: error.upstreamStatus,
+        upstreamContentType: error.upstreamContentType,
+        message: error.message,
+      });
+    }
   }
 
-  throw new Error(`iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`);
+  const loginError = new Error('iStore iSend login failed for all configured endpoint candidates');
+  loginError.attemptedPaths = attempts.map((attempt) => ({
+    requestPath: attempt.requestPath,
+    upstreamStatus: attempt.upstreamStatus,
+    upstreamContentType: attempt.upstreamContentType,
+  }));
+  const lastAttempt = attempts[attempts.length - 1] || {};
+  loginError.requestPath = lastAttempt.requestPath;
+  loginError.upstreamStatus = lastAttempt.upstreamStatus;
+  loginError.upstreamContentType = lastAttempt.upstreamContentType;
+  throw loginError;
 }
 
 /**
@@ -191,6 +230,7 @@ export async function testISendLogin(options = {}) {
     skipped: false,
     environment: config.environment,
     baseUrl: getBaseUrl(config),
+    loginPath: session.loginPath,
     hasSessionId: Boolean(session.sessionId),
     hasSessionPassword: Boolean(session.sessionPassword),
     checkedAt: new Date().toISOString(),

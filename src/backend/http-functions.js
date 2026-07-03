@@ -64,6 +64,7 @@ export async function get_testISendLoginFromWix(request) {
           requestPath: error.requestPath,
           upstreamStatus: error.upstreamStatus,
           upstreamContentType: error.upstreamContentType,
+          attemptedPaths: error.attemptedPaths,
         },
       },
     });
