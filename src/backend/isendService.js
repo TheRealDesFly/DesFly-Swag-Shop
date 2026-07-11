@@ -10,6 +10,7 @@ const MYT_OFFSET_MINUTES = 8 * 60;
 const SERVICE_START_HOUR_MYT = 10;
 const SERVICE_END_HOUR_MYT = 22;
 const REQUEST_TIMEOUT_MS = 20000;
+const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
 
 
 /**
@@ -50,13 +51,57 @@ function buildISendUrl(config, path) {
   return `${baseUrl}${normalizedPath}`;
 }
 
+function hasISendContextRoot(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname.toLowerCase().split('/').includes('isiswms-war');
+  } catch (error) {
+    return String(url || '').toLowerCase().includes(ISEND_CONTEXT_ROOT.toLowerCase());
+  }
+}
+
+function buildISendUrlFromRoot(rootUrl, path) {
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${trimTrailingSlash(rootUrl)}${normalizedPath}`;
+}
+
 function getLoginUrls(config) {
-  const urls = [buildISendUrl(config, '/Json/Public/login/')];
+  const baseUrl = getBaseUrl(config);
+  const urls = [buildISendUrlFromRoot(baseUrl, '/Json/Public/login/')];
+  if (!hasISendContextRoot(baseUrl)) {
+    urls.push(buildISendUrlFromRoot(`${baseUrl}${ISEND_CONTEXT_ROOT}`, '/Json/Public/login/'));
+  }
   const configuredUrl = trimTrailingSlash(config.baseUrl);
   if (configuredUrl.toLowerCase().endsWith('/api/login')) {
     urls.push(configuredUrl);
   }
   return urls.filter((url, index, list) => list.indexOf(url) === index);
+}
+
+function getApiRootFromLoginUrl(url) {
+  let rootUrl = trimTrailingSlash(url);
+  const endpointSuffixes = [
+    '/Json/Public/login',
+    '/api/login',
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of endpointSuffixes) {
+      if (rootUrl.toLowerCase().endsWith(suffix.toLowerCase())) {
+        rootUrl = trimTrailingSlash(rootUrl.slice(0, -suffix.length));
+        changed = true;
+      }
+    }
+  }
+
+  return rootUrl;
+}
+
+function buildSessionUrl(config, session, path) {
+  const rootUrl = session && session.apiRoot ? session.apiRoot : getBaseUrl(config);
+  return buildISendUrlFromRoot(rootUrl, path);
 }
 
 function getUrlPath(url) {
@@ -66,6 +111,53 @@ function getUrlPath(url) {
   } catch (error) {
     return undefined;
   }
+}
+
+function getHeaderValue(headers, name) {
+  if (!headers) return undefined;
+
+  if (headers.get) {
+    const value = headers.get(name);
+    if (value) return value;
+  }
+
+  if (headers.getAll) {
+    const value = headers.getAll(name);
+    if (value && value.length) return value;
+  }
+
+  if (headers.raw) {
+    const rawHeaders = headers.raw();
+    const value = rawHeaders && (rawHeaders[name] || rawHeaders[name.toLowerCase()]);
+    if (value) return value;
+  }
+
+  return headers[name] || headers[name.toLowerCase()];
+}
+
+function splitSetCookieHeader(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+
+  return String(value)
+    .split(/,(?=\s*[^;,=\s]+=)/)
+    .map((cookie) => cookie.trim())
+    .filter(Boolean);
+}
+
+function getCookieHeader(headers) {
+  return splitSetCookieHeader(getHeaderValue(headers, 'set-cookie'))
+    .map((cookie) => String(cookie).split(';')[0])
+    .filter(Boolean)
+    .join('; ');
+}
+
+function getSessionHeaders(session) {
+  const headers = {};
+  if (session && session.sessionId) headers.sessionId = session.sessionId;
+  if (session && session.sessionPassword) headers.sessionPassword = session.sessionPassword;
+  if (session && session.cookieHeader) headers.Cookie = session.cookieHeader;
+  return headers;
 }
 
 /**
@@ -120,7 +212,7 @@ function withTimeout(promise, timeoutMs, label) {
  * Send a POST request to iSend with JSON payload and parse the response.
  * Throws an error for non-OK responses or invalid JSON.
  */
-async function postJson(url, body, headers = {}) {
+async function postJson(url, body, headers = {}, options = {}) {
   const requestHeaders = Object.assign({
     'Content-Type': 'application/json',
   }, headers);
@@ -155,6 +247,10 @@ async function postJson(url, body, headers = {}) {
     throw responseError;
   }
 
+  if (options.includeResponse) {
+    return { data, headers: response.headers };
+  }
+
   return data;
 }
 
@@ -168,14 +264,19 @@ export async function loginToISend(options = {}) {
 
   for (const url of getLoginUrls(config)) {
     try {
-      const data = await postJson(url, {
+      const result = await postJson(url, {
         userNo: config.userNo,
         userPassword: config.userPassword,
-      });
+      }, {}, { includeResponse: true });
+      const data = result.data;
+      const cookieHeader = getCookieHeader(result.headers);
 
       if (data.success && data.returnObject) {
         return {
           ...data.returnObject,
+          cookieHeader,
+          hasSessionCookie: Boolean(cookieHeader),
+          apiRoot: getApiRootFromLoginUrl(url),
           loginPath: getUrlPath(url),
         };
       }
@@ -233,6 +334,7 @@ export async function testISendLogin(options = {}) {
     loginPath: session.loginPath,
     hasSessionId: Boolean(session.sessionId),
     hasSessionPassword: Boolean(session.sessionPassword),
+    hasSessionCookie: Boolean(session.cookieHeader),
     checkedAt: new Date().toISOString(),
     serviceWindow,
   };
@@ -278,6 +380,74 @@ function getItemSku(item) {
   return item.sku || getCatalogItemId(item) || item.productId || '';
 }
 
+function getCustomerName(shipping, order) {
+  const fromShipping = shipping.fullName || `${shipping.firstName || ''} ${shipping.lastName || ''}`.trim();
+  const buyerInfo = order.buyerInfo || {};
+  return fromShipping || buyerInfo.fullName || buyerInfo.name || '';
+}
+
+function formatISendDate(value) {
+  const date = value ? new Date(value) : new Date();
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  const pad = (number) => String(number).padStart(2, '0');
+
+  return [
+    `${safeDate.getDate()}/${safeDate.getMonth() + 1}/${safeDate.getFullYear()}`,
+    `${pad(safeDate.getHours())}:${pad(safeDate.getMinutes())}:${pad(safeDate.getSeconds())}`,
+  ].join(' ');
+}
+
+function getOrderDate(order) {
+  return order._dateCreated || order.dateCreated || order.createdDate || order.orderDate || order.createdAt;
+}
+
+function getOrderAmount(order) {
+  const totals = order.totals || order.priceSummary || {};
+  const total = order.totalPrice || order.total || totals.total || totals.totalPrice || totals.subtotal;
+  const amount = total && typeof total === 'object' ? (total.amount || total.value) : total;
+  return amount === undefined || amount === null || amount === '' ? 0 : amount;
+}
+
+function getOrderCurrency(order) {
+  const totals = order.totals || order.priceSummary || {};
+  return order.currency || totals.currency || 'MYR';
+}
+
+function getLineItemPrice(item) {
+  const priceData = item.priceData || item.price || item.lineItemPrice || {};
+  const price = priceData && typeof priceData === 'object'
+    ? (priceData.price || priceData.amount || priceData.value)
+    : priceData;
+  return price === undefined || price === null || price === '' ? 0 : price;
+}
+
+function getLineItemDescription(item) {
+  return item.name || item.productName || item.description || getItemSku(item);
+}
+
+function buildCustomerAddress(order, shipping, config) {
+  const name = getCustomerName(shipping, order);
+  const buyerInfo = order.buyerInfo || {};
+
+  return {
+    customerNo: buyerInfo.id || buyerInfo.memberId || order.buyerId || config.userId,
+    customerDesc: name,
+    addrTypeNo: 'ADDRESS_TYPE_HOME',
+    city: shipping.city || getAddressValue(shipping, 'city'),
+    postcode: shipping.zipCode || shipping.postalCode || getAddressValue(shipping, 'postalCode'),
+    state: shipping.subdivision || shipping.state || getAddressValue(shipping, 'subdivision'),
+    country: shipping.country || getAddressValue(shipping, 'country'),
+    telNo: shipping.phone || getBuyerPhone(order),
+    faxNo: '',
+    email: shipping.email || getBuyerEmail(order),
+    contactPerson: name,
+    defaultAddr: false,
+    addr1: shipping.addressLine1 || getAddressValue(shipping, 'addressLine') || getAddressValue(shipping, 'addressLine1'),
+    addr2: shipping.addressLine2 || getAddressValue(shipping, 'addressLine2'),
+    addr3: shipping.addressLine3 || getAddressValue(shipping, 'addressLine3'),
+  };
+}
+
 /**
  * Convert a Wix order object into the format expected by iSend.
  * This function normalizes shipping and item fields into a single payload.
@@ -286,7 +456,8 @@ function mapOrderToISend(order, config) {
   const shipping = getShippingDetails(order);
   const lineItems = getLineItems(order);
   const orderId = order._id || order.id || order.number;
-  const consigneeName = shipping.fullName || `${shipping.firstName || ''} ${shipping.lastName || ''}`.trim();
+  const orderAmount = getOrderAmount(order);
+  const customerAddress = buildCustomerAddress(order, shipping, config);
 
   return {
     storageClientNo: config.storageClientNo,
@@ -295,23 +466,24 @@ function mapOrderToISend(order, config) {
     orderId,
     orderNumber: order.number ? String(order.number) : String(orderId),
     orderSource: config.orderSource,
-    orderDate: new Date().toLocaleDateString('en-GB'),
+    orderDate: formatISendDate(getOrderDate(order)),
     orderStatus: 'PROCESSING',
+    buyerCustAddr: customerAddress,
+    deliverToCustAddr: customerAddress,
     clickAndCollectFlag: false,
+    orderCurrency: getOrderCurrency(order),
+    orderAmountInvoiced: orderAmount,
+    orderAmountIncTax: orderAmount,
+    paymentAmountInvoiced: orderAmount,
+    orderCostAmount: orderAmount,
     codFlag: false,
-    consigneeName,
-    consigneeEmail: shipping.email || getBuyerEmail(order),
-    consigneePhone: shipping.phone || getBuyerPhone(order),
-    address1: shipping.addressLine1 || getAddressValue(shipping, 'addressLine'),
-    address2: shipping.addressLine2 || '',
-    city: shipping.city || getAddressValue(shipping, 'city'),
-    state: shipping.subdivision || getAddressValue(shipping, 'subdivision'),
-    postCode: shipping.zipCode || shipping.postalCode || getAddressValue(shipping, 'postalCode'),
-    country: shipping.country || getAddressValue(shipping, 'country'),
-    orderItemList: lineItems.map((item) => ({
-      sku: getItemSku(item),
-      itemNo: getItemSku(item),
-      quantity: Number(item.quantity || 1),
+    remark: order.note || order.buyerNote || '',
+    detailList: lineItems.map((item) => ({
+      itemId: getItemSku(item),
+      skuNo: getItemSku(item),
+      skuDesc: getLineItemDescription(item),
+      orderQty: Number(item.quantity || 1),
+      salePrice: getLineItemPrice(item),
     })),
   };
 }
@@ -333,13 +505,10 @@ export async function sendOrderToISend(order, options = {}) {
 
   const config = await getISendConfig(options);
   const session = await loginToISend({ config });
-  const url = buildISendUrl(config, '/Json/WebApiOrder/doAddWebApiOrder');
+  const url = buildSessionUrl(config, session, '/Json/WebApiOrder/doAddWebApiOrder');
   const payload = mapOrderToISend(order, config);
 
-  return postJson(url, payload, {
-    sessionId: session.sessionId,
-    sessionPassword: session.sessionPassword,
-  });
+  return postJson(url, payload, getSessionHeaders(session));
 }
 
 /**
@@ -358,7 +527,7 @@ export async function getTrackingInfo(customerOrderNo, options = {}) {
 
   const config = await getISendConfig(options);
   const session = await loginToISend({ config });
-  const url = buildISendUrl(config, '/Json/WhseOrder/doQueryOrderPage');
+  const url = buildSessionUrl(config, session, '/Json/WhseOrder/doQueryOrderPage');
 
   return postJson(url, {
     orderQuery: {
@@ -369,10 +538,7 @@ export async function getTrackingInfo(customerOrderNo, options = {}) {
       currentLength: 1,
       currentOffset: 0,
     },
-  }, {
-    sessionId: session.sessionId,
-    sessionPassword: session.sessionPassword,
-  });
+  }, getSessionHeaders(session));
 }
 
 export async function queryStorageClientInventory(options = {}) {
@@ -388,7 +554,7 @@ export async function queryStorageClientInventory(options = {}) {
 
   const config = await getISendConfig(options);
   const session = await loginToISend({ config });
-  const url = buildISendUrl(config, '/Json/InvEntity/doQueryStorageClientInventoryPage');
+  const url = buildSessionUrl(config, session, '/Json/InvEntity/doQueryStorageClientInventoryPage');
   const storageClientNo = options.storageClientNo || config.storageClientNo;
 
   return postJson(url, {
@@ -402,9 +568,6 @@ export async function queryStorageClientInventory(options = {}) {
       currentLength: Number(options.currentLength || 1000),
       currentOffset: Number(options.currentOffset || 0),
     },
-  }, {
-    sessionId: session.sessionId,
-    sessionPassword: session.sessionPassword,
-  });
+  }, getSessionHeaders(session));
 }
 

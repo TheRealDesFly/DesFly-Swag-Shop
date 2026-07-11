@@ -15,6 +15,7 @@ Environment variables supported (used as defaults):
 
 const http = require('http');
 const https = require('https');
+const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
 
 function parseArgs() {
   const argv = process.argv.slice(2);
@@ -91,17 +92,72 @@ function postJson(urlString, body, timeout) {
   });
 }
 
-async function checkLogin(baseUrl, user, pass, timeout) {
-  const url = String(baseUrl).replace(/\/+$/, '') + '/Json/Public/login/';
-  try {
-    const res = await postJson(url, { userNo: user, userPassword: pass }, timeout);
-    if (res.ok && res.body && res.body.success) {
-      return { ok: true, res };
+function trimTrailingSlash(value) {
+  return String(value || '').replace(/\/+$/, '');
+}
+
+function normalizeISendBaseUrl(value) {
+  let baseUrl = trimTrailingSlash(value);
+  const endpointSuffixes = [
+    '/Json/Public/login',
+    '/api/login',
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of endpointSuffixes) {
+      if (baseUrl.toLowerCase().endsWith(suffix.toLowerCase())) {
+        baseUrl = trimTrailingSlash(baseUrl.slice(0, -suffix.length));
+        changed = true;
+      }
     }
-    return { ok: false, res };
-  } catch (err) {
-    return { ok: false, err };
   }
+
+  return baseUrl;
+}
+
+function hasISendContextRoot(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    return parsed.pathname.toLowerCase().split('/').includes('isiswms-war');
+  } catch (error) {
+    return String(urlString || '').toLowerCase().includes(ISEND_CONTEXT_ROOT.toLowerCase());
+  }
+}
+
+function buildISendUrlFromRoot(rootUrl, path) {
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${trimTrailingSlash(rootUrl)}${normalizedPath}`;
+}
+
+function getLoginUrls(baseUrl) {
+  const normalizedBaseUrl = normalizeISendBaseUrl(baseUrl);
+  const urls = [buildISendUrlFromRoot(normalizedBaseUrl, '/Json/Public/login/')];
+  if (!hasISendContextRoot(normalizedBaseUrl)) {
+    urls.push(buildISendUrlFromRoot(`${normalizedBaseUrl}${ISEND_CONTEXT_ROOT}`, '/Json/Public/login/'));
+  }
+  const configuredUrl = trimTrailingSlash(baseUrl);
+  if (configuredUrl.toLowerCase().endsWith('/api/login')) {
+    urls.push(configuredUrl);
+  }
+  return urls.filter((url, index, list) => list.indexOf(url) === index);
+}
+
+async function checkLogin(baseUrl, user, pass, timeout) {
+  const attempts = [];
+  for (const url of getLoginUrls(baseUrl)) {
+    try {
+      const res = await postJson(url, { userNo: user, userPassword: pass }, timeout);
+      if (res.ok && res.body && res.body.success) {
+        return { ok: true, res, url };
+      }
+      attempts.push({ url, statusCode: res.statusCode, body: res.body });
+    } catch (err) {
+      attempts.push({ url, err });
+    }
+  }
+  return { ok: false, attempts };
 }
 
 /**
@@ -142,7 +198,11 @@ async function checkLogin(baseUrl, user, pass, timeout) {
     if (result.ok) {
       console.log(`  ${c.name} OK (session returned).`);
     } else {
-      console.error(`  ${c.name} FAILED`, result.err ? result.err.message : `status=${result.res && result.res.statusCode}`, result.res && result.res.body ? result.res.body : '');
+      console.error(`  ${c.name} FAILED`, JSON.stringify(result.attempts.map((attempt) => ({
+        path: attempt.url ? new URL(attempt.url).pathname : undefined,
+        statusCode: attempt.statusCode,
+        error: attempt.err && attempt.err.message,
+      }))));
       process.exit(1);
     }
   }

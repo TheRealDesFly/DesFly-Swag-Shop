@@ -20,6 +20,7 @@ const MYT_OFFSET_MINUTES = 8 * 60;
 const SERVICE_START_HOUR_MYT = 10;
 const SERVICE_END_HOUR_MYT = 22;
 const DEFAULT_TIMEOUT_MS = 20000;
+const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
 
 function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -123,6 +124,11 @@ function buildISendUrl(baseUrl, path) {
   return `${normalizeISendBaseUrl(baseUrl)}${normalizedPath}`;
 }
 
+function buildISendUrlFromRoot(rootUrl, path) {
+  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
+  return `${trimTrailingSlash(rootUrl)}${normalizedPath}`;
+}
+
 function getUrlPath(urlString) {
   try {
     return new URL(urlString).pathname;
@@ -131,13 +137,47 @@ function getUrlPath(urlString) {
   }
 }
 
+function hasISendContextRoot(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    return parsed.pathname.toLowerCase().split('/').includes('isiswms-war');
+  } catch (error) {
+    return String(urlString || '').toLowerCase().includes(ISEND_CONTEXT_ROOT.toLowerCase());
+  }
+}
+
 function getLoginUrls(baseUrl) {
-  const urls = [buildISendUrl(baseUrl, '/Json/Public/login/')];
+  const normalizedBaseUrl = normalizeISendBaseUrl(baseUrl);
+  const urls = [buildISendUrlFromRoot(normalizedBaseUrl, '/Json/Public/login/')];
+  if (!hasISendContextRoot(normalizedBaseUrl)) {
+    urls.push(buildISendUrlFromRoot(`${normalizedBaseUrl}${ISEND_CONTEXT_ROOT}`, '/Json/Public/login/'));
+  }
   const configuredUrl = trimTrailingSlash(baseUrl);
   if (configuredUrl.toLowerCase().endsWith('/api/login')) {
     urls.push(configuredUrl);
   }
   return urls.filter((url, index, list) => list.indexOf(url) === index);
+}
+
+function getApiRootFromLoginUrl(urlString) {
+  let rootUrl = trimTrailingSlash(urlString);
+  const endpointSuffixes = [
+    '/Json/Public/login',
+    '/api/login',
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of endpointSuffixes) {
+      if (rootUrl.toLowerCase().endsWith(suffix.toLowerCase())) {
+        rootUrl = trimTrailingSlash(rootUrl.slice(0, -suffix.length));
+        changed = true;
+      }
+    }
+  }
+
+  return rootUrl;
 }
 
 function getMytDate(now) {
@@ -360,7 +400,9 @@ async function checkDirectISend(options) {
         ok: true,
         statusCode: result.statusCode,
         loginPath: getUrlPath(url),
+        apiRootPath: getUrlPath(getApiRootFromLoginUrl(url)),
         hasSession: Boolean(result.body.returnObject && result.body.returnObject.sessionId),
+        hasSessionCookie: Boolean(getCookieHeader(result.headers)),
       };
     }
 
@@ -395,6 +437,7 @@ async function checkDirectInventory(options) {
       continue;
     }
     if (candidateResult.ok && candidateResult.body && candidateResult.body.success) {
+      candidateResult.loginUrl = loginUrl;
       loginResult = candidateResult;
       break;
     }
@@ -411,11 +454,11 @@ async function checkDirectInventory(options) {
 
   const session = loginResult.body.returnObject || {};
   const cookie = getCookieHeader(loginResult.headers);
-  const url = buildISendUrl(options.stagingUrl, '/Json/InvEntity/doQueryStorageClientInventoryPage');
+  const url = buildISendUrlFromRoot(getApiRootFromLoginUrl(loginResult.loginUrl), '/Json/InvEntity/doQueryStorageClientInventoryPage');
   const result = await requestJson('POST', url, {
     storageClientInventoryQuery: {
       storageClientNo: options.storageClientNo,
-      country: 'MALAYSIA',
+      country: '',
       storageClientSkuNo: '',
       skuStatus: 'ACTIVE',
     },
@@ -465,6 +508,7 @@ async function checkWixEndpoint(options) {
     environment: result.body.environment || 'staging',
     hasSessionId: Boolean(result.body.hasSessionId),
     hasSessionPassword: Boolean(result.body.hasSessionPassword),
+    hasSessionCookie: Boolean(result.body.hasSessionCookie),
   };
 }
 

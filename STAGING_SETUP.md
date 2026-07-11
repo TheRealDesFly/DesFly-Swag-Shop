@@ -29,7 +29,13 @@ Set these local environment variables when testing from your machine:
 - `ISTORE_ISEND_STORAGE_CLIENT_NO`
 - `WIX_SITE_BASE_URL`
 
-Use the iStore/iSend API context root for `ISTORE_ISEND_SANDBOX_URL`, matching the Postman `cmd_ctr_base_url` value. The code appends `/Json/...` paths such as `/Json/Public/login/`.
+Use the iStore/iSend host or API context root for `ISTORE_ISEND_SANDBOX_URL`. The backend appends `/Json/...` paths and automatically tries the `/IsisWMS-War` context root when the configured URL is host-only.
+
+Verified official context roots:
+
+- Staging: `https://staging.istoreisend-wms.com:5191/IsisWMS-War`
+- Production: `https://istoreisend-wms.com:5191/IsisWMS-War`
+- Alternate web API host supplied for testing: `https://webapi.istoreisend-wms.com/IsisWMS-War`
 
 You can put these values in an untracked `.env` file. Start from `.env.example`; the smoke script loads `.env` automatically and does not print secret values.
 
@@ -59,9 +65,9 @@ npm run check:staging -- --inventory
 
 The script performs whichever checks it has enough configuration for:
 
-- Direct iSend staging login using local iSend credentials.
+- Direct iSend staging login using local iSend credentials. The check reports whether login returned a `JSESSIONID` session cookie, but never prints the cookie value.
 - Published Wix endpoint check at `/_functions/testISendLoginFromWix?env=staging`.
-- Direct inventory query when `--inventory` is provided; it logs in first and sends the returned iSend session with the inventory request.
+- Direct inventory query when `--inventory` is provided; it logs in first and sends the returned iSend session cookie/session fields with the inventory request.
 
 It does not print secret values. Live iSend and Wix login probes are skipped outside the configured 10:00 AM-10:00 PM Malaysia Time service window unless you pass `--force`.
 

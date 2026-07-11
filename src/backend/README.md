@@ -56,7 +56,8 @@ This repo includes an iStore/iSend integration with webhook receiver and a polle
 - Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`.
 - Manual fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET` matching Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET`.
 - Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`.
-- iStore/iSend base URLs should be the API context root from their Postman `cmd_ctr_base_url`; backend code appends `/Json/...` endpoint paths.
+- iStore/iSend base URLs may be either the Postman host or the API context root with `/IsisWMS-War`; backend code appends `/Json/...` endpoint paths and tries `/IsisWMS-War` automatically for host-only URLs. Verified official roots are `https://staging.istoreisend-wms.com:5191/IsisWMS-War` and `https://istoreisend-wms.com:5191/IsisWMS-War`.
+- Login captures the `JSESSIONID` cookie returned by `/Json/Public/login/` and sends it with authenticated order, tracking, and inventory requests.
 - The configured service window is 10:00 AM-10:00 PM Malaysia Time.
 - Backend iStore/iSend requests use a 20-second timeout so Wix does not wait until a gateway timeout before returning a controlled error.
 
