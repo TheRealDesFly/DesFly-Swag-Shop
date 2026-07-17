@@ -10,58 +10,97 @@ const COLLECTION = 'ISendOrderMap';
  */
 export function mapISendStatus(iSendStatus) {
   if (!iSendStatus) return null;
-  const s = String(iSendStatus).toLowerCase();
-  if (s.includes('ship') || s.includes('shipped') || s.includes('sent') || s.includes('dispatched')) return 'SHIPPED';
-  if (s.includes('deliver') || s.includes('delivered')) return 'DELIVERED';
-  if (s.includes('cancel') || s.includes('cancelled') || s.includes('canceled')) return 'CANCELLED';
-  if (s.includes('pick') || s.includes('picked')) return 'PICKED';
-  if (s.includes('process') || s.includes('processing')) return 'PROCESSING';
-  if (s.includes('return') || s.includes('returned')) return 'RETURNED';
-  return s.toUpperCase();
+  const rawStatus = String(iSendStatus).trim();
+  const s = rawStatus.toLowerCase();
+  const canonicalStatuses = new Map([
+    ['cancelled', 'CANCELLED'],
+    ['canceled', 'CANCELLED'],
+    ['order cancelled', 'CANCELLED'],
+    ['order canceled', 'CANCELLED'],
+    ['shipment cancelled', 'CANCELLED'],
+    ['shipment canceled', 'CANCELLED'],
+    ['returned', 'RETURNED'],
+    ['order returned', 'RETURNED'],
+    ['shipped', 'SHIPPED'],
+    ['order shipped', 'SHIPPED'],
+    ['sent', 'SHIPPED'],
+    ['dispatched', 'SHIPPED'],
+    ['in transit', 'SHIPPED'],
+    ['picked', 'PICKED'],
+    ['picked up', 'PICKED'],
+    ['order picked', 'PICKED'],
+    ['processing', 'PROCESSING'],
+    ['in process', 'PROCESSING'],
+    ['order processing', 'PROCESSING'],
+  ]);
+  if (canonicalStatuses.has(s)) return canonicalStatuses.get(s);
+  const deliveredStatuses = new Set([
+    'delivered',
+    'delivered to customer',
+    'delivered to recipient',
+    'successfully delivered',
+    'delivery completed',
+  ]);
+  if (deliveredStatuses.has(s)) return 'DELIVERED';
+  return rawStatus.toUpperCase();
+}
+
+function withStatusMeta(item, iSendStatus) {
+  return {
+    ...item,
+    meta: {
+      ...(item.meta || {}),
+      lastKnownISendStatus: iSendStatus,
+      lastStatusUpdatedAt: new Date(),
+    },
+  };
 }
 
 /**
  * Update the stored mapping record with the latest iSend status.
- * If the order just became DELIVERED, this also triggers the delivery workflow.
+ * Every DELIVERED report also retries the idempotent delivery workflow so an
+ * earlier status write cannot strand unfinished audit or email side effects.
  */
 export async function updateMappingStatus(iSendOrderNo, iSendStatus) {
   if (!iSendOrderNo) return null;
   const mapping = await getByISendOrderNo(iSendOrderNo);
   if (!mapping) return null;
-  try {
-    const prevStatus = mapping.meta && mapping.meta.lastKnownISendStatus;
-    const item = Object.assign({}, mapping);
-    item.meta = item.meta || {};
-    item.meta.lastKnownISendStatus = iSendStatus;
-    item.meta.lastStatusUpdatedAt = new Date();
-    // wixData.update needs an _id field; mapping likely has _id
-    let updated = null;
-    if (item._id) {
-      updated = await wixData.update(COLLECTION, item);
-    } else {
-      // fallback: try updating by wixOrderId
-      const res = await wixData.query(COLLECTION).eq('wixOrderId', String(mapping.wixOrderId)).limit(1).find();
-      if (res.items && res.items.length) {
-        const doc = res.items[0];
-        doc.meta = item.meta;
-        updated = await wixData.update(COLLECTION, doc);
-      }
-    }
 
-    // If transitioned to DELIVERED now, trigger delivered actions
-    if (String(iSendStatus).toUpperCase() === 'DELIVERED' && prevStatus !== 'DELIVERED') {
-      try {
-        await handleDelivered(iSendOrderNo, {});
-      } catch (e) {
-        console.error('updateMappingStatus: handleDelivered failed', e.message);
-      }
+  let updated;
+  if (mapping._id) {
+    updated = await wixData.update(
+      COLLECTION,
+      withStatusMeta(mapping, iSendStatus),
+      { suppressAuth: true },
+    );
+  } else {
+    // Refresh legacy rows without an ID and merge into the current metadata,
+    // rather than copying a stale mapping snapshot over newer fields.
+    const res = await wixData.query(COLLECTION)
+      .eq('wixOrderId', String(mapping.wixOrderId))
+      .limit(1)
+      .find({ consistentRead: true, suppressAuth: true });
+    const current = res.items && res.items[0];
+    if (!current) {
+      throw new Error(`Status mapping disappeared for Wix order ${mapping.wixOrderId}`);
     }
-
-    return updated;
-  } catch (e) {
-    console.error('updateMappingStatus failed', e.message);
-    return null;
+    updated = await wixData.update(
+      COLLECTION,
+      withStatusMeta(current, iSendStatus),
+      { suppressAuth: true },
+    );
   }
+
+  if (!updated) {
+    throw new Error(`Status mapping update returned no record for ${iSendOrderNo}`);
+  }
+
+  if (String(iSendStatus).toUpperCase() === 'DELIVERED') {
+    const delivery = await handleDelivered(iSendOrderNo, {});
+    return { ...updated, delivery };
+  }
+
+  return updated;
 }
 
 export default { mapISendStatus, updateMappingStatus };

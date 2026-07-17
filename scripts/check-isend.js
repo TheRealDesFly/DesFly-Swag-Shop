@@ -77,7 +77,12 @@ function postJson(urlString, body, timeout) {
         } catch (e) {
           json = text;
         }
-        resolve({ statusCode: res.statusCode, body: json, ok: res.statusCode >= 200 && res.statusCode < 300 });
+        resolve({
+          statusCode: res.statusCode,
+          headers: res.headers || {},
+          body: json,
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+        });
       });
     });
 
@@ -144,15 +149,59 @@ function getLoginUrls(baseUrl) {
   return urls.filter((url, index, list) => list.indexOf(url) === index);
 }
 
+function splitSetCookieHeader(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  return String(value)
+    .split(/,(?=\s*[^;,=\s]+=)/)
+    .map((cookie) => cookie.trim())
+    .filter(Boolean);
+}
+
+function getAuthenticatedSessionEvidence(session, headers = {}) {
+  const hasValue = (value) => value !== undefined
+    && value !== null
+    && String(value).trim().length > 0;
+  const hasSessionFields = Boolean(session)
+    && hasValue(session.sessionId)
+    && hasValue(session.sessionPassword);
+  const hasSessionCookie = splitSetCookieHeader(headers['set-cookie'])
+    .map((cookie) => String(cookie).split(';')[0])
+    .some((cookie) => {
+      const separator = cookie.indexOf('=');
+      return separator >= 0
+        && cookie.slice(0, separator).trim().toLowerCase() === 'jsessionid'
+        && cookie.slice(separator + 1).trim().length > 0;
+    });
+  return { hasSessionFields, hasSessionCookie };
+}
+
+function isAuthenticatedLoginResponse(response) {
+  if (!response || !response.ok || !response.body || response.body.success !== true) {
+    return false;
+  }
+  const evidence = getAuthenticatedSessionEvidence(
+    response.body.returnObject,
+    response.headers,
+  );
+  return evidence.hasSessionFields || evidence.hasSessionCookie;
+}
+
 async function checkLogin(baseUrl, user, pass, timeout) {
   const attempts = [];
   for (const url of getLoginUrls(baseUrl)) {
     try {
       const res = await postJson(url, { userNo: user, userPassword: pass }, timeout);
-      if (res.ok && res.body && res.body.success) {
+      if (isAuthenticatedLoginResponse(res)) {
         return { ok: true, res, url };
       }
-      attempts.push({ url, statusCode: res.statusCode, body: res.body });
+      attempts.push({
+        url,
+        statusCode: res.statusCode,
+        reason: res.ok && res.body && res.body.success === true
+          ? 'login-success-without-session'
+          : 'login-rejected',
+      });
     } catch (err) {
       attempts.push({ url, err });
     }
@@ -164,7 +213,7 @@ async function checkLogin(baseUrl, user, pass, timeout) {
  * Main CLI entrypoint.
  * It reads command-line flags, validates required credentials, and checks staging/production login endpoints.
  */
-(async function main() {
+async function main() {
   const opts = parseArgs();
   const env = (opts.env || 'both').toLowerCase();
   const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || '10000', 10);
@@ -193,7 +242,7 @@ async function checkLogin(baseUrl, user, pass, timeout) {
   if (env === 'production' || env === 'both') checks.push({ name: 'production', url: productionUrl });
 
   for (const c of checks) {
-    console.log(`Checking ${c.name} (${c.url})...`);
+    console.log(`Checking ${c.name} iSend login...`);
     const result = await checkLogin(c.url, user, pass, timeout);
     if (result.ok) {
       console.log(`  ${c.name} OK (session returned).`);
@@ -209,4 +258,17 @@ async function checkLogin(baseUrl, user, pass, timeout) {
 
   console.log('All checks passed.');
   process.exit(0);
-})();
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  checkLogin,
+  getAuthenticatedSessionEvidence,
+  isAuthenticatedLoginResponse,
+};

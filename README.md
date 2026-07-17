@@ -9,7 +9,7 @@ This repo is connected to a Wix site. That site tracks this repo's default branc
 
 Before getting started, make sure you have the following things installed:
 * [Git](https://git-scm.com/download)
-* [Node](https://nodejs.org/en/download/), version 14.8 or later.
+* [Node](https://nodejs.org/en/download/), version 22.12 LTS (or another version allowed by `package.json` `engines`).
 * [npm](https://docs.npmjs.com/downloading-and-installing-node-js-and-npm) or [yarn](https://yarnpkg.com/getting-started/install)
 * An SSH key [added to your GitHub account](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account).
 
