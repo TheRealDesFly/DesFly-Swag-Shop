@@ -47,14 +47,17 @@ This file defines [permissions](https://support.wix.com/en/article/velo-about-we
     "invoke" : // Boolean
   }  
 }
+```
 
 ## iStore / iSend Integration Notes
 
 This repo includes an iStore/iSend integration with webhook receiver and a poller.
 
 - Webhook endpoint: `POST /_functions/isendWebhook` — expects HMAC-SHA256 signature header `X-ISEND-Signature` using secret `ISTORE_ISEND_WEBHOOK_SECRET`.
-- Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`.
-- Manual fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET` matching Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET`.
+- Staging diagnostic: `GET /_functions/testISendLoginFromWix` — protected by `X-ISEND-POLLER-SECRET`; it always selects staging and returns session-presence evidence without the iSend root or session values.
+- Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`; it always uses the site's configured iSend environment.
+- Manual outbox recovery: `POST /_functions/requeueISendOrder` — protected by the separate operator-only `X-ISEND-RECOVERY-SECRET` and limited to conclusively pre-submit, retry-exhausted records.
+- Manual fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET` matching Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET` and requires a stable `idempotencyKey` bound to the exact fulfillment request.
 - Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`.
 - iStore/iSend base URLs may be either the Postman host or the API context root with `/IsisWMS-War`; backend code appends `/Json/...` endpoint paths and tries `/IsisWMS-War` automatically for host-only URLs. Verified official roots are `https://staging.istoreisend-wms.com:5191/IsisWMS-War` and `https://istoreisend-wms.com:5191/IsisWMS-War`.
 - Login captures the `JSESSIONID` cookie returned by `/Json/Public/login/` and sends it with authenticated order, tracking, and inventory requests.
@@ -67,22 +70,30 @@ GitHub Actions workflow is provided to run staging smoke checks. To enable it, a
 - `ISTORE_ISEND_API_USER_ID`
 - `ISTORE_ISEND_API_PASSWORD`
 - `ISTORE_ISEND_SANDBOX_URL`
-- `ISTORE_ISEND_STORAGE_CLIENT_NO`
+- `ISEND_POLLER_TRIGGER_SECRET`
 
 Workflow:
-- `.github/workflows/isend-staging-smoke.yml` — runs lint and staging connectivity checks every 30 minutes and on demand.
+- `.github/workflows/isend-staging-smoke.yml` — runs locked install, lint, tests, and offline smoke validation on pull requests/pushes. It runs strict direct-plus-Wix live probes three times daily or by default-branch manual dispatch inside 10:00-22:00 MYT.
 
 Wix Data collections required:
 - `ISendOrderMap` — maps `wixOrderId` ↔ `iSendOrderNo`.
+- `ISendOrderOutbox` — stores durable order snapshots and `pending`, `processing`, `retry`, `unknown_outcome`, or `sent` state.
+- `ISendOrderOutboxClaims` — stores append-only, deterministic worker-lease generations.
 - `ISendProcessedEvents` — stores idempotency keys (`idempotencyKey`).
 - `ISendWebhookEvents` — persisted raw webhook events for auditing.
 - `ISendInventory` — optional, stores SKU inventory snapshots from webhook events.
 - `ISendPendingEmails` — optional, stores pending outbound emails for Wix Automations (fields: `to`, `subject`, `body`, `wixOrderId`, `iSendOrderNo`, `createdAt`, `sent`).
 
 Recommended indexes:
-- `ISendOrderMap.wixOrderId` unique.
-- `ISendOrderMap.iSendOrderNo` unique.
-- `ISendProcessedEvents.idempotencyKey` unique.
+- `ISendOrderMap.wixOrderId` regular; deterministic mapping IDs enforce one mapping per Wix order.
+- `ISendOrderMap.iSendOrderNo` unique so one iSend order cannot map to two Wix orders.
+- `ISendProcessedEvents.idempotencyKey` unique; deterministic IDs plus a legacy-row pre-read protect upgraded code, and the index closes old/new deployment races.
+- `ISendOrderOutbox.orderKey`, `(status, nextAttemptAt)`, `(status, retryExhausted)`, and `(status, leaseExpiresAt)`.
+- `ISendOrderOutboxClaims.(claimKey, generation)` compound and `leaseExpiresAt` regular.
+
+Keep all integration collections Admin-only. Deterministic `_id` values provide the outbox, mapping, and side-effect claim concurrency boundary; monotonic claim generations fence stale workers without deleting and reusing a claim ID. The custom indexes improve performance and add defense in depth. The hourly scheduled worker processes five orders per run inside the MYT service window, so load-test the 60-order daily capacity before production.
+
+In Wix Data, configure `ISendOrderOutbox.attemptCount`, `maxAttempts`, and `claimGeneration` as Number; `retryExhausted` as Boolean; all `*At` and `leaseExpiresAt` values as Date and Time; and snapshots/diagnostics as Object. Configure `ISendOrderOutboxClaims.generation` as Number (never Text), its lifecycle fields as Date and Time, and its identity/token fields as Text. Preserve the newest claim generation for every order; older released generations can be archived by a future retention job only after a safe interval.
 
 ### Webhook secret
 
@@ -100,7 +111,7 @@ Example `curl` test (replace `<SIG>` and `<SITE_URL>`):
 ```
 curl -X POST "<SITE_URL>/_functions/isendWebhook" \
   -H "Content-Type: application/json" \
-  -H "X-ISEND-Signature: sha256:<SIG>" \
+  -H "X-ISEND-Signature: sha256=<SIG>" \
   -d '{"orderNo":"TEST123","tracking":{"trackingNo":"TN12345"}}'
 ```
 
@@ -109,6 +120,10 @@ curl -X POST "<SITE_URL>/_functions/isendWebhook" \
 Store the poller trigger secret as a Backend-only Wix Secret named `ISEND_POLLER_TRIGGER_SECRET`.
 Call `POST /_functions/runISendPoller` with `X-ISEND-POLLER-SECRET`.
 The poller syncs tracking and order status by default. Inventory polling is not enabled until the iStore inventory API contract is confirmed.
+
+The staging diagnostic uses the poller trigger secret; the outbox recovery endpoint instead uses `ISEND_RECOVERY_TRIGGER_SECRET`, which must not be shared with automated monitoring. Recovery accepts only retry-exhausted records whose failures were conclusively before submit. Ambiguous `unknown_outcome` records cannot be automatically requeued: a timed-out request may complete after an operator checks, so quarantine the row and reconcile it with iSend support until an authoritative idempotent recovery contract exists.
+
+Fulfillment claims live in `ISendProcessedEvents` under canonical tracking keys. Only `meta.status=completed` is a safe duplicate. Reconcile `processing` or `unknown_outcome` against the Wix order's actual fulfillments; mark an existing fulfillment completed, or remove the single claim only after authoritative confirmation that no fulfillment exists. Delivery audit/email writes use deterministic IDs and retry on every `DELIVERED` report; email consumers must mark queue rows sent instead of deleting them.
 
 ### DELIVERED handling
 
@@ -128,18 +143,15 @@ To run the staging smoke-tests workflow you must add the following **repository*
 - `ISTORE_ISEND_API_USER_ID`
 - `ISTORE_ISEND_API_PASSWORD`
 - `ISTORE_ISEND_SANDBOX_URL`
+- `ISEND_POLLER_TRIGGER_SECRET`
 
 Once the secrets are added and you've pushed these workflow files to `main` (or your default branch), go to the Actions tab and run the `iSend Staging Smoke Tests` workflow (or trigger it via the `Run workflow` button). The workflow will:
 
-- Run `npm run lint`.
-- Run `npm run check:staging`, which validates direct iSend staging login and calls `/_functions/testISendLoginFromWix?env=staging` when `WIX_SITE_BASE_URL` is configured. Outside the configured iSend service window, the local smoke script skips live iSend/Wix login probes unless `--force` is provided.
+- Run `npm ci`, lint, unit tests, and secret-free smoke configuration checks on every pull request and push.
+- On scheduled or manual default-branch runs inside 10:00-22:00 MYT, require both direct iSend staging login and the protected `/_functions/testISendLoginFromWix?env=staging` probe to complete with authenticated-session evidence. Outside-window manual requests and non-default-branch live requests fail explicitly.
 
 Make sure the Wix site is published and the Backend Secrets are set (Backend-only) before running the workflow.
 
-
-
-
-```
 These values reflect the different levels of web module function permissions. You can set them using the following options:
 | |`siteOwner`|`siteMember`|`anonymous`|
 |-|-----------|------------|-----------|

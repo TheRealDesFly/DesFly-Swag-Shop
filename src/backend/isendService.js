@@ -152,6 +152,31 @@ function getCookieHeader(headers) {
     .join('; ');
 }
 
+function hasUsableValue(value) {
+  return value !== undefined
+    && value !== null
+    && String(value).trim().length > 0;
+}
+
+function hasAuthenticatedSessionFields(session) {
+  return Boolean(session)
+    && hasUsableValue(session.sessionId)
+    && hasUsableValue(session.sessionPassword);
+}
+
+function hasJSessionIdCookie(cookieHeader) {
+  return String(cookieHeader || '')
+    .split(';')
+    .some((part) => {
+      const separator = part.indexOf('=');
+      if (separator < 0) return false;
+
+      const name = part.slice(0, separator).trim().toLowerCase();
+      const value = part.slice(separator + 1).trim();
+      return name === 'jsessionid' && value.length > 0;
+    });
+}
+
 function getSessionHeaders(session) {
   const headers = {};
   if (session && session.sessionId) headers.sessionId = session.sessionId;
@@ -254,6 +279,18 @@ async function postJson(url, body, headers = {}, options = {}) {
   return data;
 }
 
+function withISendPhase(error, phase) {
+  const source = error && typeof error === 'object' ? error : {};
+  const wrapped = new Error(source.message || String(error || 'iStore iSend operation failed'));
+  wrapped.name = source.name || wrapped.name;
+  wrapped.isendPhase = phase;
+  wrapped.cause = error;
+  ['requestPath', 'upstreamStatus', 'upstreamContentType', 'attemptedPaths'].forEach((field) => {
+    if (source[field] !== undefined) wrapped[field] = source[field];
+  });
+  return wrapped;
+}
+
 /**
  * Log in to iSend to obtain a session token.
  * The returned session data is required for all subsequent iSend calls.
@@ -270,12 +307,17 @@ export async function loginToISend(options = {}) {
       }, {}, { includeResponse: true });
       const data = result.data;
       const cookieHeader = getCookieHeader(result.headers);
+      const session = data.returnObject && typeof data.returnObject === 'object'
+        ? data.returnObject
+        : {};
+      const hasSessionFields = hasAuthenticatedSessionFields(session);
+      const hasSessionCookie = hasJSessionIdCookie(cookieHeader);
 
-      if (data.success && data.returnObject) {
+      if (data.success && (hasSessionFields || hasSessionCookie)) {
         return {
-          ...data.returnObject,
+          ...session,
           cookieHeader,
-          hasSessionCookie: Boolean(cookieHeader),
+          hasSessionCookie,
           apiRoot: getApiRootFromLoginUrl(url),
           loginPath: getUrlPath(url),
         };
@@ -332,9 +374,9 @@ export async function testISendLogin(options = {}) {
     environment: config.environment,
     baseUrl: getBaseUrl(config),
     loginPath: session.loginPath,
-    hasSessionId: Boolean(session.sessionId),
-    hasSessionPassword: Boolean(session.sessionPassword),
-    hasSessionCookie: Boolean(session.cookieHeader),
+    hasSessionId: hasUsableValue(session.sessionId),
+    hasSessionPassword: hasUsableValue(session.sessionPassword),
+    hasSessionCookie: Boolean(session.hasSessionCookie),
     checkedAt: new Date().toISOString(),
     serviceWindow,
   };
@@ -398,7 +440,13 @@ function formatISendDate(value) {
 }
 
 function getOrderDate(order) {
-  return order._dateCreated || order.dateCreated || order.createdDate || order.orderDate || order.createdAt;
+  return order._createdDate
+    || order.purchasedDate
+    || order._dateCreated
+    || order.dateCreated
+    || order.createdDate
+    || order.orderDate
+    || order.createdAt;
 }
 
 function getOrderAmount(order) {
@@ -452,7 +500,7 @@ function buildCustomerAddress(order, shipping, config) {
  * Convert a Wix order object into the format expected by iSend.
  * This function normalizes shipping and item fields into a single payload.
  */
-function mapOrderToISend(order, config) {
+export function mapOrderToISend(order, config) {
   const shipping = getShippingDetails(order);
   const lineItems = getLineItems(order);
   const orderId = order._id || order.id || order.number;
@@ -503,12 +551,33 @@ export async function sendOrderToISend(order, options = {}) {
     };
   }
 
-  const config = await getISendConfig(options);
-  const session = await loginToISend({ config });
-  const url = buildSessionUrl(config, session, '/Json/WebApiOrder/doAddWebApiOrder');
-  const payload = mapOrderToISend(order, config);
+  let config;
+  try {
+    config = await getISendConfig(options);
+  } catch (error) {
+    throw withISendPhase(error, 'configuration');
+  }
 
-  return postJson(url, payload, getSessionHeaders(session));
+  let payload;
+  try {
+    payload = mapOrderToISend(order, config);
+  } catch (error) {
+    throw withISendPhase(error, 'payload');
+  }
+
+  let session;
+  try {
+    session = await loginToISend({ config });
+  } catch (error) {
+    throw withISendPhase(error, 'login');
+  }
+
+  try {
+    const url = buildSessionUrl(config, session, '/Json/WebApiOrder/doAddWebApiOrder');
+    return await postJson(url, payload, getSessionHeaders(session));
+  } catch (error) {
+    throw withISendPhase(error, 'submit');
+  }
 }
 
 /**

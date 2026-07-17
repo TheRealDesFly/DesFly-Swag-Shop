@@ -3,8 +3,35 @@
  * This makes it possible to connect incoming iSend events back to Wix orders.
  */
 import wixData from 'wix-data';
+import crypto from 'crypto';
 
 const COLLECTION = 'ISendOrderMap';
+
+function mappingItemId(wixOrderId) {
+  const digest = crypto.createHash('sha256').update(String(wixOrderId)).digest('hex');
+  return `isend-map-${digest.slice(0, 48)}`;
+}
+
+function isDuplicateKeyError(error) {
+  const signals = [
+    error && error.code,
+    error && error.errorCode,
+    error && error.name,
+    error && error.message,
+    error && error.description,
+  ];
+  try {
+    signals.push(JSON.stringify(error));
+  } catch {
+    // Scalar fields above still cover cyclic Error objects.
+  }
+  const text = signals.filter(Boolean).map(String).join(' ').toLowerCase();
+  return text.includes('wde0074')
+    || text.includes('wd_item_already_exists')
+    || text.includes('duplicate')
+    || text.includes('unique')
+    || text.includes('already exists');
+}
 
 export async function saveMapping(wixOrderId, iSendOrderNo, meta = {}) {
   if (!wixOrderId || !iSendOrderNo) {
@@ -22,12 +49,21 @@ export async function saveMapping(wixOrderId, iSendOrderNo, meta = {}) {
   }
 
   const item = {
+    _id: mappingItemId(wixOrderId),
     wixOrderId: String(wixOrderId),
     iSendOrderNo: String(iSendOrderNo),
     meta,
     createdAt: new Date(),
   };
-  return wixData.insert(COLLECTION, item);
+  try {
+    return await wixData.insert(COLLECTION, item, { suppressAuth: true });
+  } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      const concurrent = await getByWixOrderId(wixOrderId);
+      if (concurrent) return concurrent;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -39,7 +75,7 @@ export async function getByISendOrderNo(iSendOrderNo) {
   const res = await wixData.query(COLLECTION)
     .eq('iSendOrderNo', String(iSendOrderNo))
     .limit(1)
-    .find();
+    .find({ consistentRead: true, suppressAuth: true });
   return res.items && res.items.length ? res.items[0] : null;
 }
 
@@ -51,7 +87,7 @@ export async function getByWixOrderId(wixOrderId) {
   const res = await wixData.query(COLLECTION)
     .eq('wixOrderId', String(wixOrderId))
     .limit(1)
-    .find();
+    .find({ consistentRead: true, suppressAuth: true });
   return res.items && res.items.length ? res.items[0] : null;
 }
 
@@ -60,7 +96,10 @@ export async function getByWixOrderId(wixOrderId) {
  * The poller uses this to iterate through mapped orders.
  */
 export async function findMappings(limit = 100, skip = 0) {
-  const res = await wixData.query(COLLECTION).limit(limit).skip(skip).find();
+  const res = await wixData.query(COLLECTION)
+    .limit(limit)
+    .skip(skip)
+    .find({ suppressAuth: true });
   return res.items || [];
 }
 

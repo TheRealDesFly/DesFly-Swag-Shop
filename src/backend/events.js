@@ -1,77 +1,30 @@
-/*****************
- backend/events.js
- *****************
+import { enqueueISendOrderEvent } from 'backend/isendOrderOutbox';
 
- 'backend/events.js' is a reserved Velo file that enables you to handle backend events.
-
- Many of the Velo backend modules, like 'wix-stores-backend' or 'wix-media-backend', include events that are triggered when 
- specific actions occur on your site. You can write code that runs when these actions occur.
-
- For example, you can write code that sends a custom email to a customer when they pay for a store order.
-
- Example: Use the function below to capture the event of a file being uploaded to the Media Manager:
-
-   export function wixMediaManager_onFileUploaded(event) {
-       console.log('The file "' + event.fileInfo.fileName + '" was uploaded to the Media Manager');
-   }
-
- ---
- More about Velo Backend Events: 
- https://support.wix.com/en/article/velo-backend-events
-
-*******************/
-import { sendOrderToISend } from 'backend/isendService';
-import { getByWixOrderId, saveMapping } from 'backend/isendMappings';
-
-/**
- * Wix Stores event handler for new orders.
- * This function runs automatically when a new Wix order is created.
- * It sends the order to iSend and saves the mapping between Wix and iSend order numbers.
- */
-export async function wixStores_onNewOrder(event) {
-  const order = event.order;
-  const wixOrderId = order?._id || order?.id;
-
+async function enqueueOrder(event, eventName) {
   try {
-    if (wixOrderId) {
-      const existingMapping = await getByWixOrderId(wixOrderId);
-      if (existingMapping) {
-        console.log('Skipping iStore iSend submit; mapping already exists', {
-          wixOrderId,
-          iSendOrderNo: existingMapping.iSendOrderNo,
-        });
-        return;
-      }
-    }
-
-    const result = await sendOrderToISend(order);
-    console.log('iStore iSend order submit result', {
-      orderId: wixOrderId,
-      success: result?.success,
-      skipped: result?.skipped,
-      messageCount: result?.msgList?.msgList?.length || 0,
+    const result = await enqueueISendOrderEvent(event);
+    console.log('Queued Wix order for iStore iSend', {
+      eventName,
+      orderKey: result.item && result.item.orderKey,
+      duplicate: result.duplicate,
     });
-
-    // Attempt to extract iSend order number from the response and save mapping
-    try {
-      const iSendOrderNo = (result && (
-        result.returnObject && (result.returnObject.custOrderNo || result.returnObject.orderNo || result.returnObject.orderId)
-      )) || result.custOrderNo || result.orderNo || result.orderId || null;
-
-      if (wixOrderId && iSendOrderNo) {
-        await saveMapping(wixOrderId, iSendOrderNo, { raw: result });
-        console.log('Saved iSend mapping', { wixOrderId, iSendOrderNo });
-      } else {
-        console.log('No iSend order number found in response; mapping not saved', { wixOrderId });
-      }
-    } catch (e) {
-      console.error('Failed to save iSend mapping', e.message);
-    }
+    return result;
   } catch (error) {
-    console.error('iStore iSend order submit failed', {
-      orderId: wixOrderId,
+    // Rethrow so Wix can retry the event. No iSend call occurs in this handler.
+    console.error('Failed to durably queue Wix order for iStore iSend', {
+      eventName,
       message: error.message,
     });
+    throw error;
   }
 }
 
+/** Legacy Wix Stores boundary (the event itself carries the order snapshot). */
+export function wixStores_onNewOrder(event) {
+  return enqueueOrder(event, 'wixStores_onNewOrder');
+}
+
+/** Modern Wix eCommerce replacement boundary (`event.data.order`). */
+export function wixEcom_onOrderApproved(event) {
+  return enqueueOrder(event, 'wixEcom_onOrderApproved');
+}

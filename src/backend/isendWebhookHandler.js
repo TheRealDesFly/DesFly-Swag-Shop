@@ -4,15 +4,18 @@
  * and dispatches tracking, inventory, and status updates into Wix.
  */
 import { getSecret } from 'wix-secrets-backend';
+import { elevate } from 'wix-auth';
+import { orders } from 'wix-ecom-backend';
 import crypto from 'crypto';
 import wixData from 'wix-data';
-import wixStoresBackend from 'wix-stores-backend';
 import { hasProcessed, markProcessed } from 'backend/isendIdempotency';
 import { getByISendOrderNo } from 'backend/isendMappings';
 import { createFulfillment } from 'backend/orderFulfillment';
 import { mapISendStatus, updateMappingStatus } from 'backend/isendStatusMapping';
+import { consumeRequestBody, parseJsonBody, RequestBodyError } from 'backend/requestBody';
 
 const INVENTORY_COLLECTION = 'ISendInventory';
+const getOrder = elevate(orders.getOrder);
 
 /**
  * Read a request header in a case-insensitive way.
@@ -47,23 +50,34 @@ function safeTimingEqual(aHex, bHex) {
  */
 function extractTrackingNumbers(obj) {
   const results = new Set();
+  const trackingField = /^(tracking(?:no|number)?|tracking[_-]?(?:no|number)|parcel(?:no|number)?|parcel[_-]?(?:no|number)|waybill(?:no|number)?|waybill[_-]?(?:no|number)|awb(?:no|number)?)$/i;
 
-  function walker(value) {
+  function addCandidate(value) {
     if (!value) return;
     if (typeof value === 'string') {
-      // crude: tracking numbers are alphanumeric and at least 5 chars
-      if (/^[A-Z0-9\-]{5,}$/.test(value)) results.add(value);
+      if (/^[A-Z0-9\-]{5,}$/i.test(value)) results.add(value);
       return;
     }
     if (Array.isArray(value)) {
-      for (const e of value) walker(e);
+      for (const entry of value) addCandidate(entry);
+      return;
+    }
+    if (typeof value === 'object') {
+      walker(value);
+    }
+  }
+
+  function walker(value) {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      for (const entry of value) walker(entry);
       return;
     }
     if (typeof value === 'object') {
       for (const k of Object.keys(value)) {
         const v = value[k];
-        if (/tracking|trackingNo|trackingNumber|parcel|waybill|awb|logistics/i.test(k)) {
-          walker(v);
+        if (trackingField.test(k)) {
+          addCandidate(v);
         } else {
           walker(v);
         }
@@ -75,74 +89,122 @@ function extractTrackingNumbers(obj) {
   return Array.from(results);
 }
 
+function getWebhookOrderReference(payload) {
+  return payload.custOrderNo
+    || payload.order?.custOrderNo
+    || payload.orderQuery?.custOrderNo
+    || payload.orderNo
+    || payload.order?.orderNo
+    || null;
+}
+
 /**
  * Main webhook handler for iSend.
  * It verifies the request signature, deduplicates events, and routes them to the correct flow.
  */
 export async function handleWebhook(request) {
-  // raw body string used for signature
-  const rawBody = request && request.body ? (typeof request.body === 'string' ? request.body : JSON.stringify(request.body)) : '';
-
-  const providedSig = (getHeader(request, 'X-ISEND-Signature') || '').replace(/^sha256=/i, '');
-  const deliveryId = getHeader(request, 'X-ISEND-Delivery-Id') || (request && request.body && (request.body.deliveryId || request.body.eventId));
-  const eventHeader = getHeader(request, 'X-ISEND-Event');
-
-  const secret = await getSecret('ISTORE_ISEND_WEBHOOK_SECRET');
-  if (!secret) {
-    throw new Error('Webhook secret not configured (ISTORE_ISEND_WEBHOOK_SECRET)');
-  }
-
-  const computed = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-  if (!providedSig || !safeTimingEqual(computed, providedSig)) {
-    return { success: false, status: 401, message: 'Invalid signature' };
-  }
-
-  // parse payload
-  let payload = {};
   try {
-    payload = typeof request.body === 'string' ? JSON.parse(request.body) : (request.body || {});
-  } catch (e) {
-    payload = request.body || {};
-  }
+    const signatureHeader = getHeader(request, 'X-ISEND-Signature');
+    const providedSig = String(signatureHeader || '').replace(/^sha256=/i, '').trim();
+    const eventHeader = getHeader(request, 'X-ISEND-Event');
+    let secret;
+    try {
+      secret = await getSecret('ISTORE_ISEND_WEBHOOK_SECRET');
+    } catch (error) {
+      return {
+        success: false,
+        status: 503,
+        retryable: true,
+        code: 'webhook-not-configured',
+        message: 'Webhook endpoint is not configured',
+      };
+    }
 
-  const eventType = (eventHeader || payload.eventType || payload.type || '').toLowerCase();
-  const payloadHash = crypto.createHash('sha256').update(rawBody || JSON.stringify(payload || {})).digest('hex');
-  const idKey = deliveryId || `${payload.eventType || eventHeader || 'isend'}:${payloadHash}`;
+    if (!secret) {
+      return {
+        success: false,
+        status: 503,
+        retryable: true,
+        code: 'webhook-not-configured',
+        message: 'Webhook endpoint is not configured',
+      };
+    }
+
+    if (!providedSig) {
+      return { success: false, status: 401, code: 'invalid-signature', message: 'Invalid signature' };
+    }
+
+    const { rawBody, rawBytes } = await consumeRequestBody(request);
+    const computed = crypto.createHmac('sha256', secret).update(rawBytes).digest('hex');
+    if (!safeTimingEqual(computed, providedSig)) {
+      return { success: false, status: 401, code: 'invalid-signature', message: 'Invalid signature' };
+    }
+
+    // Parse only after authenticating the exact bytes received from iSend.
+    const payload = parseJsonBody(rawBody, { allowEmpty: false });
+    const trackingCandidates = extractTrackingNumbers(payload);
+    if (trackingCandidates.length > 1) {
+      return {
+        success: false,
+        status: 409,
+        code: 'unsupported-multi-tracking',
+        message: 'Multiple tracking numbers require a line-item allocation contract',
+        trackingCount: trackingCandidates.length,
+      };
+    }
+
+    const deliveryId = getHeader(request, 'X-ISEND-Delivery-Id') || payload.deliveryId || payload.eventId;
+    const eventType = String(eventHeader || payload.eventType || payload.type || '').toLowerCase();
+    const payloadHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
+    const idKey = deliveryId || `${payload.eventType || eventHeader || 'isend'}:${payloadHash}`;
 
     if (await hasProcessed(idKey)) {
-    return { success: true, skipped: true, reason: 'idempotency', idempotencyKey: idKey };
-  }
+      return { success: true, status: 200, skipped: true, reason: 'idempotency', idempotencyKey: idKey };
+    }
 
-  try {
-    if (/tracking|shipment/.test(eventType) || payload.tracking) {
-      const iSendOrderNo = payload.orderNo || payload.custOrderNo || payload.order?.orderNo || payload.orderQuery?.custOrderNo;
+    const possibleStatus = payload.orderStatus
+      || payload.order && (payload.order.orderStatus || payload.order.status)
+      || payload.tracking && payload.tracking.status
+      || payload.status;
+    const isTrackingEvent = /tracking|shipment/.test(eventType);
+    const isInventoryEvent = /inventory/.test(eventType);
+    const isStatusEvent = /order\.status|status/.test(eventType);
+    const hasRecognizedEventType = isTrackingEvent || isInventoryEvent || isStatusEvent;
+
+    // Explicit event types take precedence over incidental fields. For
+    // example, an order.status event may include SKU metadata but must not be
+    // acknowledged as an inventory update.
+    const shouldHandleTracking = (trackingCandidates.length > 0
+      && (isTrackingEvent || !hasRecognizedEventType))
+      || (isTrackingEvent && !possibleStatus);
+    if (shouldHandleTracking) {
+      const iSendOrderNo = getWebhookOrderReference(payload);
       if (!iSendOrderNo) {
-        await markProcessed(idKey, { eventType, note: 'missing iSend order number' });
-        return { success: true, processed: false, reason: 'missing-order-no' };
+        return { success: false, status: 400, code: 'missing-order-number', message: 'Missing iSend order number' };
       }
 
       const mapping = await getByISendOrderNo(iSendOrderNo);
       if (!mapping) {
-        await markProcessed(idKey, { eventType, iSendOrderNo, note: 'no mapping' });
-        return { success: true, processed: false, reason: 'no-mapping' };
+        return {
+          success: false,
+          status: 503,
+          retryable: true,
+          code: 'mapping-not-ready',
+          message: 'Order mapping is not available yet',
+        };
       }
 
       const wixOrderId = mapping.wixOrderId;
 
-      // fetch Wix order to get line items and indexes
-      let wixOrder;
-      try {
-        wixOrder = await wixStoresBackend.getOrder(wixOrderId);
-      } catch (e) {
-        // If getOrder fails, still continue but without line item indices
-        wixOrder = null;
-      }
-
-      const lineItems = (wixOrder && wixOrder.order && Array.isArray(wixOrder.order.lineItems))
-        ? wixOrder.order.lineItems.map((li) => ({ index: li.index, quantity: li.quantity }))
+      // The eCommerce Orders API returns the Order directly, including GUID line-item IDs.
+      const wixOrder = await getOrder(wixOrderId);
+      const lineItems = Array.isArray(wixOrder?.lineItems)
+        ? wixOrder.lineItems.map((lineItem) => ({
+          _id: lineItem._id || lineItem.id,
+          quantity: lineItem.quantity,
+        }))
         : [];
 
-      const trackingCandidates = extractTrackingNumbers(payload);
       if (trackingCandidates.length === 0 && payload.tracking) {
         // try common fields
         const t = payload.tracking.trackingNo || payload.tracking.trackingNumber || payload.tracking.tracking;
@@ -150,8 +212,7 @@ export async function handleWebhook(request) {
       }
 
       if (trackingCandidates.length === 0) {
-        await markProcessed(idKey, { eventType, iSendOrderNo, note: 'no-tracking-found' });
-        return { success: true, processed: false, reason: 'no-tracking' };
+        return { success: false, status: 400, code: 'missing-tracking-number', message: 'Missing tracking number' };
       }
 
       for (const trackingNo of trackingCandidates) {
@@ -160,76 +221,112 @@ export async function handleWebhook(request) {
         // Use a canonical idempotency key so both webhooks and the poller dedupe the same fulfillment
         const canonicalKey = `isend:${iSendOrderNo}:tracking:${trackingNo}`;
 
-        try {
-          await createFulfillment(wixOrderId, { lineItems, trackingNumber: trackingNo, shippingProvider, trackingLink, idempotencyKey: canonicalKey });
-        } catch (err) {
-          // log and continue
-          console.error('createFulfillment failed in webhook handler', err.message);
+        await createFulfillment(wixOrderId, { lineItems, trackingNumber: trackingNo, shippingProvider, trackingLink, idempotencyKey: canonicalKey });
+      }
+
+      // A shipment event can carry both tracking and status. Complete both
+      // idempotent effects before acknowledging the delivery.
+      if (possibleStatus) {
+        const mapped = mapISendStatus(possibleStatus);
+        const updated = await updateMappingStatus(iSendOrderNo, mapped || possibleStatus);
+        if (!updated) {
+          throw new Error(`Failed to update order status for ${iSendOrderNo}`);
         }
       }
 
       await markProcessed(idKey, { eventType, iSendOrderNo, processedAt: new Date() });
-      return { success: true, processed: true };
+      return { success: true, status: 200, processed: true };
     }
 
-    if (/inventory/.test(eventType) || payload.sku) {
+    if (isInventoryEvent
+      || (!hasRecognizedEventType && (payload.sku || payload.item?.sku))) {
       // upsert inventory record
       const sku = payload.sku || payload.item && payload.item.sku;
-      const qty = payload.availableQty || payload.quantity || payload.qty;
+      const qty = payload.availableQty ?? payload.quantity ?? payload.qty ?? 0;
       if (!sku) {
-        await markProcessed(idKey, { eventType, note: 'missing sku' });
-        return { success: true, processed: false, reason: 'missing-sku' };
+        return { success: false, status: 400, code: 'missing-sku', message: 'Missing SKU' };
       }
-      try {
-        const existing = await wixData.query(INVENTORY_COLLECTION).eq('sku', String(sku)).limit(1).find();
-        if (existing.items && existing.items.length) {
-          const item = existing.items[0];
-          item.lastKnownQty = Number(qty || 0);
-          item.updatedAt = new Date();
-          await wixData.update(INVENTORY_COLLECTION, item);
-        } else {
-          await wixData.insert(INVENTORY_COLLECTION, { sku: String(sku), lastKnownQty: Number(qty || 0), updatedAt: new Date() });
-        }
-      } catch (e) {
-        console.error('inventory upsert failed', e.message);
+      const existing = await wixData.query(INVENTORY_COLLECTION)
+        .eq('sku', String(sku))
+        .limit(1)
+        .find({ consistentRead: true, suppressAuth: true });
+      if (existing.items && existing.items.length) {
+        const item = existing.items[0];
+        item.lastKnownQty = Number(qty || 0);
+        item.updatedAt = new Date();
+        await wixData.update(INVENTORY_COLLECTION, item, { suppressAuth: true });
+      } else {
+        await wixData.insert(
+          INVENTORY_COLLECTION,
+          { sku: String(sku), lastKnownQty: Number(qty || 0), updatedAt: new Date() },
+          { suppressAuth: true },
+        );
       }
       await markProcessed(idKey, { eventType, sku });
-      return { success: true, processed: true };
+      return { success: true, status: 200, processed: true };
     }
 
     // order status events: update mapping status if possible
-    const possibleStatus = payload.status || payload.orderStatus || payload.order && (payload.order.status || payload.order.orderStatus) || payload.tracking && payload.tracking.status;
-    if ((/order\.status|status/.test(eventType) || possibleStatus) && (payload.orderNo || payload.custOrderNo || payload.order && payload.order.orderNo || payload.orderQuery && payload.orderQuery.custOrderNo)) {
-      const iSendOrderNo = payload.orderNo || payload.custOrderNo || payload.order && payload.order.orderNo || payload.orderQuery && payload.orderQuery.custOrderNo;
-      const status = possibleStatus;
-      if (iSendOrderNo && status) {
-        const mapped = mapISendStatus(status);
-        try {
-          await updateMappingStatus(iSendOrderNo, mapped || status);
-        } catch (e) {
-          console.error('updateMappingStatus failed', e.message);
-        }
+    if (isStatusEvent
+      || (possibleStatus && (!hasRecognizedEventType || isTrackingEvent))) {
+      const iSendOrderNo = getWebhookOrderReference(payload);
+      if (!iSendOrderNo) {
+        return { success: false, status: 400, code: 'missing-order-number', message: 'Missing iSend order number' };
       }
-      try {
-        await wixData.insert('ISendWebhookEvents', { deliveryId: idKey, eventType, payload, processedAt: new Date() });
-      } catch (e) {
-        console.error('failed to persist webhook event', e.message);
+      if (!possibleStatus) {
+        return { success: false, status: 400, code: 'missing-status', message: 'Missing order status' };
       }
+
+      const mapping = await getByISendOrderNo(iSendOrderNo);
+      if (!mapping) {
+        return {
+          success: false,
+          status: 503,
+          retryable: true,
+          code: 'mapping-not-ready',
+          message: 'Order mapping is not available yet',
+        };
+      }
+
+      const mapped = mapISendStatus(possibleStatus);
+      const updated = await updateMappingStatus(iSendOrderNo, mapped || possibleStatus);
+      if (!updated) {
+        throw new Error(`Failed to update order status for ${iSendOrderNo}`);
+      }
+
+      await wixData.insert(
+        'ISendWebhookEvents',
+        { deliveryId: idKey, eventType, payload, processedAt: new Date() },
+        { suppressAuth: true },
+      );
       await markProcessed(idKey, { eventType });
-      return { success: true };
+      return { success: true, status: 200, processed: true };
+    }
+
+    if (!eventType) {
+      return { success: false, status: 400, code: 'missing-event-type', message: 'Missing event type' };
     }
 
     // other event types: store raw payload
-    try {
-      await wixData.insert('ISendWebhookEvents', { deliveryId: idKey, eventType, payload, processedAt: new Date() });
-    } catch (e) {
-      console.error('failed to persist webhook event', e.message);
-    }
+    await wixData.insert(
+      'ISendWebhookEvents',
+      { deliveryId: idKey, eventType, payload, processedAt: new Date() },
+      { suppressAuth: true },
+    );
     await markProcessed(idKey, { eventType });
-    return { success: true };
+    return { success: true, status: 200, processed: true };
   } catch (err) {
+    if (err instanceof RequestBodyError) {
+      return { success: false, status: 400, code: err.code, message: err.message };
+    }
     console.error('isendWebhookHandler error', err.message);
-    return { success: false, message: err.message };
+    return {
+      success: false,
+      status: 500,
+      retryable: true,
+      code: 'webhook-processing-failed',
+      message: 'Webhook processing failed',
+    };
   }
 }
 

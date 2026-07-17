@@ -63,26 +63,151 @@ function parseArgs() {
   return opts;
 }
 
-function presence(name) {
-  return Boolean(process.env[name]);
-}
+function validateDirectISendRoot(value) {
+  if (!String(value || '').trim()) {
+    return {
+      configured: false,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL is missing',
+    };
+  }
 
-function validateSetup() {
-  const directKeys = [
-    'ISTORE_ISEND_API_USER_ID',
-    'ISTORE_ISEND_API_PASSWORD',
-    'ISTORE_ISEND_SANDBOX_URL',
-  ];
-  const wixKeys = ['WIX_SITE_BASE_URL'];
-  const directMissing = directKeys.filter((name) => !presence(name));
-  const wixMissing = wixKeys.filter((name) => !presence(name));
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (error) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL must be an absolute URL',
+    };
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL must use http or https',
+    };
+  }
+
+  if (!parsed.hostname) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL must include a hostname',
+    };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL must not contain credentials',
+    };
+  }
+
+  if (parsed.search || parsed.hash) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL must be a root URL without a query or fragment',
+    };
+  }
+
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(parsed.pathname).toLowerCase();
+  } catch (error) {
+    decodedPath = parsed.pathname.toLowerCase();
+  }
+  const pathSegments = decodedPath.split('/').filter(Boolean);
+  if (pathSegments.includes('_functions') || pathSegments.includes('_functions-dev')) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'ISTORE_ISEND_SANDBOX_URL must point directly to iSend, not to a Wix /_functions route',
+    };
+  }
 
   return {
-    directISendReady: directMissing.length === 0,
+    configured: true,
+    valid: true,
+    protocol: parsed.protocol.replace(':', ''),
+    hasContextPath: parsed.pathname !== '/',
+    hasISendContextRoot: hasISendContextRoot(value),
+  };
+}
+
+function validateSetup(values = {}) {
+  const directValues = {
+    ISTORE_ISEND_API_USER_ID: values.user,
+    ISTORE_ISEND_API_PASSWORD: values.password,
+    ISTORE_ISEND_SANDBOX_URL: values.stagingUrl,
+  };
+  const wixValues = {
+    WIX_SITE_BASE_URL: values.wixSiteUrl,
+    ISEND_POLLER_TRIGGER_SECRET: values.pollerSecret,
+  };
+  const directMissing = Object.keys(directValues)
+    .filter((name) => !String(directValues[name] || '').trim());
+  const wixMissing = Object.keys(wixValues)
+    .filter((name) => !String(wixValues[name] || '').trim());
+  const stagingUrl = validateDirectISendRoot(values.stagingUrl);
+
+  return {
+    directISendReady: directMissing.length === 0 && stagingUrl.valid,
     wixEndpointReady: wixMissing.length === 0,
-    inventoryReady: directMissing.length === 0 && presence('ISTORE_ISEND_STORAGE_CLIENT_NO'),
+    inventoryReady: directMissing.length === 0
+      && stagingUrl.valid
+      && Boolean(String(values.storageClientNo || '').trim()),
     directMissing,
     wixMissing,
+    stagingUrl,
+  };
+}
+
+function setupMeetsRequirements(setup, opts) {
+  const configuredUrlIsValid = !setup.stagingUrl.configured || setup.stagingUrl.valid;
+  if (!configuredUrlIsValid) return false;
+
+  if ((opts['require-direct'] && opts['skip-direct'])
+    || (opts['require-wix'] && opts['skip-wix'])) {
+    return false;
+  }
+
+  const requireLive = Boolean(opts['require-live']);
+  const requireDirect = Boolean(opts['require-direct'])
+    || (requireLive && !opts['skip-direct']);
+  const requireWix = Boolean(opts['require-wix'])
+    || (requireLive && !opts['skip-wix']);
+  if (requireDirect || requireWix) {
+    return (!requireDirect || setup.directISendReady)
+      && (!requireWix || setup.wixEndpointReady);
+  }
+
+  return setup.directISendReady || setup.wixEndpointReady;
+}
+
+function summarizeResults(results) {
+  const summary = {
+    passed: results.filter((result) => result.status === 'passed').length,
+    skipped: results.filter((result) => result.status === 'skipped').length,
+    failed: results.filter((result) => result.status === 'failed').length,
+  };
+  let outcome = 'passed';
+  if (summary.failed > 0) {
+    outcome = 'failed';
+  } else if (summary.passed === 0) {
+    outcome = 'neutral';
+  } else if (summary.skipped > 0) {
+    outcome = 'partial';
+  }
+
+  return {
+    outcome,
+    success: outcome === 'passed',
+    summary,
   };
 }
 
@@ -203,7 +328,8 @@ function skippedOutsideServiceWindow(name, options) {
 
   return {
     name,
-    ok: true,
+    ok: null,
+    status: 'skipped',
     skipped: true,
     reason: 'Outside iStore iSend service window',
     serviceWindow: options.serviceWindow,
@@ -218,11 +344,54 @@ function getSessionHeaders(session, cookie) {
   return headers;
 }
 
+function splitSetCookieHeader(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+
+  return String(value)
+    .split(/,(?=\s*[^;,=\s]+=)/)
+    .map((cookie) => cookie.trim())
+    .filter(Boolean);
+}
+
 function getCookieHeader(headers) {
   const cookies = headers && headers['set-cookie'];
   if (!cookies) return '';
-  const list = Array.isArray(cookies) ? cookies : [cookies];
-  return list.map((cookie) => String(cookie).split(';')[0]).filter(Boolean).join('; ');
+  return splitSetCookieHeader(cookies)
+    .map((cookie) => String(cookie).split(';')[0])
+    .filter(Boolean)
+    .join('; ');
+}
+
+function hasUsableValue(value) {
+  return value !== undefined
+    && value !== null
+    && String(value).trim().length > 0;
+}
+
+function hasJSessionIdCookie(cookieHeader) {
+  return String(cookieHeader || '')
+    .split(';')
+    .some((part) => {
+      const separator = part.indexOf('=');
+      if (separator < 0) return false;
+
+      const name = part.slice(0, separator).trim().toLowerCase();
+      const value = part.slice(separator + 1).trim();
+      return name === 'jsessionid' && value.length > 0;
+    });
+}
+
+function getAuthenticatedSessionEvidence(session, headers) {
+  const hasSessionId = Boolean(session) && hasUsableValue(session.sessionId);
+  const hasSessionPassword = Boolean(session) && hasUsableValue(session.sessionPassword);
+  const cookieHeader = getCookieHeader(headers);
+
+  return {
+    cookieHeader,
+    hasSessionFields: hasSessionId && hasSessionPassword,
+    hasSessionCookie: hasJSessionIdCookie(cookieHeader),
+  };
 }
 
 function requestJson(method, urlString, body, timeout, headers = {}) {
@@ -334,8 +503,6 @@ async function diagnose(options) {
     const wixPaths = [
       '/_functions/testISendLoginFromWix?env=staging',
       '/_functions-dev/testISendLoginFromWix?env=staging',
-      '/_functions/testISendLoginFromWix?force=true&env=staging',
-      '/_functions-dev/testISendLoginFromWix?force=true&env=staging',
       '/_functions/testISendLoginFromWix',
       '/_functions-dev/testISendLoginFromWix',
       '/_functions/isendWebhook',
@@ -394,15 +561,19 @@ async function checkDirectISend(options) {
       continue;
     }
 
-    if (result.ok && result.body && result.body.success) {
+    const session = result.body && result.body.returnObject;
+    const evidence = getAuthenticatedSessionEvidence(session, result.headers);
+    const { hasSessionFields, hasSessionCookie } = evidence;
+    if (result.ok && result.body && result.body.success && (hasSessionFields || hasSessionCookie)) {
       return {
         name: 'direct-isend-staging',
         ok: true,
+        status: 'passed',
         statusCode: result.statusCode,
         loginPath: getUrlPath(url),
         apiRootPath: getUrlPath(getApiRootFromLoginUrl(url)),
-        hasSession: Boolean(result.body.returnObject && result.body.returnObject.sessionId),
-        hasSessionCookie: Boolean(getCookieHeader(result.headers)),
+        hasSession: hasSessionFields,
+        hasSessionCookie,
       };
     }
 
@@ -410,6 +581,9 @@ async function checkDirectISend(options) {
       requestPath: getUrlPath(url),
       statusCode: result.statusCode,
       contentType: result.headers && result.headers['content-type'],
+      reason: result.ok && result.body && result.body.success
+        ? 'login-success-without-session'
+        : undefined,
     });
   }
 
@@ -421,6 +595,7 @@ async function checkDirectInventory(options) {
   if (skipped) return skipped;
 
   let loginResult;
+  let loginEvidence;
   const attempts = [];
   for (const loginUrl of getLoginUrls(options.stagingUrl)) {
     let candidateResult;
@@ -436,15 +611,25 @@ async function checkDirectInventory(options) {
       });
       continue;
     }
-    if (candidateResult.ok && candidateResult.body && candidateResult.body.success) {
+    const session = candidateResult.body && candidateResult.body.returnObject;
+    const evidence = getAuthenticatedSessionEvidence(session, candidateResult.headers);
+    const { hasSessionFields, hasSessionCookie } = evidence;
+    if (candidateResult.ok
+      && candidateResult.body
+      && candidateResult.body.success
+      && (hasSessionFields || hasSessionCookie)) {
       candidateResult.loginUrl = loginUrl;
       loginResult = candidateResult;
+      loginEvidence = evidence;
       break;
     }
     attempts.push({
       requestPath: getUrlPath(loginUrl),
       statusCode: candidateResult.statusCode,
       contentType: candidateResult.headers && candidateResult.headers['content-type'],
+      reason: candidateResult.ok && candidateResult.body && candidateResult.body.success
+        ? 'login-success-without-session'
+        : undefined,
     });
   }
 
@@ -453,7 +638,7 @@ async function checkDirectInventory(options) {
   }
 
   const session = loginResult.body.returnObject || {};
-  const cookie = getCookieHeader(loginResult.headers);
+  const cookie = loginEvidence.cookieHeader;
   const url = buildISendUrlFromRoot(getApiRootFromLoginUrl(loginResult.loginUrl), '/Json/InvEntity/doQueryStorageClientInventoryPage');
   const result = await requestJson('POST', url, {
     storageClientInventoryQuery: {
@@ -476,6 +661,7 @@ async function checkDirectInventory(options) {
   return {
     name: 'direct-isend-inventory',
     ok: true,
+    status: 'passed',
     statusCode: result.statusCode,
     totalRecord: Number(returnObject.totalRecord || 0),
     totalSize: Number(returnObject.totalSize || 0),
@@ -488,27 +674,43 @@ async function checkWixEndpoint(options) {
 
   const forceParam = options.force ? '&force=true' : '';
   const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix?env=staging${forceParam}`;
-  const result = await requestJson('GET', url, null, options.timeout);
+  const result = await requestJson('GET', url, null, options.timeout, {
+    'X-ISEND-POLLER-SECRET': options.pollerSecret,
+  });
 
-  if (!result.ok || !result.body || (!result.body.success && !result.body.skipped)) {
+  const hasSessionId = Boolean(result.body) && result.body.hasSessionId === true;
+  const hasSessionPassword = Boolean(result.body) && result.body.hasSessionPassword === true;
+  const hasSessionCookie = Boolean(result.body) && result.body.hasSessionCookie === true;
+  const hasAuthenticatedSession = (hasSessionId && hasSessionPassword) || hasSessionCookie;
+  if (!result.ok
+    || !result.body
+    || (!result.body.success && !result.body.skipped)
+    || (result.body.success && !hasAuthenticatedSession)) {
     const message = result.body && (result.body.message || result.body.reason)
       ? `: ${result.body.message || result.body.reason}`
       : '';
     const diagnostics = result.body && result.body.diagnostics
       ? ` diagnostics=${JSON.stringify(result.body.diagnostics)}`
       : '';
-    throw new Error(`Wix staging iSend endpoint failed with status ${result.statusCode}${message}${diagnostics}`);
+    const sessionMessage = result.body && result.body.success && !hasAuthenticatedSession
+      ? ': login reported success without an authenticated session'
+      : message;
+    throw new Error(`Wix staging iSend endpoint failed with status ${result.statusCode}${sessionMessage}${diagnostics}`);
   }
 
   return {
     name: 'wix-isend-staging',
-    ok: true,
+    ok: result.body.skipped ? null : true,
+    status: result.body.skipped ? 'skipped' : 'passed',
     skipped: Boolean(result.body.skipped),
+    reason: result.body.skipped
+      ? (result.body.reason || 'Wix endpoint skipped the live iSend probe')
+      : undefined,
     statusCode: result.statusCode,
     environment: result.body.environment || 'staging',
-    hasSessionId: Boolean(result.body.hasSessionId),
-    hasSessionPassword: Boolean(result.body.hasSessionPassword),
-    hasSessionCookie: Boolean(result.body.hasSessionCookie),
+    hasSessionId,
+    hasSessionPassword,
+    hasSessionCookie,
   };
 }
 
@@ -516,10 +718,25 @@ async function main() {
   loadDotEnv(path.join(process.cwd(), '.env'));
 
   const opts = parseArgs();
+  const configuredValues = {
+    user: opts.user || process.env.ISTORE_ISEND_API_USER_ID || process.env.ISTORE_ISEND_API_USER,
+    password: opts.password || process.env.ISTORE_ISEND_API_PASSWORD || process.env.ISTORE_ISEND_API_PASS,
+    stagingUrl: opts['staging-url'] || process.env.ISTORE_ISEND_SANDBOX_URL,
+    wixSiteUrl: opts['wix-site-url'] || process.env.WIX_SITE_BASE_URL,
+    pollerSecret: opts['poller-secret'] || process.env.ISEND_POLLER_TRIGGER_SECRET,
+    storageClientNo: opts['storage-client-no'] || process.env.ISTORE_ISEND_STORAGE_CLIENT_NO,
+  };
+  const setup = validateSetup(configuredValues);
+
   if (opts['validate-setup']) {
-    const setup = validateSetup();
-    console.log(JSON.stringify({ success: setup.directISendReady || setup.wixEndpointReady, setup }, null, 2));
-    process.exit(setup.directISendReady || setup.wixEndpointReady ? 0 : 2);
+    const success = setupMeetsRequirements(setup, opts);
+    console.log(JSON.stringify({
+      mode: 'offline-configuration-validation',
+      outcome: success ? 'passed' : 'failed',
+      success,
+      setup,
+    }, null, 2));
+    process.exit(success ? 0 : 2);
   }
 
   const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || String(DEFAULT_TIMEOUT_MS), 10);
@@ -527,12 +744,18 @@ async function main() {
     timeout,
     force: Boolean(opts.force),
     serviceWindow: getServiceWindowStatus(new Date()),
-    user: opts.user || process.env.ISTORE_ISEND_API_USER_ID || process.env.ISTORE_ISEND_API_USER,
-    password: opts.password || process.env.ISTORE_ISEND_API_PASSWORD || process.env.ISTORE_ISEND_API_PASS,
-    stagingUrl: opts['staging-url'] || process.env.ISTORE_ISEND_SANDBOX_URL,
-    wixSiteUrl: opts['wix-site-url'] || process.env.WIX_SITE_BASE_URL,
-    storageClientNo: opts['storage-client-no'] || process.env.ISTORE_ISEND_STORAGE_CLIENT_NO,
+    ...configuredValues,
   };
+
+  if (!setupMeetsRequirements(setup, opts)) {
+    console.error(JSON.stringify({
+      mode: 'configuration-validation',
+      outcome: 'failed',
+      success: false,
+      setup,
+    }, null, 2));
+    process.exit(2);
+  }
 
   if (opts.diagnose) {
     const report = await diagnose(options);
@@ -541,8 +764,13 @@ async function main() {
   }
 
   const shouldCheckDirect = !opts['skip-direct'] && options.user && options.password && options.stagingUrl;
-  const shouldCheckInventory = opts.inventory && options.storageClientNo && options.stagingUrl && options.user && options.password;
-  const shouldCheckWix = !opts['skip-wix'] && options.wixSiteUrl;
+  const shouldCheckInventory = !opts['skip-direct']
+    && opts.inventory
+    && options.storageClientNo
+    && options.stagingUrl
+    && options.user
+    && options.password;
+  const shouldCheckWix = !opts['skip-wix'] && options.wixSiteUrl && options.pollerSecret;
   const checks = [];
 
   if (shouldCheckDirect) checks.push({ name: 'direct-isend-staging', run: () => checkDirectISend(options) });
@@ -552,7 +780,7 @@ async function main() {
   if (!checks.length) {
     console.error('No staging checks can run. Provide direct iSend env vars and/or WIX_SITE_BASE_URL.');
     console.error('Direct iSend: ISTORE_ISEND_API_USER_ID, ISTORE_ISEND_API_PASSWORD, ISTORE_ISEND_SANDBOX_URL');
-    console.error('Wix endpoint: WIX_SITE_BASE_URL');
+    console.error('Wix endpoint: WIX_SITE_BASE_URL, ISEND_POLLER_TRIGGER_SECRET');
     process.exit(2);
   }
 
@@ -564,17 +792,31 @@ async function main() {
       results.push({
         name: check.name,
         ok: false,
+        status: 'failed',
         error: sanitizeError(error),
       });
     }
   }
 
-  const success = results.every((result) => result.ok);
-  console.log(JSON.stringify({ success, checks: results }, null, 2));
-  process.exit(success ? 0 : 1);
+  const { outcome, success, summary } = summarizeResults(results);
+  console.log(JSON.stringify({ outcome, success, summary, checks: results }, null, 2));
+
+  if (summary.failed > 0) process.exit(1);
+  if (opts['require-live'] && !success) process.exit(2);
+  process.exit(0);
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  getAuthenticatedSessionEvidence,
+  setupMeetsRequirements,
+  summarizeResults,
+  validateDirectISendRoot,
+  validateSetup,
+};

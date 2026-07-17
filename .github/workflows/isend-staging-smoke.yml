@@ -1,32 +1,141 @@
 name: iSend Staging Smoke Tests
 
 on:
+  pull_request:
+  push:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    # 11:23, 15:23, and 19:23 MYT; all are inside the 10:00-22:00 service window.
+    - cron: "23 3,7,11 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isend-staging-smoke-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  staging-smoke:
+  offline_checks:
+    name: Offline validation
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
+          cache: npm
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install locked dependencies
+        run: npm ci
 
       - name: Lint
         run: npm run lint
 
-      - name: Check staging iSend connectivity
-        run: npm run check:staging
+      - name: Unit tests
+        run: npm test
+
+      - name: Check smoke script syntax
+        run: node --check scripts/check-staging-connection.js
+
+      - name: Validate a direct iSend root without making requests
+        run: npm run check:staging:setup -- --require-direct
+        env:
+          ISTORE_ISEND_API_USER_ID: offline-check-user
+          ISTORE_ISEND_API_PASSWORD: offline-check-password
+          ISTORE_ISEND_SANDBOX_URL: https://example.invalid/IsisWMS-War
+
+      - name: Reject a Wix function URL as the iSend root
+        shell: bash
+        run: |
+          if npm run check:staging:setup -- --require-direct; then
+            echo "::error::A Wix /_functions route was accepted as ISTORE_ISEND_SANDBOX_URL"
+            exit 1
+          fi
+        env:
+          ISTORE_ISEND_API_USER_ID: offline-check-user
+          ISTORE_ISEND_API_PASSWORD: offline-check-password
+          ISTORE_ISEND_SANDBOX_URL: https://example.wixsite.com/store/_functions/isendWebhook
+
+  service_window:
+    name: MYT service-window gate
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      within: ${{ steps.window.outputs.within }}
+    steps:
+      - name: Check current Malaysia time
+        id: window
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          expected_ref="refs/heads/${DEFAULT_BRANCH}"
+          if [[ "$GITHUB_REF" != "$expected_ref" ]]; then
+            echo "::error::Live staging probes are restricted to ${expected_ref}; got ${GITHUB_REF}"
+            exit 1
+          fi
+
+          utc_hour="$(date -u +%H)"
+          myt_hour=$(( (10#$utc_hour + 8) % 24 ))
+          if (( myt_hour >= 10 && myt_hour < 22 )); then
+            echo "within=true" >> "$GITHUB_OUTPUT"
+            echo "Live probes are enabled at ${myt_hour}:00 MYT." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "within=false" >> "$GITHUB_OUTPUT"
+            echo "## Live probe outcome: neutral" >> "$GITHUB_STEP_SUMMARY"
+            echo "No network probe ran because the workflow started outside 10:00-22:00 MYT." >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "::error::Manual live probe requested outside the iSend service window"
+              exit 1
+            fi
+            echo "::notice::Scheduled live staging probe skipped outside the iSend service window"
+          fi
+
+  live_probe:
+    name: Live staging probe
+    needs:
+      - offline_checks
+      - service_window
+    if: ${{ needs.service_window.outputs.within == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Require complete live-probe configuration
+        run: npm run check:staging:setup -- --require-direct --require-wix
         env:
           ISTORE_ISEND_API_USER_ID: ${{ secrets.ISTORE_ISEND_API_USER_ID }}
           ISTORE_ISEND_API_PASSWORD: ${{ secrets.ISTORE_ISEND_API_PASSWORD }}
           ISTORE_ISEND_SANDBOX_URL: ${{ secrets.ISTORE_ISEND_SANDBOX_URL }}
           WIX_SITE_BASE_URL: ${{ secrets.WIX_SITE_BASE_URL }}
+          ISEND_POLLER_TRIGGER_SECRET: ${{ secrets.ISEND_POLLER_TRIGGER_SECRET }}
+
+      - name: Check direct and Wix staging connectivity
+        run: npm run check:staging -- --require-direct --require-wix --require-live
+        env:
+          ISTORE_ISEND_API_USER_ID: ${{ secrets.ISTORE_ISEND_API_USER_ID }}
+          ISTORE_ISEND_API_PASSWORD: ${{ secrets.ISTORE_ISEND_API_PASSWORD }}
+          ISTORE_ISEND_SANDBOX_URL: ${{ secrets.ISTORE_ISEND_SANDBOX_URL }}
+          WIX_SITE_BASE_URL: ${{ secrets.WIX_SITE_BASE_URL }}
+          ISEND_POLLER_TRIGGER_SECRET: ${{ secrets.ISEND_POLLER_TRIGGER_SECRET }}
