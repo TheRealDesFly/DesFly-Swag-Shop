@@ -143,25 +143,7 @@ export async function handleWebhook(request) {
     // Parse only after authenticating the exact bytes received from iSend.
     const payload = parseJsonBody(rawBody, { allowEmpty: false });
     const trackingCandidates = extractTrackingNumbers(payload);
-    if (trackingCandidates.length > 1) {
-      return {
-        success: false,
-        status: 409,
-        code: 'unsupported-multi-tracking',
-        message: 'Multiple tracking numbers require a line-item allocation contract',
-        trackingCount: trackingCandidates.length,
-      };
-    }
-
-    const deliveryId = getHeader(request, 'X-ISEND-Delivery-Id') || payload.deliveryId || payload.eventId;
     const eventType = String(eventHeader || payload.eventType || payload.type || '').toLowerCase();
-    const payloadHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
-    const idKey = deliveryId || `${payload.eventType || eventHeader || 'isend'}:${payloadHash}`;
-
-    if (await hasProcessed(idKey)) {
-      return { success: true, status: 200, skipped: true, reason: 'idempotency', idempotencyKey: idKey };
-    }
-
     const possibleStatus = payload.orderStatus
       || payload.order && (payload.order.orderStatus || payload.order.status)
       || payload.tracking && payload.tracking.status
@@ -177,6 +159,24 @@ export async function handleWebhook(request) {
     const shouldHandleTracking = (trackingCandidates.length > 0
       && (isTrackingEvent || !hasRecognizedEventType))
       || (isTrackingEvent && !possibleStatus);
+    if (shouldHandleTracking && trackingCandidates.length > 1) {
+      return {
+        success: false,
+        status: 409,
+        code: 'unsupported-multi-tracking',
+        message: 'Multiple tracking numbers require a line-item allocation contract',
+        trackingCount: trackingCandidates.length,
+      };
+    }
+
+    const deliveryId = getHeader(request, 'X-ISEND-Delivery-Id') || payload.deliveryId || payload.eventId;
+    const payloadHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
+    const idKey = deliveryId || `${payload.eventType || eventHeader || 'isend'}:${payloadHash}`;
+
+    if (await hasProcessed(idKey)) {
+      return { success: true, status: 200, skipped: true, reason: 'idempotency', idempotencyKey: idKey };
+    }
+
     if (shouldHandleTracking) {
       const iSendOrderNo = getWebhookOrderReference(payload);
       if (!iSendOrderNo) {

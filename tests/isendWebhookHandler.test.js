@@ -210,6 +210,25 @@ describe('iSend webhook handling', () => {
     expect(mocks.markProcessed).toHaveBeenCalledTimes(1);
   });
 
+  it('ignores incidental multiple tracking numbers on an explicit status event', async () => {
+    const { request } = signedRequest({
+      eventType: 'order.status.updated',
+      orderNo: 'ORDER123',
+      status: 'delivered',
+      parcels: [
+        { trackingNo: 'TRACK123' },
+        { trackingNo: 'TRACK456' },
+      ],
+    });
+
+    const result = await handleWebhook(request);
+
+    expect(result).toMatchObject({ success: true, status: 200, processed: true });
+    expect(mocks.updateMappingStatus).toHaveBeenCalledWith('ORDER123', 'DELIVERED');
+    expect(mocks.createFulfillment).not.toHaveBeenCalled();
+    expect(mocks.markProcessed).toHaveBeenCalledTimes(1);
+  });
+
   it('honors an explicit status event even when the payload contains SKU metadata', async () => {
     const { request } = signedRequest({
       eventType: 'order.status.updated',
