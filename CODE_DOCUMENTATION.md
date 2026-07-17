@@ -68,6 +68,10 @@ Functions:
   - Uses the Wix secret `ISTORE_ISEND_ENV` when no option is passed.
   - Returns an object with `storageClientNo`, `userNo`, `userPassword`, `orderOrigin`, `userId`, `orderSource`, `baseUrl`, and `environment`.
 
+- `getConfiguredISendEnvironment(options = {})`
+  - Reads and normalizes only `ISTORE_ISEND_ENV` for durable queue and mapping boundaries.
+  - Accepts an explicit internal environment for trusted workers/tests and rejects missing or invalid selectors.
+
 This module is the central source of truth for iSend credentials and endpoints.
 
 ---
@@ -111,8 +115,9 @@ This module stores and reads mappings between Wix order IDs and iSend order numb
 
 Functions:
 
-- `saveMapping(wixOrderId, iSendOrderNo, meta = {})`
+- `saveMapping(wixOrderId, iSendOrderNo, meta = {}, environment)`
   - Saves a new mapping record into `ISendOrderMap`.
+  - Persists an immutable `staging` or `production` binding and rejects an existing mapping from another environment.
   - `meta` can store raw response data or additional context.
 
 - `getByISendOrderNo(iSendOrderNo)`
@@ -121,8 +126,26 @@ Functions:
 - `getByWixOrderId(wixOrderId)`
   - Finds a mapping by Wix order ID.
 
-- `findMappings(limit = 100, skip = 0)`
-  - Reads a batch of mapping records.
+- `findMappings(limit = 100, skip = 0, environment)`
+  - Reads a stably ordered, current-environment batch for the protected manual poller.
+
+- `findMappingsForReconciliation(environment, limit = 5)`
+  - Reads only current-environment active mappings, oldest reconciliation attempt first, for the scheduled safety net.
+
+- `findUnclassifiedMappingsForReconciliation(environment, limit = 5)`
+  - Selects a bounded, already environment-bound pre-upgrade batch whose reconciliation state still needs initialization.
+
+- `findReconciliationEnvironmentConflicts(environment)`
+  - Finds active other-environment or unassigned legacy mappings so the scheduled job fails without querying iSend.
+
+- `updateMappingReconciliation(iSendOrderNo, fields, environment)`
+  - Updates reconciliation scheduling fields under the distributed mapping-mutation lease.
+
+---
+
+## src/backend/isendMappingMutationLock.js
+
+This module serializes full-item `ISendOrderMap` writes across Wix workers. It stores append-only, deterministic generations in `ISendOrderOutboxClaims` under `isend-mapping:<iSendOrderNo>`. A 30-second lease, same-generation insert race, and token-fenced release prevent concurrent webhook, status, delivery, and poller updates from replacing one another.
 
 Mapping lookup is essential when webhook events arrive from iSend and need to be connected to Wix orders.
 
@@ -168,9 +191,14 @@ Functions:
 - `testISendLogin(options = {})`
   - Tests login and returns whether it is valid.
 
+- `mapOrderToISend(order, config)`
+  - Normalizes numeric strings and SKU whitespace, then rejects missing identity, empty items, blank SKUs, invalid quantities/prices/totals, and incomplete delivery contact/address data.
+  - Fully zero-total orders fail closed until the partner contract explicitly permits them; zero-priced promotional lines remain valid inside a positive-total order.
+
 - `sendOrderToISend(order)`
   - Converts a Wix order into iSend format and sends it.
   - Skips the call if the current time is outside the iSend service window.
+  - Classifies validation failures as the `payload` phase before any login or submit request.
 
 - `getTrackingInfo(customerOrderNo)`
   - Queries iSend for tracking and order details for a given order number.
@@ -188,11 +216,13 @@ Functions:
 - `mapISendStatus(iSendStatus)`
   - Converts raw iSend status text into canonical labels such as `SHIPPED`, `DELIVERED`, `CANCELLED`, `PICKED`, `PROCESSING`, and `RETURNED`.
 
-- `updateMappingStatus(iSendOrderNo, iSendStatus)`
+- `updateMappingStatus(iSendOrderNo, iSendStatus, options = {})`
   - Finds the mapping record by iSend order number.
-  - Updates the stored status in the mapping metadata.
-  - Every `DELIVERED` report retries the idempotent `handleDelivered` workflow so a prior partial failure is not stranded.
-  - Persistence and delivery-side-effect failures propagate to the webhook/poller rather than being acknowledged.
+  - Requires the current environment binding and performs the full-item update under the distributed mapping-mutation lease.
+  - Applies monotonic status transitions: delayed nonterminal events cannot regress progress, `CANCELLED`/`RETURNED` are final, and only `RETURNED` may follow `DELIVERED`.
+  - Reactivates accepted non-final progress for reconciliation while preserving the poller's terminal deactivation boundary.
+  - Direct callers may run the idempotent `handleDelivered` workflow; webhook and poller callers defer it until the one tracking fulfillment is confirmed, so a status-only `DELIVERED` event cannot send email early.
+  - Persistence and any requested delivery-side-effect failures propagate rather than being acknowledged.
 
 This module is used whenever order status updates come from iSend via webhook or polling.
 
@@ -206,11 +236,11 @@ Key behavior:
 
 1. Verify the webhook signature using the secret `ISTORE_ISEND_WEBHOOK_SECRET`.
 2. Parse the incoming payload and determine the event type.
-3. Use idempotency checks so repeated deliveries do not process twice.
-4. Handle tracking events by creating Wix fulfillments.
-5. Handle inventory events by storing latest SKU quantities.
+3. Scope delivery idempotency keys to the configured iSend environment.
+4. Handle tracking events by creating Wix fulfillments, while refusing delayed tracking after a final status.
+5. Handle inventory events through a deterministic environment/SKU row identity.
 6. Handle order status events by updating mapping status.
-7. Persist raw webhook events to `ISendWebhookEvents` for auditing.
+7. Persist raw webhook events with deterministic environment-scoped IDs to `ISendWebhookEvents` for replay-safe auditing.
 
 Functions:
 
@@ -241,10 +271,19 @@ Functions:
   - Builds the fulfillment object for Wix.
   - Supports eCommerce line-item IDs, `trackingNumber`, `shippingProvider`, `trackingLink`, and `idempotencyKey`.
   - Uses the elevated current Wix eCommerce `orderFulfillments.createFulfillment` API.
-  - Claims the canonical tracking key before calling Wix and records `completed` only after the fulfillment response is durably saved.
+  - Claims the supplied idempotency key before calling Wix and records `completed` only after the fulfillment response is durably saved.
   - A `completed` claim is a safe skip only when its stored order, line-item, and tracking fingerprint matches the current request. Reused/mismatched keys, existing `processing`/`unknown_outcome` claims, and any ambiguous Wix response throw `fulfillment-reconciliation-required`; they are never deleted for an automatic retry.
 
-This is the function used by both webhook handling and polling.
+- `getSingleParcelFulfillmentKey(iSendOrderNo)`
+  - Returns the one order-level key `isend:<custOrderNo>:single-parcel-fulfillment`.
+
+- `createISendSingleParcelFulfillment(iSendOrderNo, orderId, options = {})`
+  - Serializes the mapping/status check and fulfillment effect under a fenced mapping lease.
+  - Refuses a final or unsupported stored status and calls `createFulfillment` with the order-level key.
+  - Requires one tracking number, fetches the authoritative Wix order inside the lease, and uses every current line-item ID/quantity; a supplied line-item assertion must match that full set exactly.
+  - Makes a later different tracking number a completed-fingerprint mismatch, enforcing the current one-parcel prohibition across separate webhook and poller deliveries.
+
+The single-parcel coordinator is used by webhook handling, polling, and the separately protected fulfillment HTTP boundary. The lower-level function is an internal primitive and must not be exposed with caller-selected keys.
 
 ---
 
@@ -255,8 +294,8 @@ This module handles the transition when an iSend order becomes delivered.
 Functions:
 
 - `handleDelivered(iSendOrderNo, options = {})`
-  - Finds the mapping for the iSend order number.
-  - Updates the mapping metadata with delivery timestamps.
+  - Finds the mapping for the iSend order number in the current environment.
+  - Updates the mapping metadata with delivery timestamps under the distributed mapping-mutation lease.
   - Records a `DELIVERED` event in `ISendWebhookEvents` using a deterministic ID.
   - Uses the elevated current Wix eCommerce Orders API to find the buyer email.
   - Creates one deterministic pending email record in `ISendPendingEmails` so an email can be sent later.
@@ -283,7 +322,11 @@ Functions:
   - Returns `success: false` with per-stage details when a selected sync action fails.
   - Optionally supports inventory sync in the future.
 
-This is the fallback/background mechanism for keeping Wix and iSend in sync.
+- `runISendPollerJob(options = {})`
+  - Runs a five-mapping active-only reconciliation batch as an hourly webhook safety net.
+  - Leaves outside-window skips at the front of the queue, retires terminal mappings only after required side effects, and throws on partial failure so Wix monitoring can alert.
+
+Signed webhooks are the primary mechanism. This bounded poller is the fallback/background safety net for keeping Wix and iSend in sync.
 
 ---
 
@@ -312,9 +355,11 @@ Functions:
   - Rejects `unknown_outcome` because a point-in-time confirmation cannot prove a timed-out submit will not complete later.
 
 - `post_createFulfillmentFromWix(request)`
-  - HTTP POST endpoint to create a Wix fulfillment from an external request.
+  - HTTP POST endpoint to create the one permitted Wix fulfillment from an external request.
   - Protected by header `X-ISEND-FULFILLMENT-SECRET` and the Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET`.
-  - Requires a stable nonempty `idempotencyKey` so transport retries cannot bypass the fulfillment state machine.
+  - Requires a mapped `iSendOrderNo`, `orderId`, and one tracking number, selects the site environment internally, and calls `createISendSingleParcelFulfillment`.
+  - Cannot authorize a partial fulfillment: the coordinator reads all authoritative Wix line items, and any supplied line-item assertion must match them exactly.
+  - Rejects a caller-selected `idempotencyKey`; if supplied, it must equal the canonical order-level single-parcel key.
 
 This file connects backend logic to external HTTP calls.
 
@@ -338,12 +383,20 @@ This is the Wix event handler file.
 
 This module owns durable Wix-to-iSend order submission.
 
-- `enqueueISendOrderEvent(event)` stores a normalized order snapshot with a deterministic Wix item ID.
+- `enqueueISendOrderEvent(event)` stores a normalized order snapshot with a deterministic Wix item ID and immutable current-environment binding.
 - `runISendOrderOutbox(options)` claims and processes a bounded batch during the MYT service window and scans durable attention states on every run.
 - `runISendOrderOutboxJob(options)` keeps scheduled monitoring failed while any unknown, exhausted-retry, stale-processing, or current worker failure remains.
 - `requeueISendOrder(orderKey, options)` re-enables only an exhausted, conclusively pre-submit retry.
 
-Unique deterministic item IDs, strongly consistent post-claim state revalidation, and monotonic lease generations prevent concurrent workers from submitting a stale row. Claim releases expire only their own generation, so a stale worker cannot remove a newer lease. Confirmed pre-submit failures retry with backoff. Ambiguous submit outcomes stop permanently in `unknown_outcome` until an authoritative provider-approved recovery exists; they never return to the automatic submit path from a bare operator confirmation.
+Unique deterministic item IDs, strongly consistent post-claim state revalidation, and monotonic lease generations prevent concurrent workers from submitting a stale row. Claim releases expire only their own generation, so a stale worker cannot remove a newer lease. Missing or current-selector-mismatched environment bindings remain visible attention states and never reach iSend. Transient confirmed pre-submit failures retry with backoff; deterministic payload validation exhausts immediately with bounded field errors because replaying the unchanged snapshot cannot succeed. Ambiguous submit outcomes stop permanently in `unknown_outcome` until an authoritative provider-approved recovery exists; they never return to the automatic submit path from a bare operator confirmation.
+
+---
+
+## Scheduled status reconciliation
+
+`src/backend/isendPoller.js` exports `runISendPollerJob`, a five-mapping hourly safety net for missed signed webhooks. Current-environment active mappings are selected through `ISendOrderMap.reconciliationActive` in oldest-`lastReconciledAt` order; active other-environment and unassigned legacy mappings fail visibly without an upstream call. Every business-success query must report authoritative `returnObject.totalRecord=1`, contain exactly one page row, and have that row's exact `custOrderNo` match the selected mapping before status or tracking fields are trusted. Outside-window skips do not rotate the queue. `CANCELLED` and `RETURNED` stop after their status write succeeds. `DELIVERED` stops only after the delivery workflow and the single-tracking fulfillment both complete safely. A delivered response without tracking, multiple tracking values, ambiguous fulfillment claims, partner failures, and reconciliation-state failures keep the mapping active and fail the scheduled job visibly. A nonterminal response without tracking remains active for a later reconciliation attempt without failing solely for the absent tracking value.
+
+The manual protected poll endpoint retains bounded stable pagination for operator diagnostics. Scheduled and manual polling keep the Wix-configured iSend environment authoritative.
 
 ---
 
@@ -379,9 +432,9 @@ They currently do not contain custom business logic beyond the default scaffoldi
 6. When iSend sends a webhook, `post_isendWebhook` authenticates the exact raw bytes and calls `handleWebhook`.
 7. `handleWebhook` checks idempotency and routes the payload:
    - Tracking events create Wix fulfillments.
-   - Status events update order mapping status.
-   - Inventory events update `ISendInventory`.
-8. The poller in `src/backend/isendPoller.js` can also regularly query iSend and keep status/tracking in sync.
+   - Status events update order mapping status without regressing a later/final state.
+   - Inventory events update one deterministic environment/SKU row in `ISendInventory`.
+8. The staggered hourly poller in `src/backend/isendPoller.js` reconciles a bounded set of active mappings as a webhook safety net and fails visibly on partial work.
 9. When a mapped order becomes delivered, `handleDelivered` records the event and creates a pending email.
 
 ---

@@ -57,8 +57,8 @@ This repo includes an iStore/iSend integration with webhook receiver and a polle
 - Staging diagnostic: `GET /_functions/testISendLoginFromWix` — protected by `X-ISEND-POLLER-SECRET`; it always selects staging and returns session-presence evidence without the iSend root or session values.
 - Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`; it always uses the site's configured iSend environment.
 - Manual outbox recovery: `POST /_functions/requeueISendOrder` — protected by the separate operator-only `X-ISEND-RECOVERY-SECRET` and limited to conclusively pre-submit, retry-exhausted records.
-- Manual fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET` matching Wix secret `ISEND_FULFILLMENT_TRIGGER_SECRET` and requires a stable `idempotencyKey` bound to the exact fulfillment request.
-- Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`.
+- Protected fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET`, requires `orderId`, mapped `iSendOrderNo`, and one tracking number, uses the configured environment, and routes through the same order-level single-parcel coordinator as webhooks/polling. The coordinator fetches the authoritative Wix order and always fulfills its complete line-item/quantity set; any supplied line-item list must match exactly. A supplied `idempotencyKey` is accepted only when it equals `isend:<iSendOrderNo>:single-parcel-fulfillment`; callers cannot choose a second key.
+- Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`. New outbox rows and mappings persist the normalized environment, and workers refuse missing or mismatched bindings so changing the selector cannot redirect old work.
 - iStore/iSend base URLs may be either the Postman host or the API context root with `/IsisWMS-War`; backend code appends `/Json/...` endpoint paths and tries `/IsisWMS-War` automatically for host-only URLs. Verified official roots are `https://staging.istoreisend-wms.com:5191/IsisWMS-War` and `https://istoreisend-wms.com:5191/IsisWMS-War`.
 - Login captures the `JSESSIONID` cookie returned by `/Json/Public/login/` and sends it with authenticated order, tracking, and inventory requests.
 - The configured service window is 10:00 AM-10:00 PM Malaysia Time.
@@ -76,24 +76,28 @@ Workflow:
 - `.github/workflows/isend-staging-smoke.yml` — runs locked install, lint, tests, and offline smoke validation on pull requests/pushes. It runs strict direct-plus-Wix live probes three times daily or by default-branch manual dispatch inside 10:00-22:00 MYT.
 
 Wix Data collections required:
-- `ISendOrderMap` — maps `wixOrderId` ↔ `iSendOrderNo`.
-- `ISendOrderOutbox` — stores durable order snapshots and `pending`, `processing`, `retry`, `unknown_outcome`, or `sent` state.
-- `ISendOrderOutboxClaims` — stores append-only, deterministic worker-lease generations.
+- `ISendOrderMap` — maps `wixOrderId` ↔ `iSendOrderNo`, binds that identity to an iSend environment, and stores reconciliation scheduling state.
+- `ISendOrderOutbox` — stores environment-bound durable order snapshots and `pending`, `processing`, `retry`, `unknown_outcome`, or `sent` state.
+- `ISendOrderOutboxClaims` — stores append-only, deterministic worker-lease generations and namespaced mapping-mutation leases.
 - `ISendProcessedEvents` — stores idempotency keys (`idempotencyKey`).
-- `ISendWebhookEvents` — persisted raw webhook events for auditing.
-- `ISendInventory` — optional, stores SKU inventory snapshots from webhook events.
-- `ISendPendingEmails` — optional, stores pending outbound emails for Wix Automations (fields: `to`, `subject`, `body`, `wixOrderId`, `iSendOrderNo`, `createdAt`, `sent`).
+- `ISendWebhookEvents` — stores environment-bound raw webhook and delivery audit events.
+- `ISendInventory` — required if inventory webhook events are accepted; stores deterministic environment/SKU inventory snapshots. Inventory polling remains disabled until the partner contract is approved.
+- `ISendPendingEmails` — required for the delivered-email path; stores environment-bound pending records for Wix Automations (fields: `to`, `subject`, `body`, `wixOrderId`, `iSendOrderNo`, `environment`, `createdAt`, `sent`, `source`).
 
 Recommended indexes:
 - `ISendOrderMap.wixOrderId` regular; deterministic mapping IDs enforce one mapping per Wix order.
-- `ISendOrderMap.iSendOrderNo` unique so one iSend order cannot map to two Wix orders.
+- `ISendOrderMap.iSendOrderNo` unique so one customer-order identity cannot resolve to two Wix orders. This remains global and fail-closed until cross-environment reuse can be authenticated safely.
+- `ISendOrderMap.(environment, reconciliationActive, lastReconciledAt)` compound regular index for the bounded current-environment safety net.
 - `ISendProcessedEvents.idempotencyKey` unique; deterministic IDs plus a legacy-row pre-read protect upgraded code, and the index closes old/new deployment races.
-- `ISendOrderOutbox.orderKey`, `(status, nextAttemptAt)`, `(status, retryExhausted)`, and `(status, leaseExpiresAt)`.
+- `ISendOrderOutbox.(status, nextAttemptAt)`, `(status, retryExhausted)`, and `(status, leaseExpiresAt)`. The deterministic item ID supplies order-key uniqueness without a fourth regular index.
 - `ISendOrderOutboxClaims.(claimKey, generation)` compound and `leaseExpiresAt` regular.
+- `ISendInventory.(environment, sku)` compound regular; a deterministic environment/SKU `_id` is the concurrency identity boundary.
 
-Keep all integration collections Admin-only. Deterministic `_id` values provide the outbox, mapping, and side-effect claim concurrency boundary; monotonic claim generations fence stale workers without deleting and reusing a claim ID. The custom indexes improve performance and add defense in depth. The hourly scheduled worker processes five orders per run inside the MYT service window, so load-test the 60-order daily capacity before production.
+Keep all integration collections Admin-only. Deterministic `_id` values provide the outbox, mapping, and side-effect claim concurrency boundary; monotonic claim generations fence stale workers without deleting and reusing a claim ID. Namespaced mapping-mutation claims serialize full-item Wix Data updates from webhooks and the poller. The custom indexes improve performance and add defense in depth. The hourly outbox processes five orders per run inside the MYT service window, so load-test the 60-order daily capacity before production. A staggered hourly poller reconciles five current-environment active mappings as a signed-webhook safety net; validate its separate 60-query daily capacity and per-query login load. The poller requires authoritative `returnObject.totalRecord=1`, exactly one page row, and an exact `custOrderNo` match to the selected mapping before it applies any status or tracking data.
 
-In Wix Data, configure `ISendOrderOutbox.attemptCount`, `maxAttempts`, and `claimGeneration` as Number; `retryExhausted` as Boolean; all `*At` and `leaseExpiresAt` values as Date and Time; and snapshots/diagnostics as Object. Configure `ISendOrderOutboxClaims.generation` as Number (never Text), its lifecycle fields as Date and Time, and its identity/token fields as Text. Preserve the newest claim generation for every order; older released generations can be archived by a future retention job only after a safe interval.
+In Wix Data, configure `ISendOrderOutbox.environment` as Text; `attemptCount`, `maxAttempts`, and `claimGeneration` as Number; `retryExhausted` as Boolean; all `*At` and `leaseExpiresAt` values as Date and Time; and snapshots/diagnostics as Object. Configure `ISendOrderOutboxClaims.generation` as Number (never Text), its lifecycle fields as Date and Time, and its identity/token fields as Text. Configure `ISendOrderMap.environment` as Text, `reconciliationActive` as Boolean, and its `createdAt`/`lastReconciledAt` fields as Date and Time. Configure the side-effect collection field types exactly as listed in `STAGING_SETUP.md`, which is the authoritative seven-collection schema. Preserve the newest claim generation for every claim key; older released generations can be archived by a future retention job only after a safe interval.
+
+Before the first publication, follow the mandatory legacy migration in `STAGING_SETUP.md`: reconcile both mapping identity dimensions independently; convert exactly one proven completed legacy per-tracking fulfillment claim to the order-level single-parcel key; environment-scope proven raw-webhook claims; and prove/backfill environments on outbox, mapping, webhook-audit, inventory, and pending-email rows. Quarantine ambiguity and never infer an environment from the current selector. Before switching to production, drain staging queue work, resolve staging attention states, deactivate terminal staging mappings, and quiesce staging webhook delivery.
 
 ### Webhook secret
 
@@ -112,18 +116,18 @@ Example `curl` test (replace `<SIG>` and `<SITE_URL>`):
 curl -X POST "<SITE_URL>/_functions/isendWebhook" \
   -H "Content-Type: application/json" \
   -H "X-ISEND-Signature: sha256=<SIG>" \
-  -d '{"orderNo":"TEST123","tracking":{"trackingNo":"TN12345"}}'
+  -d '{"eventType":"tracking.updated","custOrderNo":"TEST123","tracking":{"trackingNo":"TN12345"}}'
 ```
 
 ### Poll trigger
 
 Store the poller trigger secret as a Backend-only Wix Secret named `ISEND_POLLER_TRIGGER_SECRET`.
 Call `POST /_functions/runISendPoller` with `X-ISEND-POLLER-SECRET`.
-The poller syncs tracking and order status by default. Inventory polling is not enabled until the iStore inventory API contract is confirmed.
+The protected endpoint runs a manual diagnostic poll. A separate staggered hourly `runISendPollerJob` reconciles five active mappings as a safety net for missed signed webhooks and fails the Wix job on partial work. Inventory polling is not enabled until the iStore inventory API contract is confirmed.
 
 The staging diagnostic uses the poller trigger secret; the outbox recovery endpoint instead uses `ISEND_RECOVERY_TRIGGER_SECRET`, which must not be shared with automated monitoring. Recovery accepts only retry-exhausted records whose failures were conclusively before submit. Ambiguous `unknown_outcome` records cannot be automatically requeued: a timed-out request may complete after an operator checks, so quarantine the row and reconcile it with iSend support until an authoritative idempotent recovery contract exists.
 
-Fulfillment claims live in `ISendProcessedEvents` under canonical tracking keys. Only `meta.status=completed` is a safe duplicate. Reconcile `processing` or `unknown_outcome` against the Wix order's actual fulfillments; mark an existing fulfillment completed, or remove the single claim only after authoritative confirmation that no fulfillment exists. Delivery audit/email writes use deterministic IDs and retry on every `DELIVERED` report; email consumers must mark queue rows sent instead of deleting them.
+Fulfillment claims live in `ISendProcessedEvents` under the one-order key `isend:<custOrderNo>:single-parcel-fulfillment`. Only `meta.status=completed` with the exact order/line-item/tracking fingerprint is a safe duplicate; a second tracking number fails closed as a key mismatch. Reconcile `processing` or `unknown_outcome` against all actual Wix fulfillments and remove the single order-level claim only after authoritative confirmation that no fulfillment exists. Delivered audit/email effects run only after the single fulfillment is confirmed; status-only delivery remains pending. Email consumers must mark queue rows sent instead of deleting them.
 
 ### DELIVERED handling
 

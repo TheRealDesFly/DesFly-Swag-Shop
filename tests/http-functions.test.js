@@ -2,6 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   createFulfillment: vi.fn(),
+  getConfiguredISendEnvironment: vi.fn(),
+  getSingleParcelFulfillmentKey: vi.fn((iSendOrderNo) => (
+    `isend:${String(iSendOrderNo).trim()}:single-parcel-fulfillment`
+  )),
   getSecret: vi.fn(),
   handleWebhook: vi.fn(),
   requeueISendOrder: vi.fn(),
@@ -11,7 +15,13 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('wix-secrets-backend', () => ({ getSecret: mocks.getSecret }));
 vi.mock('backend/isendService', () => ({ testISendLogin: mocks.testISendLogin }));
-vi.mock('backend/orderFulfillment', () => ({ createFulfillment: mocks.createFulfillment }));
+vi.mock('backend/orderFulfillment', () => ({
+  createISendSingleParcelFulfillment: mocks.createFulfillment,
+  getSingleParcelFulfillmentKey: mocks.getSingleParcelFulfillmentKey,
+}));
+vi.mock('backend/isendConfig', () => ({
+  getConfiguredISendEnvironment: mocks.getConfiguredISendEnvironment,
+}));
 vi.mock('backend/isendWebhookHandler', () => ({ handleWebhook: mocks.handleWebhook }));
 vi.mock('backend/isendPoller', () => ({ runPoller: mocks.runPoller }));
 vi.mock('backend/isendOrderOutbox', () => ({ requeueISendOrder: mocks.requeueISendOrder }));
@@ -44,6 +54,7 @@ describe('Wix HTTP functions', () => {
       serviceWindow: { withinServiceWindow: true },
     });
     mocks.runPoller.mockResolvedValue({ success: true, processed: 2 });
+    mocks.getConfiguredISendEnvironment.mockResolvedValue('staging');
     mocks.requeueISendOrder.mockResolvedValue({
       orderKey: 'wix-order:wix-order-1',
       status: 'retry',
@@ -193,7 +204,20 @@ describe('Wix HTTP functions', () => {
     expect(response).toMatchObject({ status: 409, body: { success: false } });
   });
 
-  it('requires a stable idempotency key on the manual fulfillment boundary', async () => {
+  it('returns conflict when an invalid snapshot cannot be requeued unchanged', async () => {
+    mocks.requeueISendOrder.mockRejectedValueOnce(
+      new Error('An invalid iSend order payload cannot be requeued with the same snapshot'),
+    );
+
+    const response = await post_requeueISendOrder({
+      headers: { 'x-isend-recovery-secret': 'recovery-secret' },
+      body: { text: vi.fn().mockResolvedValue('{"orderKey":"wix-order:wix-order-1"}') },
+    });
+
+    expect(response).toMatchObject({ status: 409, body: { success: false } });
+  });
+
+  it('requires an iSend order identity on the protected fulfillment boundary', async () => {
     const response = await post_createFulfillmentFromWix({
       headers: { 'x-isend-fulfillment-secret': 'fulfillment-secret' },
       body: {
@@ -207,12 +231,30 @@ describe('Wix HTTP functions', () => {
 
     expect(response).toMatchObject({
       status: 400,
-      body: { success: false, code: 'missing-idempotency-key' },
+      body: { success: false, code: 'missing-isend-order-number' },
     });
     expect(mocks.createFulfillment).not.toHaveBeenCalled();
   });
 
-  it('normalizes and forwards a manual fulfillment idempotency key', async () => {
+  it('requires tracking on the protected fulfillment boundary', async () => {
+    const response = await post_createFulfillmentFromWix({
+      headers: { 'x-isend-fulfillment-secret': 'fulfillment-secret' },
+      body: {
+        text: vi.fn().mockResolvedValue(JSON.stringify({
+          orderId: 'wix-order-1',
+          iSendOrderNo: 'ISEND-1',
+        })),
+      },
+    });
+
+    expect(response).toMatchObject({
+      status: 400,
+      body: { success: false, code: 'missing-tracking-number' },
+    });
+    expect(mocks.createFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('routes protected fulfillment through the configured single-parcel coordinator', async () => {
     mocks.createFulfillment.mockResolvedValueOnce({ fulfillmentId: 'fulfillment-1' });
 
     const response = await post_createFulfillmentFromWix({
@@ -220,18 +262,73 @@ describe('Wix HTTP functions', () => {
       body: {
         text: vi.fn().mockResolvedValue(JSON.stringify({
           orderId: 'wix-order-1',
+          iSendOrderNo: ' ISEND-1 ',
           lineItems: [{ _id: 'line-item-1', quantity: 1 }],
           trackingNumber: 'TRACK123',
-          idempotencyKey: ' manual:fulfillment:1 ',
+          idempotencyKey: 'isend:ISEND-1:single-parcel-fulfillment',
         })),
       },
     });
 
     expect(response.status).toBe(200);
     expect(mocks.createFulfillment).toHaveBeenCalledWith(
+      'ISEND-1',
       'wix-order-1',
-      expect.objectContaining({ idempotencyKey: 'manual:fulfillment:1' }),
+      expect.objectContaining({
+        environment: 'staging',
+        trackingNumber: 'TRACK123',
+      }),
     );
+  });
+
+  it('rejects a caller-selected key that could bypass the single-parcel boundary', async () => {
+    const response = await post_createFulfillmentFromWix({
+      headers: { 'x-isend-fulfillment-secret': 'fulfillment-secret' },
+      body: {
+        text: vi.fn().mockResolvedValue(JSON.stringify({
+          orderId: 'wix-order-1',
+          iSendOrderNo: 'ISEND-1',
+          lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+          trackingNumber: 'TRACK123',
+          idempotencyKey: 'manual:second-parcel',
+        })),
+      },
+    });
+
+    expect(response).toMatchObject({
+      status: 400,
+      body: { success: false, code: 'invalid-idempotency-key' },
+    });
+    expect(mocks.createFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('returns conflict when supplied line items differ from the authoritative Wix order', async () => {
+    mocks.createFulfillment.mockRejectedValueOnce(Object.assign(
+      new Error('internal line-item details'),
+      { code: 'isend-fulfillment-line-items-mismatch' },
+    ));
+
+    const response = await post_createFulfillmentFromWix({
+      headers: { 'x-isend-fulfillment-secret': 'fulfillment-secret' },
+      body: {
+        text: vi.fn().mockResolvedValue(JSON.stringify({
+          orderId: 'wix-order-1',
+          iSendOrderNo: 'ISEND-1',
+          lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+          trackingNumber: 'TRACK123',
+        })),
+      },
+    });
+
+    expect(response).toEqual({
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        code: 'isend-fulfillment-line-items-mismatch',
+        message: 'Fulfillment line items do not match the authoritative Wix order',
+      },
+    });
   });
 
   it('returns a controlled conflict for a fulfillment that needs reconciliation', async () => {
@@ -248,9 +345,10 @@ describe('Wix HTTP functions', () => {
       body: {
         text: vi.fn().mockResolvedValue(JSON.stringify({
           orderId: 'wix-order-1',
+          iSendOrderNo: 'ISEND-1',
           lineItems: [{ _id: 'line-item-1', quantity: 1 }],
           trackingNumber: 'TRACK123',
-          idempotencyKey: 'manual:fulfillment:1',
+          idempotencyKey: 'isend:ISEND-1:single-parcel-fulfillment',
         })),
       },
     });

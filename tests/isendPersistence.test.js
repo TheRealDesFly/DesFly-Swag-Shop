@@ -20,11 +20,24 @@ const mock = vi.hoisted(() => {
 
   function query(collectionName) {
     const filters = [];
+    const sortFields = [];
     let queryLimit = 50;
     let querySkip = 0;
     const builder = {
+      ascending(...fields) {
+        sortFields.push(...fields);
+        return builder;
+      },
       eq(field, value) {
         filters.push((item) => item[field] === value);
+        return builder;
+      },
+      isEmpty(field) {
+        filters.push((item) => item[field] === undefined || item[field] === null || item[field] === '');
+        return builder;
+      },
+      ne(field, value) {
+        filters.push((item) => item[field] !== value);
         return builder;
       },
       limit(value) {
@@ -37,10 +50,21 @@ const mock = vi.hoisted(() => {
       },
       async find(options) {
         findCalls.push({ collectionName, options });
-        const items = collections[collectionName]
+        const filtered = collections[collectionName]
           .filter((item) => filters.every((filter) => filter(item)))
-          .slice(querySkip, querySkip + queryLimit);
-        return { items, totalCount: items.length };
+          .sort((left, right) => {
+            for (const field of sortFields) {
+              const leftValue = left[field] instanceof Date ? left[field].getTime() : left[field];
+              const rightValue = right[field] instanceof Date ? right[field].getTime() : right[field];
+              if (leftValue === rightValue) continue;
+              if (leftValue === undefined || leftValue === null) return -1;
+              if (rightValue === undefined || rightValue === null) return 1;
+              return leftValue < rightValue ? -1 : 1;
+            }
+            return 0;
+          });
+        const items = filtered.slice(querySkip, querySkip + queryLimit);
+        return { items, totalCount: filtered.length };
       },
     };
     return builder;
@@ -87,6 +111,12 @@ const mock = vi.hoisted(() => {
 });
 
 vi.mock('wix-data', () => ({ default: mock.wixData }));
+vi.mock('backend/isendMappingMutationLock', () => ({
+  assertMappingMutationLock: vi.fn().mockResolvedValue(true),
+  withMappingMutationLock: vi.fn(async (iSendOrderNo, callback) => (
+    callback({ iSendOrderNo })
+  )),
+}));
 
 import {
   claimProcessed,
@@ -96,7 +126,14 @@ import {
   releaseProcessed,
   updateProcessed,
 } from '../src/backend/isendIdempotency';
-import { findMappings, saveMapping } from '../src/backend/isendMappings';
+import {
+  findMappings,
+  findMappingsForReconciliation,
+  findUnclassifiedMappingsForReconciliation,
+  findReconciliationEnvironmentConflicts,
+  saveMapping,
+  updateMappingReconciliation,
+} from '../src/backend/isendMappings';
 
 describe('deterministic Wix persistence keys', () => {
   beforeEach(() => {
@@ -153,8 +190,8 @@ describe('deterministic Wix persistence keys', () => {
   });
 
   it('suppresses authorization for every mapping read and write', async () => {
-    await saveMapping('wix-order-auth', 'isend-order-auth');
-    const mappings = await findMappings(10, 0);
+    await saveMapping('wix-order-auth', 'isend-order-auth', {}, 'staging');
+    const mappings = await findMappings(10, 0, 'staging');
 
     expect(mappings).toHaveLength(1);
     expect(mock.wixData.insert).toHaveBeenCalledWith(
@@ -176,6 +213,204 @@ describe('deterministic Wix persistence keys', () => {
         options: { suppressAuth: true },
       },
     ]);
+  });
+
+  it('initializes new mappings as active reconciliation work', async () => {
+    const mapping = await saveMapping('wix-order-new', 'isend-order-new', {}, 'staging');
+
+    expect(mapping).toMatchObject({
+      wixOrderId: 'wix-order-new',
+      iSendOrderNo: 'isend-order-new',
+      environment: 'staging',
+      reconciliationActive: true,
+      createdAt: expect.any(Date),
+      lastReconciledAt: expect.any(Date),
+    });
+  });
+
+  it('rejects reuse of the same Wix mapping across environments', async () => {
+    await saveMapping('wix-order-bound', 'isend-order-bound', {}, 'staging');
+
+    await expect(saveMapping(
+      'wix-order-bound',
+      'isend-order-bound',
+      {},
+      'production',
+    )).rejects.toMatchObject({ code: 'isend-environment-mismatch' });
+    expect(mock.collections.ISendOrderMap).toHaveLength(1);
+  });
+
+  it('rejects one global iSend number mapped to different Wix orders across environments', async () => {
+    await saveMapping('wix-order-staging', 'isend-order-shared', {}, 'staging');
+
+    await expect(saveMapping(
+      'wix-order-production',
+      'isend-order-shared',
+      {},
+      'production',
+    )).rejects.toMatchObject({ code: 'isend-environment-mismatch' });
+    expect(mock.collections.ISendOrderMap).toHaveLength(1);
+    expect(mock.collections.ISendOrderMap[0]).toMatchObject({
+      wixOrderId: 'wix-order-staging',
+      iSendOrderNo: 'isend-order-shared',
+      environment: 'staging',
+    });
+  });
+
+  it('rejects remapping one Wix order to a different iSend order in the same environment', async () => {
+    await saveMapping('wix-order-bound', 'isend-order-original', {}, 'staging');
+
+    await expect(saveMapping(
+      'wix-order-bound',
+      'isend-order-replacement',
+      {},
+      'staging',
+    )).rejects.toMatchObject({
+      code: 'isend-mapping-collision',
+      retryable: false,
+    });
+    expect(mock.collections.ISendOrderMap).toHaveLength(1);
+  });
+
+  it('rejects remapping one iSend order to a different Wix order in the same environment', async () => {
+    await saveMapping('wix-order-original', 'isend-order-bound', {}, 'staging');
+
+    await expect(saveMapping(
+      'wix-order-replacement',
+      'isend-order-bound',
+      {},
+      'staging',
+    )).rejects.toMatchObject({
+      code: 'isend-mapping-collision',
+      retryable: false,
+    });
+    expect(mock.collections.ISendOrderMap).toHaveLength(1);
+  });
+
+  it('selects only active mappings from oldest reconciliation attempt first', async () => {
+    mock.collections.ISendOrderMap.push(
+      {
+        _id: 'mapping-newer',
+        iSendOrderNo: 'ISEND-NEWER',
+        environment: 'staging',
+        reconciliationActive: true,
+        lastReconciledAt: new Date('2026-07-17T04:00:00.000Z'),
+        createdAt: new Date('2026-07-17T02:00:00.000Z'),
+      },
+      {
+        _id: 'mapping-terminal',
+        iSendOrderNo: 'ISEND-TERMINAL',
+        environment: 'staging',
+        reconciliationActive: false,
+        lastReconciledAt: new Date('2026-07-17T01:00:00.000Z'),
+        createdAt: new Date('2026-07-17T01:00:00.000Z'),
+      },
+      {
+        _id: 'mapping-older',
+        iSendOrderNo: 'ISEND-OLDER',
+        environment: 'staging',
+        reconciliationActive: true,
+        lastReconciledAt: new Date('2026-07-17T03:00:00.000Z'),
+        createdAt: new Date('2026-07-17T03:00:00.000Z'),
+      },
+      {
+        _id: 'mapping-production',
+        iSendOrderNo: 'ISEND-PRODUCTION',
+        environment: 'production',
+        reconciliationActive: true,
+        lastReconciledAt: new Date('2026-07-17T00:00:00.000Z'),
+        createdAt: new Date('2026-07-17T00:00:00.000Z'),
+      },
+    );
+
+    const mappings = await findMappingsForReconciliation('staging', 5);
+
+    expect(mappings.map((mapping) => mapping.iSendOrderNo)).toEqual([
+      'ISEND-OLDER',
+      'ISEND-NEWER',
+    ]);
+    expect(mock.findCalls.at(-1)).toEqual({
+      collectionName: 'ISendOrderMap',
+      options: { suppressAuth: true },
+    });
+  });
+
+  it('surfaces active other-environment and unassigned legacy mappings', async () => {
+    mock.collections.ISendOrderMap.push(
+      {
+        _id: 'mapping-staging',
+        iSendOrderNo: 'ISEND-STAGING',
+        environment: 'staging',
+        reconciliationActive: true,
+      },
+      {
+        _id: 'mapping-production',
+        iSendOrderNo: 'ISEND-PRODUCTION',
+        environment: 'production',
+        reconciliationActive: true,
+      },
+      {
+        _id: 'mapping-legacy',
+        iSendOrderNo: 'ISEND-LEGACY',
+      },
+      {
+        _id: 'mapping-production-unclassified',
+        iSendOrderNo: 'ISEND-PRODUCTION-UNCLASSIFIED',
+        environment: 'production',
+      },
+      {
+        _id: 'mapping-retired-legacy',
+        iSendOrderNo: 'ISEND-RETIRED',
+        reconciliationActive: false,
+      },
+    );
+
+    const conflicts = await findReconciliationEnvironmentConflicts('staging');
+
+    expect(conflicts.map((mapping) => mapping.iSendOrderNo).sort()).toEqual([
+      'ISEND-LEGACY',
+      'ISEND-PRODUCTION',
+      'ISEND-PRODUCTION-UNCLASSIFIED',
+    ]);
+  });
+
+  it('selects and initializes only legacy mappings missing reconciliation state', async () => {
+    mock.collections.ISendOrderMap.push(
+      {
+        _id: 'mapping-legacy',
+        iSendOrderNo: 'ISEND-LEGACY',
+        environment: 'staging',
+        createdAt: new Date('2026-07-17T01:00:00.000Z'),
+        meta: { note: 'preserve-me' },
+        _revision: '1',
+      },
+      {
+        _id: 'mapping-current',
+        iSendOrderNo: 'ISEND-CURRENT',
+        environment: 'staging',
+        reconciliationActive: true,
+        createdAt: new Date('2026-07-17T02:00:00.000Z'),
+        _revision: '1',
+      },
+    );
+
+    const legacy = await findUnclassifiedMappingsForReconciliation('staging', 5);
+    const updated = await updateMappingReconciliation('ISEND-LEGACY', {
+      reconciliationActive: true,
+      lastReconciledAt: new Date('2026-07-17T03:00:00.000Z'),
+    }, 'staging');
+
+    expect(legacy.map((mapping) => mapping.iSendOrderNo)).toEqual(['ISEND-LEGACY']);
+    expect(updated).toMatchObject({
+      reconciliationActive: true,
+      lastReconciledAt: new Date('2026-07-17T03:00:00.000Z'),
+      meta: { note: 'preserve-me' },
+    });
+    expect(mock.wixData.update).toHaveBeenCalledWith(
+      'ISendOrderMap',
+      expect.objectContaining({ iSendOrderNo: 'ISEND-LEGACY' }),
+      { suppressAuth: true },
+    );
   });
 
   it('suppresses authorization for every processed-event operation', async () => {
@@ -243,13 +478,38 @@ describe('deterministic Wix persistence keys', () => {
     });
 
     const [first, second] = await Promise.all([
-      saveMapping('wix-order-1', 'isend-order-1'),
-      saveMapping('wix-order-1', 'isend-order-1'),
+      saveMapping('wix-order-1', 'isend-order-1', {}, 'staging'),
+      saveMapping('wix-order-1', 'isend-order-1', {}, 'staging'),
     ]);
 
     expect(first._id).toMatch(/^isend-map-[a-f0-9]{48}$/);
     expect(second._id).toBe(first._id);
     expect(insertAttempts).toBe(2);
+    expect(mock.collections.ISendOrderMap).toHaveLength(1);
+  });
+
+  it('rejects a concurrent loser that reads back a conflicting mapping', async () => {
+    const originalInsert = mock.wixData.insert.getMockImplementation();
+    mock.wixData.insert.mockImplementationOnce(async (collectionName, value, options) => {
+      mock.collections.ISendOrderMap.push({
+        ...value,
+        iSendOrderNo: 'isend-order-winner',
+        _revision: '1',
+      });
+      const error = new Error('duplicate');
+      error.code = 'WDE0074';
+      throw error;
+    }).mockImplementation(originalInsert);
+
+    await expect(saveMapping(
+      'wix-order-race',
+      'isend-order-loser',
+      {},
+      'staging',
+    )).rejects.toMatchObject({
+      code: 'isend-mapping-collision',
+      retryable: false,
+    });
     expect(mock.collections.ISendOrderMap).toHaveLength(1);
   });
 });

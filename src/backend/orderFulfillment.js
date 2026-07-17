@@ -1,9 +1,21 @@
 import crypto from 'crypto';
 import { elevate } from 'wix-auth';
-import { orderFulfillments } from 'wix-ecom-backend';
+import { orderFulfillments, orders } from 'wix-ecom-backend';
 import { claimProcessed, updateProcessed } from 'backend/isendIdempotency';
+import { getByISendOrderNo } from 'backend/isendMappings';
+import {
+  assertMappingMutationLock,
+  MAX_MAPPING_MUTATION_LEASE_MS,
+  withMappingMutationLock,
+} from 'backend/isendMappingMutationLock';
+import {
+  isFinalISendStatus,
+  isRecognizedISendStatus,
+  mapISendStatus,
+} from 'backend/isendStatusPolicy';
 
 const createWixFulfillment = elevate(orderFulfillments.createFulfillment);
+const getWixOrder = elevate(orders.getOrder);
 
 const COMPLETED = 'completed';
 const PROCESSING = 'processing';
@@ -47,6 +59,28 @@ function normalizeLineItems(lineItems) {
 
     return { _id: String(lineItemId), quantity };
   });
+}
+
+function canonicalLineItems(lineItems) {
+  return normalizeLineItems(lineItems)
+    .map((lineItem) => ({ _id: String(lineItem._id), quantity: Number(lineItem.quantity) }))
+    .sort((left, right) => (
+      left._id.localeCompare(right._id) || left.quantity - right.quantity
+    ));
+}
+
+function sameLineItems(left, right) {
+  return JSON.stringify(canonicalLineItems(left)) === JSON.stringify(canonicalLineItems(right));
+}
+
+function lineItemsMismatchError(orderId, cause) {
+  const error = new Error(
+    `Fulfillment line items do not match the authoritative Wix order ${orderId}`,
+  );
+  error.code = 'isend-fulfillment-line-items-mismatch';
+  error.retryable = false;
+  if (cause) error.cause = cause;
+  return error;
 }
 
 function fulfillmentRequestFingerprint(orderId, fulfillment) {
@@ -172,4 +206,101 @@ export async function createFulfillment(orderId, options = {}) {
   return result;
 }
 
-export default { createFulfillment };
+export function getSingleParcelFulfillmentKey(iSendOrderNo) {
+  const normalized = String(iSendOrderNo || '').trim();
+  if (!normalized) throw new Error('Single-parcel fulfillment requires an iSend order number');
+  return `isend:${normalized}:single-parcel-fulfillment`;
+}
+
+/**
+ * Serialize the one allowed fulfillment for an iSend order with status
+ * transitions. The order-level claim intentionally excludes tracking number:
+ * a different second tracking value is a request-fingerprint mismatch, not a
+ * second parcel permission.
+ */
+export async function createISendSingleParcelFulfillment(
+  iSendOrderNo,
+  orderId,
+  options = {},
+) {
+  const environment = options.environment;
+  if (!['staging', 'production'].includes(environment)) {
+    throw new Error('Single-parcel fulfillment requires an explicit iSend environment');
+  }
+  const expectedOrderId = String(orderId || '').trim();
+  if (!expectedOrderId) throw new Error('Single-parcel fulfillment requires a Wix order ID');
+  const trackingNumber = String(options.trackingNumber || '').trim();
+  if (!trackingNumber) {
+    const error = new Error('Single-parcel fulfillment requires one tracking number');
+    error.code = 'missing-isend-tracking-number';
+    error.retryable = false;
+    throw error;
+  }
+
+  return withMappingMutationLock(iSendOrderNo, async (lock) => {
+    const mapping = await getByISendOrderNo(iSendOrderNo, environment);
+    if (!mapping) {
+      throw new Error(`No Wix order mapping found for iSend order ${iSendOrderNo}`);
+    }
+    if (String(mapping.wixOrderId || '') !== expectedOrderId) {
+      const error = new Error(`iSend mapping does not match Wix order ${expectedOrderId}`);
+      error.code = 'isend-fulfillment-mapping-mismatch';
+      throw error;
+    }
+
+    const storedStatus = mapping.meta?.lastKnownISendStatus;
+    const effectiveStatus = mapISendStatus(storedStatus);
+    if (effectiveStatus && !isRecognizedISendStatus(effectiveStatus)) {
+      const error = new Error(`Stored iSend status requires reconciliation before fulfillment: ${effectiveStatus}`);
+      error.code = 'unsupported-stored-isend-status';
+      throw error;
+    }
+    if (isFinalISendStatus(effectiveStatus)) {
+      return {
+        skipped: true,
+        reason: 'final-status-preserved',
+        effectiveStatus,
+      };
+    }
+
+    const wixOrder = await getWixOrder(expectedOrderId);
+    if (!wixOrder) {
+      throw new Error(`Wix order lookup returned no order for ${expectedOrderId}`);
+    }
+    const authoritativeLineItems = canonicalLineItems(wixOrder.lineItems);
+    if (options.lineItems !== undefined) {
+      let matchesAuthoritativeOrder = false;
+      try {
+        matchesAuthoritativeOrder = sameLineItems(options.lineItems, authoritativeLineItems);
+      } catch (error) {
+        throw lineItemsMismatchError(expectedOrderId, error);
+      }
+      if (!matchesAuthoritativeOrder) {
+        throw lineItemsMismatchError(expectedOrderId);
+      }
+    }
+
+    await assertMappingMutationLock(lock);
+    const {
+      environment: omittedEnvironment,
+      idempotencyKey: omittedKey,
+      lineItems: omittedLineItems,
+      ...fulfillmentOptions
+    } = options;
+    void omittedEnvironment;
+    void omittedKey;
+    void omittedLineItems;
+    return createFulfillment(expectedOrderId, {
+      ...fulfillmentOptions,
+      lineItems: authoritativeLineItems,
+      trackingNumber,
+      idempotencyKey: getSingleParcelFulfillmentKey(iSendOrderNo),
+    });
+  }, { leaseMs: MAX_MAPPING_MUTATION_LEASE_MS });
+}
+
+export default {
+  createFulfillment,
+  createISendSingleParcelFulfillment,
+  getSingleParcelFulfillmentKey,
+};

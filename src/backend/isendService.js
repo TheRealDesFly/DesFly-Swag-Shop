@@ -285,7 +285,7 @@ function withISendPhase(error, phase) {
   wrapped.name = source.name || wrapped.name;
   wrapped.isendPhase = phase;
   wrapped.cause = error;
-  ['requestPath', 'upstreamStatus', 'upstreamContentType', 'attemptedPaths'].forEach((field) => {
+  ['code', 'validationErrors', 'requestPath', 'upstreamStatus', 'upstreamContentType', 'attemptedPaths'].forEach((field) => {
     if (source[field] !== undefined) wrapped[field] = source[field];
   });
   return wrapped;
@@ -394,7 +394,8 @@ function getShippingDetails(order) {
  * Normalize different line item fields into a list.
  */
 function getLineItems(order) {
-  return order.lineItems || order.items || [];
+  const lineItems = order.lineItems ?? order.items ?? [];
+  return Array.isArray(lineItems) ? lineItems : [];
 }
 
 function getBuyerEmail(order) {
@@ -412,14 +413,11 @@ function getAddressValue(shipping, key) {
   return shipping.address && shipping.address[key] ? shipping.address[key] : '';
 }
 
-function getCatalogItemId(item) {
-  return item.catalogReference && item.catalogReference.catalogItemId
-    ? item.catalogReference.catalogItemId
-    : '';
-}
-
 function getItemSku(item) {
-  return item.sku || getCatalogItemId(item) || item.productId || '';
+  const source = item || {};
+  // Warehouse submission requires an explicit SKU. Wix catalog/product IDs
+  // are internal identifiers and must never be substituted for an iSend SKU.
+  return source.sku || '';
 }
 
 function getCustomerName(shipping, order) {
@@ -451,9 +449,12 @@ function getOrderDate(order) {
 
 function getOrderAmount(order) {
   const totals = order.totals || order.priceSummary || {};
-  const total = order.totalPrice || order.total || totals.total || totals.totalPrice || totals.subtotal;
-  const amount = total && typeof total === 'object' ? (total.amount || total.value) : total;
-  return amount === undefined || amount === null || amount === '' ? 0 : amount;
+  const total = order.totalPrice
+    ?? order.total
+    ?? totals.total
+    ?? totals.totalPrice
+    ?? totals.subtotal;
+  return total && typeof total === 'object' ? (total.amount ?? total.value) : total;
 }
 
 function getOrderCurrency(order) {
@@ -462,15 +463,80 @@ function getOrderCurrency(order) {
 }
 
 function getLineItemPrice(item) {
-  const priceData = item.priceData || item.price || item.lineItemPrice || {};
+  const source = item || {};
+  const priceData = source.priceData ?? source.price ?? source.lineItemPrice;
   const price = priceData && typeof priceData === 'object'
-    ? (priceData.price || priceData.amount || priceData.value)
+    ? (priceData.price ?? priceData.amount ?? priceData.value)
     : priceData;
-  return price === undefined || price === null || price === '' ? 0 : price;
+  return price;
 }
 
 function getLineItemDescription(item) {
-  return item.name || item.productName || item.description || getItemSku(item);
+  const source = item || {};
+  return source.name || source.productName || source.description || getItemSku(source);
+}
+
+function isBlank(value) {
+  return value === undefined || value === null || String(value).trim().length === 0;
+}
+
+function toFiniteNumber(value) {
+  if (isBlank(value)) return NaN;
+  if (!['number', 'string'].includes(typeof value)) return NaN;
+  const normalized = Number(value);
+  return Number.isFinite(normalized) ? normalized : NaN;
+}
+
+function validateOrderPayload(payload) {
+  const errors = [];
+
+  if (isBlank(payload.orderId)) {
+    errors.push('order identity is required');
+  }
+
+  if (!Array.isArray(payload.detailList) || payload.detailList.length === 0) {
+    errors.push('at least one line item is required');
+  } else {
+    payload.detailList.forEach((item, index) => {
+      const label = `line item ${index + 1}`;
+      if (isBlank(item.skuNo)) {
+        errors.push(`${label} SKU is required`);
+      }
+      if (!Number.isFinite(item.orderQty) || item.orderQty <= 0) {
+        errors.push(`${label} quantity must be a positive number`);
+      }
+      if (!Number.isFinite(item.salePrice) || item.salePrice < 0) {
+        errors.push(`${label} sale price must be a non-negative number`);
+      }
+    });
+  }
+
+  if (!Number.isFinite(payload.orderAmountIncTax) || payload.orderAmountIncTax <= 0) {
+    errors.push('order total must be a positive number');
+  }
+
+  const deliveryAddress = payload.deliverToCustAddr || {};
+  [
+    ['contactPerson', 'delivery contact name'],
+    ['telNo', 'delivery contact phone'],
+    ['addr1', 'delivery address line 1'],
+    ['city', 'delivery city'],
+    ['postcode', 'delivery postcode'],
+    ['state', 'delivery state'],
+    ['country', 'delivery country'],
+  ].forEach(([field, label]) => {
+    if (isBlank(deliveryAddress[field])) errors.push(`${label} is required`);
+  });
+
+  if (errors.length > 0) {
+    const error = new Error(`Invalid iSend order payload: ${errors.join('; ')}`);
+    error.name = 'ISendPayloadValidationError';
+    error.code = 'invalid-isend-order-payload';
+    error.validationErrors = errors;
+    throw error;
+  }
+
+  return payload;
 }
 
 function buildCustomerAddress(order, shipping, config) {
@@ -501,13 +567,21 @@ function buildCustomerAddress(order, shipping, config) {
  * This function normalizes shipping and item fields into a single payload.
  */
 export function mapOrderToISend(order, config) {
+  if (!order || typeof order !== 'object' || Array.isArray(order)) {
+    const error = new Error('Invalid iSend order payload: order identity is required');
+    error.name = 'ISendPayloadValidationError';
+    error.code = 'invalid-isend-order-payload';
+    error.validationErrors = ['order identity is required'];
+    throw error;
+  }
+
   const shipping = getShippingDetails(order);
   const lineItems = getLineItems(order);
   const orderId = order._id || order.id || order.number;
-  const orderAmount = getOrderAmount(order);
+  const orderAmount = toFiniteNumber(getOrderAmount(order));
   const customerAddress = buildCustomerAddress(order, shipping, config);
 
-  return {
+  const payload = {
     storageClientNo: config.storageClientNo,
     orderOrigin: config.orderOrigin,
     userId: config.userId,
@@ -527,13 +601,15 @@ export function mapOrderToISend(order, config) {
     codFlag: false,
     remark: order.note || order.buyerNote || '',
     detailList: lineItems.map((item) => ({
-      itemId: getItemSku(item),
-      skuNo: getItemSku(item),
+      itemId: String(getItemSku(item) || '').trim(),
+      skuNo: String(getItemSku(item) || '').trim(),
       skuDesc: getLineItemDescription(item),
-      orderQty: Number(item.quantity || 1),
-      salePrice: getLineItemPrice(item),
+      orderQty: toFiniteNumber(item && (item.quantity ?? item.qty)),
+      salePrice: toFiniteNumber(getLineItemPrice(item)),
     })),
   };
+
+  return validateOrderPayload(payload);
 }
 
 /**

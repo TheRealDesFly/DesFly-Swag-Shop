@@ -18,25 +18,27 @@ Set these in Wix as backend-only secrets:
 - `ISEND_FULFILLMENT_TRIGGER_SECRET`
 - `ISEND_RECOVERY_TRIGGER_SECRET`
 
-Production must set `ISTORE_ISEND_ENV` to `production`. The backend now uses the production URL only when that environment is selected, and it no longer falls back from production to staging.
+Production must set `ISTORE_ISEND_ENV` to `production`. The backend uses the production URL only when that environment is selected, and it never falls back from production to staging. New outbox rows and mappings persist that normalized environment. Workers fail closed when a durable record is missing the binding or does not match the current selector; changing the selector can no longer redirect old staging work to production.
 
 ## Wix Data Collections
 
 Create these collections with Admin-only read/write permissions before publishing the order worker:
 
-- `ISendOrderOutbox` stores the complete Wix order snapshot and queue state. Add a regular index on `orderKey` plus compound indexes on (`status`, `nextAttemptAt`), (`status`, `retryExhausted`), and (`status`, `leaseExpiresAt`).
+- `ISendOrderOutbox` stores the complete Wix order snapshot and queue state. Add compound indexes on (`status`, `nextAttemptAt`), (`status`, `retryExhausted`), and (`status`, `leaseExpiresAt`). Its deterministic item ID supplies the order-key identity boundary without consuming a fourth regular-index slot.
 - `ISendOrderOutboxClaims` stores append-only, generation-fenced worker leases. Add a compound index on `claimKey`, `generation` and a regular index on `leaseExpiresAt`.
-- `ISendOrderMap` maps Wix orders to iSend orders. Add a regular index on `wixOrderId` and use the collection's unique-index slot on `iSendOrderNo`. The deterministic mapping item ID already enforces one mapping per Wix order.
+- `ISendOrderMap` maps Wix orders to iSend orders and schedules bounded status reconciliation. Add a regular index on `wixOrderId`, use the collection's single-field unique-index slot on `iSendOrderNo`, and add a compound regular index on (`environment`, `reconciliationActive`, `lastReconciledAt`). The deterministic mapping item ID already enforces one mapping per Wix order. Global iSend-number uniqueness is intentionally fail-closed until the partner confirms whether staging and production can reuse a `custOrderNo` and supplies an authenticated environment discriminator for webhooks.
 - `ISendProcessedEvents` stores webhook and fulfillment idempotency records. Add a unique index on `idempotencyKey`; deterministic item IDs enforce new-code concurrency while the unique index also protects legacy auto-ID rows during rollout.
-- `ISendWebhookEvents`, `ISendInventory`, and `ISendPendingEmails` store audit, inventory, and delivery-email records.
+- `ISendWebhookEvents` stores environment-bound audit events; no custom index is prescribed.
+- `ISendInventory` stores environment-bound inventory snapshots. Add a compound regular index on (`environment`, `sku`). Inventory polling remains disabled until the partner contract is approved.
+- `ISendPendingEmails` stores environment-bound delivery-email records; no custom index is prescribed.
 
-The outbox, mapping, and idempotency modules also use deterministic Wix item IDs, so duplicate writes fail closed even before most custom indexes are available. Before creating the `ISendProcessedEvents.idempotencyKey` unique index, reconcile/remove any existing duplicate-key rows; the runtime strongly checks legacy rows, and the unique index closes the old/new deployment race.
+The outbox, mapping, idempotency, raw-audit, delivery-side-effect, and inventory modules use deterministic Wix item IDs, so duplicate writes fail closed even before most custom indexes are available. Before creating the `ISendProcessedEvents.idempotencyKey` unique index, reconcile/remove any existing duplicate-key rows; the runtime strongly checks legacy rows, and the unique index closes the old/new deployment race.
 
 Configure the worker and side-effect claim collections with these field types. Wix supplies its normal system fields in addition to these application fields.
 
 | Collection | Field | Wix field type | Required purpose |
 | --- | --- | --- | --- |
-| `ISendOrderOutbox` | `orderKey`, `wixOrderId`, `status` | Text | Stable order identity and queue state |
+| `ISendOrderOutbox` | `orderKey`, `wixOrderId`, `status`, `environment` | Text | Stable order identity, queue state, and immutable iSend environment binding |
 | `ISendOrderOutbox` | `orderSnapshot`, `lastError`, `responseSummary`, `unknownOutcomeDetails` | Object | Durable order payload and bounded diagnostics |
 | `ISendOrderOutbox` | `attemptCount`, `maxAttempts`, `claimGeneration` | Number | Retry and lease fencing counters |
 | `ISendOrderOutbox` | `retryExhausted` | Boolean | Terminal retry guard |
@@ -45,21 +47,59 @@ Configure the worker and side-effect claim collections with these field types. W
 | `ISendOrderOutboxClaims` | `claimKey`, `orderKey`, `leaseToken` | Text | Lease identity and ownership |
 | `ISendOrderOutboxClaims` | `generation` | Number | Numeric descending sort and monotonic fencing; do not configure this as Text |
 | `ISendOrderOutboxClaims` | `claimedAt`, `leaseExpiresAt`, `releasedAt` | Date and Time | Lease lifecycle and expiry queries |
+| `ISendOrderMap` | `wixOrderId`, `iSendOrderNo`, `environment` | Text | Stable Wix-to-iSend identity and immutable environment binding |
+| `ISendOrderMap` | `meta` | Object | Latest status and partner metadata |
+| `ISendOrderMap` | `reconciliationActive` | Boolean | Include only non-terminal mappings in the scheduled safety net |
+| `ISendOrderMap` | `createdAt`, `lastReconciledAt` | Date and Time | Stable manual pagination and oldest-attempted scheduling |
 | `ISendProcessedEvents` | `idempotencyKey` | Text | Webhook or canonical fulfillment key |
 | `ISendProcessedEvents` | `meta` | Object | Fulfillment state and bounded result/failure metadata |
 | `ISendProcessedEvents` | `createdAt`, `updatedAt` | Date and Time | Claim lifecycle timestamps |
+| `ISendWebhookEvents` | `deliveryId`, `environment`, `eventType` | Text | Environment-scoped delivery identity and audit event type |
+| `ISendWebhookEvents` | `payload` | Object | Authenticated raw event payload |
+| `ISendWebhookEvents` | `processedAt` | Date and Time | Audit processing timestamp |
+| `ISendInventory` | `environment`, `sku` | Text | Environment-bound inventory identity |
+| `ISendInventory` | `lastKnownQty` | Number | Latest webhook-reported available quantity |
+| `ISendInventory` | `updatedAt` | Date and Time | Inventory observation timestamp |
+| `ISendPendingEmails` | `to`, `subject`, `body`, `wixOrderId`, `iSendOrderNo`, `environment`, `source` | Text | Recipient, message, order identity, environment, and source |
+| `ISendPendingEmails` | `createdAt` | Date and Time | Delivery-email queue timestamp |
+| `ISendPendingEmails` | `sent` | Boolean | Wix Automation completion marker |
 
-The compound `ISendOrderOutboxClaims` index must use `claimKey` then numeric `generation`; `nextAttemptAt` and `leaseExpiresAt` must remain Date and Time fields because the worker sorts and compares them. Changing those fields to Text can make generations sort lexically after 9 or make due/expired queries incorrect.
+The compound `ISendOrderOutboxClaims` index must use `claimKey` then numeric `generation`; `nextAttemptAt` and `leaseExpiresAt` must remain Date and Time fields because the worker sorts and compares them. Changing those fields to Text can make generations sort lexically after 9 or make due/expired queries incorrect. The same append-only claim collection also serializes mutations of one mapping under the namespaced key `isend-mapping:<iSendOrderNo>`, preventing a webhook and poller from replacing each other's full Wix Data item update.
+
+Before adding the global unique `ISendOrderMap.iSendOrderNo` index, export the mappings and run two independent checks: group by `iSendOrderNo`, then separately group by `wixOrderId`. Manually reconcile every duplicate to one authoritative Wix/iSend pair; do not delete a record until its outbox, fulfillment, delivery-email, and partner evidence agree. Index creation must not be used as the duplicate detector because Wix can reject the build without resolving the underlying operational ambiguity.
+
+Before publishing, export `ISendProcessedEvents` and complete two distinct migrations. First group legacy fulfillment keys shaped like `isend:<custOrderNo>:tracking:<trackingNo>` by `custOrderNo`. The runtime now permits one order-level claim only: `isend:<custOrderNo>:single-parcel-fulfillment`. Convert a group only when it has exactly one conclusively completed claim whose stored Wix order ID, tracking number, and request fingerprint match the authoritative fulfillment and its full line-item/quantity request; preserve that metadata and result under the new key. Quarantine any group with multiple old tracking keys, missing/mismatched fingerprint, `processing`, `unknown_outcome`, missing, or ambiguous status. Reconcile it against Wix and do not publish until resolved. If a new key already exists, require exact metadata agreement and retain one authoritative row rather than overwriting evidence.
+
+Second, rows whose `meta.eventType` proves they are legacy raw-webhook claims must be assigned an environment from deployment and evidence appropriate to the event: matching audit evidence for status, mapped-order plus fulfillment/tracking evidence for tracking, or provider/inventory evidence for inventory. Change their key from the old delivery key to `<environment>:<old-key>` and record `meta.environment`. Leave ambiguous rows quarantined and keep webhook intake disabled. Do not prefix the new order-level fulfillment key or a non-webhook recovery claim. Re-run the duplicate-key check after both migrations and before creating the unique index.
 
 Claim generations are append-only to prevent lease ID reuse. Monitor collection growth and add a retention job after measuring staging volume. A retention job may archive or delete old released generations only after a generous safety interval, and it must always preserve the highest generation for every `claimKey`; deleting the latest row would reset monotonic fencing.
 
-`src/backend/jobs.config` runs the outbox worker hourly. It processes a bounded five-order batch only inside 10:00-22:00 MYT. Validate that this maximum of 60 orders per service-window day fits expected volume before production; increase or redesign the worker only after measuring Wix job runtime and iSend rate limits.
+`src/backend/jobs.config` runs two staggered hourly jobs: the outbox worker at minute 0 and a five-mapping status reconciliation safety net at minute 30. Both make iSend calls only inside 10:00-22:00 MYT. The outbox can submit at most 60 orders per service-window day. The poller can reconcile at most 60 active mappings per day and currently authenticates each selected query independently. Validate both capacities, Wix runtime, and iSend login/query rate limits before production; do not raise either bounded batch until staging measurements support it.
+
+Signed webhooks are the primary status path. Register only signed tracking and order-status events for this release; do not subscribe inventory until its payload/endpoint contract and legacy data are accepted. The scheduled poller is a safety net for missed events, not permission to omit webhook registration. It selects only current-environment `reconciliationActive=true` rows in oldest-`lastReconciledAt` order, leaves outside-window skips in place, and stops polling a terminal mapping only after required status/delivery/fulfillment effects complete. A business-success query must report authoritative `returnObject.totalRecord=1`, return exactly one page row, and have that row's `custOrderNo` match the selected mapping before any status or tracking value can touch Wix. Missing or non-unit totals, empty/extra page rows, and mismatched identities fail the job. Signed tracking/status webhooks likewise must carry `custOrderNo` or the documented `customerOrderNo` alias; an internal `orderNo` alone is rejected. Webhook delivery claims are scoped by the configured environment. Status transitions are monotonic: delayed nonterminal events cannot regress later progress, `CANCELLED`/`RETURNED` are final, and only `RETURNED` may follow `DELIVERED`. A first valid tracking number remains eligible when its accompanying nonterminal status is ignored as stale, but effective `CANCELLED`/`RETURNED` blocks fulfillment and email. Pre-upgrade mappings are classified only after an environment has been assigned.
+
+Outbound order submission also fails closed before login when identity, line items, SKUs, positive quantities/totals, non-negative prices, or required delivery contact/address fields are missing. Fully zero-total orders remain blocked until iSend confirms their contract; a zero-priced promotional line is allowed only inside a positive-total order.
+
+Deterministic payload validation failures become retry-exhausted after the first attempt and preserve bounded field-level errors for operators. Replaying the same immutable snapshot cannot repair it: correct the authoritative order data and use a reviewed replacement/remediation path before any requeue.
+
+## Environment Migration And Cutover
+
+Do not infer a missing durable-record environment from the current secret. Before the first publication of this version, inventory every existing row in `ISendOrderOutbox`, `ISendOrderMap`, `ISendWebhookEvents`, `ISendInventory`, and `ISendPendingEmails`, plus the raw-webhook claims described above:
+
+1. Prove each row's origin from deployment records and upstream evidence.
+2. Backfill `environment=staging` only where that provenance is conclusive; use `production` only for proven production records.
+3. Leave ambiguous rows quarantined and resolve them manually. The outbox and scheduled poller intentionally remain red and make no iSend request for unassigned outbox/mapping rows; keep webhook intake, inventory intake, or the email automation disabled for ambiguous side-effect rows.
+4. Confirm every active environment-sensitive row has a binding before enabling its schedule, intake, or automation. Legacy side-effect IDs are stable, so a duplicate current write will not self-heal a missing `environment` field.
+
+Before changing `ISTORE_ISEND_ENV` from staging to production, stop new staging intake and quiesce the staging webhook sender. Resolve all staging outbox attention states, require no staging row in `pending`, `processing`, or retryable `retry`, and require every staging mapping to have `reconciliationActive=false`. Retain a redacted export proving those conditions. After the selector change, both jobs must show zero missing/other-environment conflicts before the production canary is placed.
 
 ## Multi-Parcel Fulfillment Contract
 
 Multi-parcel fulfillment is a go-live blocker. Obtain an iSend response/webhook contract that allocates each unique tracking number to specific Wix eCommerce line-item IDs and quantities, then verify that allocation with a real staging order. A tracking-number list without line-item allocation is not sufficient because the same Wix line item cannot be fulfilled once for every parcel.
 
 Until that contract is implemented, the integration fails closed when a payload contains more than one unique tracking number. The webhook returns HTTP 409 with code `unsupported-multi-tracking`, and the poller returns `success: false` with a per-mapping `tracking-allocation` failure. Neither path reads the Wix order or creates a fulfillment for that update.
+
+The protected `createFulfillmentFromWix` endpoint is subject to the same prohibition: it requires the mapped `iSendOrderNo` and one tracking number, derives the configured environment, fetches the authoritative Wix order, and uses every current line-item ID/quantity under the one order-level single-parcel claim. Any supplied line-item assertion must match the full authoritative set. It rejects arbitrary caller-selected idempotency keys, so an untracked, partial, or second request cannot consume or bypass the one-parcel boundary.
 
 ## Local Staging Smoke Test
 
@@ -185,13 +225,13 @@ It rejects pending, processing, sent, and `unknown_outcome` records.
 
 ## Fulfillment Reconciliation
 
-Fulfillment claims use keys shaped like `isend:<ISEND_ORDER_NO>:tracking:<TRACKING_NO>` in `ISendProcessedEvents`. Only `meta.status: completed` is safe to acknowledge. A `processing`, `unknown_outcome`, or missing/legacy status is deliberately terminal because Wix may have created the fulfillment even if the request failed or its response was lost.
+The single-parcel fulfillment claim uses one order-level key shaped like `isend:<ISEND_ORDER_NO>:single-parcel-fulfillment` in `ISendProcessedEvents`. Only `meta.status: completed` with an exact stored request fingerprint is safe to acknowledge. A different tracking number produces a fingerprint mismatch instead of authorizing a second parcel. A `processing`, `unknown_outcome`, missing/legacy status, or completed fingerprint mismatch is deliberately terminal because Wix may have created the fulfillment even if the request failed or its response was lost.
 
 When monitoring reports `fulfillment-reconciliation-required`:
 
-1. Open the mapped Wix eCommerce order and inspect its fulfillments for that exact tracking number and the expected line items/quantities.
-2. If the fulfillment exists, keep the claim and set `meta.status` to `completed`, recording who reconciled it and when.
-3. If the fulfillment does not exist, confirm that absence from the authoritative Wix order/fulfillment view. Only then remove that one canonical claim (or create the fulfillment manually and mark it `completed`) so the next webhook/poller attempt can claim it again.
+1. Open the mapped Wix eCommerce order and inspect all fulfillments for the claim's exact tracking number and expected line items/quantities.
+2. If the one expected fulfillment exists, keep the order-level claim and set `meta.status` to `completed`, preserving the matching order ID, tracking number, and request fingerprint and recording who reconciled it and when.
+3. If no fulfillment exists, confirm that absence from the authoritative Wix order/fulfillment view. Only then remove that one order-level claim (or create the single fulfillment manually and mark it `completed`) so the next webhook/poller attempt can claim it again.
 4. Never remove a `processing` or `unknown_outcome` claim merely to clear an alert. Preserve the evidence until the remote outcome is known.
 
 Alert on any fulfillment claim that remains `processing` beyond the request timeout and on every `unknown_outcome`. The pending-email consumer must mark `ISendPendingEmails.sent=true` rather than delete delivered-email rows; deterministic IDs make repeated delivery reports reuse the same queue record.

@@ -5,35 +5,199 @@ const mocks = vi.hoisted(() => {
   return {
     claimProcessed: vi.fn(),
     createWixFulfillment: vi.fn(),
+    getWixOrder: vi.fn(),
     elevate: vi.fn((method) => {
       elevatedMethods.push(method);
       return (...args) => method(...args);
     }),
     elevatedMethods,
+    assertMappingMutationLock: vi.fn(),
+    getByISendOrderNo: vi.fn(),
     releaseProcessed: vi.fn(),
     updateProcessed: vi.fn(),
+    withMappingMutationLock: vi.fn(),
   };
 });
 
 vi.mock('wix-auth', () => ({ elevate: mocks.elevate }));
 vi.mock('wix-ecom-backend', () => ({
   orderFulfillments: { createFulfillment: mocks.createWixFulfillment },
+  orders: { getOrder: mocks.getWixOrder },
 }));
 vi.mock('backend/isendIdempotency', () => ({
   claimProcessed: mocks.claimProcessed,
   releaseProcessed: mocks.releaseProcessed,
   updateProcessed: mocks.updateProcessed,
 }));
+vi.mock('backend/isendMappings', () => ({
+  getByISendOrderNo: mocks.getByISendOrderNo,
+}));
+vi.mock('backend/isendMappingMutationLock', () => ({
+  MAX_MAPPING_MUTATION_LEASE_MS: 5 * 60 * 1000,
+  assertMappingMutationLock: mocks.assertMappingMutationLock,
+  withMappingMutationLock: mocks.withMappingMutationLock,
+}));
 
-import { createFulfillment } from '../src/backend/orderFulfillment';
+import {
+  createFulfillment,
+  createISendSingleParcelFulfillment,
+  getSingleParcelFulfillmentKey,
+} from '../src/backend/orderFulfillment';
 
 describe('Wix eCommerce fulfillment creation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.claimProcessed.mockResolvedValue({ claimed: true });
+    mocks.assertMappingMutationLock.mockResolvedValue(true);
+    mocks.getByISendOrderNo.mockResolvedValue({
+      wixOrderId: 'wix-order-1',
+      meta: { lastKnownISendStatus: 'SHIPPED' },
+    });
+    mocks.withMappingMutationLock.mockImplementation(async (iSendOrderNo, callback) => (
+      callback({ iSendOrderNo })
+    ));
     mocks.createWixFulfillment.mockResolvedValue({ fulfillmentId: 'fulfillment-1' });
+    mocks.getWixOrder.mockResolvedValue({
+      _id: 'wix-order-1',
+      lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+    });
     mocks.releaseProcessed.mockResolvedValue({});
     mocks.updateProcessed.mockResolvedValue({});
+  });
+
+  it('uses one order-level claim to prohibit a second tracking number', async () => {
+    const options = {
+      environment: 'staging',
+      lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+      trackingNumber: 'TRACK123',
+    };
+    await createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', options);
+
+    const orderLevelKey = getSingleParcelFulfillmentKey('ISEND-1');
+    expect(orderLevelKey).toBe('isend:ISEND-1:single-parcel-fulfillment');
+    expect(mocks.claimProcessed).toHaveBeenCalledWith(
+      orderLevelKey,
+      expect.objectContaining({ trackingNumber: 'TRACK123' }),
+    );
+    const firstFingerprint = mocks.claimProcessed.mock.calls[0][1].requestFingerprint;
+    mocks.claimProcessed.mockResolvedValueOnce({
+      claimed: false,
+      item: {
+        meta: {
+          status: 'completed',
+          requestFingerprint: firstFingerprint,
+        },
+      },
+    });
+
+    await expect(createISendSingleParcelFulfillment(
+      'ISEND-1',
+      'wix-order-1',
+      { ...options, trackingNumber: 'TRACK456' },
+    )).rejects.toMatchObject({
+      code: 'fulfillment-reconciliation-required',
+      idempotencyKey: orderLevelKey,
+      idempotencyStatus: 'completed-key-mismatch',
+    });
+    expect(mocks.createWixFulfillment).toHaveBeenCalledTimes(1);
+    expect(mocks.withMappingMutationLock).toHaveBeenLastCalledWith(
+      'ISEND-1',
+      expect.any(Function),
+      { leaseMs: 5 * 60 * 1000 },
+    );
+  });
+
+  it('skips a single-parcel fulfillment after a final mapping status', async () => {
+    mocks.getByISendOrderNo.mockResolvedValue({
+      wixOrderId: 'wix-order-1',
+      meta: { lastKnownISendStatus: 'RETURNED' },
+    });
+
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+      trackingNumber: 'TRACK123',
+    })).resolves.toMatchObject({
+      skipped: true,
+      reason: 'final-status-preserved',
+      effectiveStatus: 'RETURNED',
+    });
+    expect(mocks.assertMappingMutationLock).not.toHaveBeenCalled();
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('requires tracking before acquiring or consuming the order-level claim', async () => {
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+    })).rejects.toMatchObject({
+      code: 'missing-isend-tracking-number',
+      retryable: false,
+    });
+
+    expect(mocks.withMappingMutationLock).not.toHaveBeenCalled();
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('rejects partial line items before consuming the order-level claim', async () => {
+    mocks.getWixOrder.mockResolvedValue({
+      _id: 'wix-order-1',
+      lineItems: [
+        { _id: 'line-item-1', quantity: 1 },
+        { _id: 'line-item-2', quantity: 2 },
+      ],
+    });
+
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+      trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({
+      code: 'isend-fulfillment-line-items-mismatch',
+      retryable: false,
+    });
+
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('classifies a malformed supplied line-item assertion as a non-retryable mismatch', async () => {
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      lineItems: [],
+      trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({
+      code: 'isend-fulfillment-line-items-mismatch',
+      retryable: false,
+    });
+
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('uses every authoritative Wix line item when the caller omits line items', async () => {
+    mocks.getWixOrder.mockResolvedValue({
+      _id: 'wix-order-1',
+      lineItems: [
+        { _id: 'line-item-2', quantity: 2 },
+        { _id: 'line-item-1', quantity: 1 },
+      ],
+    });
+
+    await createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      trackingNumber: ' TRACK123 ',
+    });
+
+    expect(mocks.elevatedMethods).toContain(mocks.getWixOrder);
+    expect(mocks.createWixFulfillment).toHaveBeenCalledWith('wix-order-1', {
+      lineItems: [
+        { _id: 'line-item-1', quantity: 1 },
+        { _id: 'line-item-2', quantity: 2 },
+      ],
+      trackingInfo: { trackingNumber: 'TRACK123' },
+    });
   });
 
   it('elevates the current API and sends eCommerce line-item IDs', async () => {
