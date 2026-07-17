@@ -8,11 +8,14 @@ const mocks = vi.hoisted(() => {
       return (...args) => method(...args);
     }),
     elevatedMethods,
+    getConfiguredISendEnvironment: vi.fn(),
     getByISendOrderNo: vi.fn(),
     getOrder: vi.fn(),
+    assertMappingMutationLock: vi.fn(),
     insert: vi.fn(),
     query: vi.fn(),
     update: vi.fn(),
+    withMappingMutationLock: vi.fn(),
   };
 });
 
@@ -30,17 +33,30 @@ vi.mock('wix-ecom-backend', () => ({
 vi.mock('backend/isendMappings', () => ({
   getByISendOrderNo: mocks.getByISendOrderNo,
 }));
+vi.mock('backend/isendConfig', () => ({
+  getConfiguredISendEnvironment: mocks.getConfiguredISendEnvironment,
+}));
+vi.mock('backend/isendMappingMutationLock', () => ({
+  MAX_MAPPING_MUTATION_LEASE_MS: 5 * 60 * 1000,
+  assertMappingMutationLock: mocks.assertMappingMutationLock,
+  withMappingMutationLock: mocks.withMappingMutationLock,
+}));
 
 import { handleDelivered } from '../src/backend/orderStateTransitions';
 
 describe('delivered-order side effects', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.assertMappingMutationLock.mockResolvedValue(true);
+    mocks.getConfiguredISendEnvironment.mockResolvedValue('staging');
+    mocks.withMappingMutationLock.mockImplementation(async (iSendOrderNo, callback) => (
+      callback({ iSendOrderNo })
+    ));
     mocks.getByISendOrderNo.mockResolvedValue({
       _id: 'mapping-1',
       wixOrderId: 'wix-order-1',
       iSendOrderNo: 'ISEND-1',
-      meta: { preserved: 'value' },
+      meta: { preserved: 'value', lastKnownISendStatus: 'DELIVERED' },
     });
     mocks.getOrder.mockResolvedValue({
       _id: 'wix-order-1',
@@ -96,10 +112,18 @@ describe('delivered-order side effects', () => {
       expect.objectContaining({ _id: first.emailId }),
       { suppressAuth: true },
     );
+    expect(mocks.withMappingMutationLock).toHaveBeenLastCalledWith(
+      'ISEND-1',
+      expect.any(Function),
+      { leaseMs: 5 * 60 * 1000 },
+    );
 
     // Building the update must not mutate the strong-read snapshot supplied by
     // the mapping helper.
-    expect(mapping.meta).toEqual({ preserved: 'value' });
+    expect(mapping.meta).toEqual({
+      preserved: 'value',
+      lastKnownISendStatus: 'DELIVERED',
+    });
     expect(mocks.update).toHaveBeenCalledWith(
       'ISendOrderMap',
       expect.objectContaining({
@@ -110,6 +134,46 @@ describe('delivered-order side effects', () => {
       }),
       { suppressAuth: true },
     );
+  });
+
+  it('does not overwrite a newer terminal status while adding delivery metadata', async () => {
+    mocks.getByISendOrderNo.mockResolvedValue({
+      _id: 'mapping-1',
+      wixOrderId: 'wix-order-1',
+      iSendOrderNo: 'ISEND-1',
+      meta: { lastKnownISendStatus: 'RETURNED', lastStatusUpdatedAt: 'newer' },
+    });
+
+    const result = await handleDelivered('ISEND-1');
+
+    expect(result).toMatchObject({
+      success: true,
+      skipped: true,
+      reason: 'stale-delivered-status',
+      effectiveStatus: 'RETURNED',
+      emailQueued: false,
+    });
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.getOrder).not.toHaveBeenCalled();
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not write audit or email after the delivery lease is fenced', async () => {
+    mocks.assertMappingMutationLock
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce(Object.assign(new Error('mapping lease fenced'), {
+        code: 'isend-mapping-mutation-busy',
+        reason: 'fenced',
+      }));
+
+    await expect(handleDelivered('ISEND-1')).rejects.toMatchObject({
+      code: 'isend-mapping-mutation-busy',
+      reason: 'fenced',
+    });
+
+    expect(mocks.update).toHaveBeenCalledTimes(1);
+    expect(mocks.getOrder).toHaveBeenCalledTimes(1);
+    expect(mocks.insert).not.toHaveBeenCalled();
   });
 
   it('propagates an audit insert failure and does not queue email', async () => {

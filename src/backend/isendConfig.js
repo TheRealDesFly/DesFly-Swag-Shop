@@ -45,6 +45,21 @@ function normalizeEnvironment(value) {
   throw new Error(`Invalid iSend environment "${value}". Use "staging" or "production".`);
 }
 
+/**
+ * Resolve only the site environment selector. Queue boundaries use this
+ * lightweight read to bind durable work without loading API credentials.
+ */
+export async function getConfiguredISendEnvironment(options = {}) {
+  const requested = options.environment === undefined
+    ? await readOptionalSecret(SECRET_NAMES.environment)
+    : options.environment;
+  const environment = normalizeEnvironment(requested);
+  if (!environment) {
+    throw new Error(`Missing Wix secret: ${SECRET_NAMES.environment}`);
+  }
+  return environment;
+}
+
 // options: { environment: 'staging'|'production', useSandbox: boolean }
 export async function getISendConfig(options = {}) {
   const [

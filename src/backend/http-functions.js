@@ -1,7 +1,11 @@
 import { ok, serverError } from 'wix-http-functions';
 import crypto from 'crypto';
 import { testISendLogin } from 'backend/isendService';
-import { createFulfillment } from 'backend/orderFulfillment';
+import {
+  createISendSingleParcelFulfillment,
+  getSingleParcelFulfillmentKey,
+} from 'backend/orderFulfillment';
+import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { handleWebhook } from 'backend/isendWebhookHandler';
 import { runPoller } from 'backend/isendPoller';
 import { requeueISendOrder } from 'backend/isendOrderOutbox';
@@ -214,6 +218,7 @@ export async function post_requeueISendOrder(request) {
     }
     if (message.startsWith('Only exhausted iSend retries can be requeued')
       || message.includes('cannot be automatically requeued')
+      || message.includes('cannot be requeued with the same snapshot')
       || message.startsWith('Outbox item is currently claimed')) {
       return jsonResponse(409, { success: false, message });
     }
@@ -236,31 +241,62 @@ export async function post_createFulfillmentFromWix(request) {
 
     const { payload } = await consumeJsonRequestBody(request);
 
-    const { orderId, lineItems, trackingNumber, shippingProvider, trackingLink, idempotencyKey } = payload || {};
+    const {
+      iSendOrderNo,
+      orderId,
+      lineItems,
+      trackingNumber,
+      shippingProvider,
+      trackingLink,
+      idempotencyKey,
+    } = payload || {};
 
     if (!orderId) {
       return jsonResponse(400, { success: false, message: 'Missing orderId' });
     }
 
-    const normalizedIdempotencyKey = String(idempotencyKey || '').trim();
-    if (!normalizedIdempotencyKey) {
+    const normalizedISendOrderNo = String(iSendOrderNo || '').trim();
+    if (!normalizedISendOrderNo) {
       return jsonResponse(400, {
         success: false,
-        code: 'missing-idempotency-key',
-        message: 'Missing idempotencyKey',
+        code: 'missing-isend-order-number',
+        message: 'Missing iSendOrderNo',
       });
     }
 
-    const result = await createFulfillment(orderId, {
-      lineItems,
-      trackingNumber,
-      shippingProvider,
-      trackingLink,
-      idempotencyKey: normalizedIdempotencyKey,
-    });
+    if (!String(trackingNumber || '').trim()) {
+      return jsonResponse(400, {
+        success: false,
+        code: 'missing-tracking-number',
+        message: 'Missing trackingNumber',
+      });
+    }
+
+    const canonicalIdempotencyKey = getSingleParcelFulfillmentKey(normalizedISendOrderNo);
+    const suppliedIdempotencyKey = String(idempotencyKey || '').trim();
+    if (suppliedIdempotencyKey && suppliedIdempotencyKey !== canonicalIdempotencyKey) {
+      return jsonResponse(400, {
+        success: false,
+        code: 'invalid-idempotency-key',
+        message: 'idempotencyKey must match the canonical single-parcel order key',
+      });
+    }
+
+    const environment = await getConfiguredISendEnvironment();
+    const result = await createISendSingleParcelFulfillment(
+      normalizedISendOrderNo,
+      orderId,
+      {
+        environment,
+        lineItems,
+        trackingNumber,
+        shippingProvider,
+        trackingLink,
+      },
+    );
 
     if (result && result.skipped && result.reason === 'idempotency') {
-      return ok({ headers: { 'Content-Type': 'application/json' }, body: { success: true, skipped: true, reason: 'idempotency', idempotencyKey: normalizedIdempotencyKey } });
+      return ok({ headers: { 'Content-Type': 'application/json' }, body: { success: true, skipped: true, reason: 'idempotency', idempotencyKey: canonicalIdempotencyKey } });
     }
 
     return ok({
@@ -280,6 +316,13 @@ export async function post_createFulfillmentFromWix(request) {
         code: error.code,
         message: 'Fulfillment outcome requires operator reconciliation',
         idempotencyStatus: error.idempotencyStatus,
+      });
+    }
+    if (error && error.code === 'isend-fulfillment-line-items-mismatch') {
+      return jsonResponse(409, {
+        success: false,
+        code: error.code,
+        message: 'Fulfillment line items do not match the authoritative Wix order',
       });
     }
     return serverError({

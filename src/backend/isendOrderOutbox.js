@@ -2,8 +2,9 @@
  * Durable outbound queue for Wix orders sent to iStore/iSend.
  *
  * Required Wix Data collections and recommended indexes:
- * - ISendOrderOutbox: `orderKey` plus compound indexes on status with
- *   `nextAttemptAt`, `retryExhausted`, and `leaseExpiresAt`.
+ * - ISendOrderOutbox: compound indexes on status with `nextAttemptAt`,
+ *   `retryExhausted`, and `leaseExpiresAt`. The deterministic item ID is the
+ *   order-key identity boundary without consuming a fourth regular index.
  * - ISendOrderOutboxClaims: a compound index on `claimKey`, `generation`.
  * Both collections must use Admin-only content permissions because the order
  * snapshot contains customer and delivery data.
@@ -15,6 +16,7 @@
  */
 import crypto from 'crypto';
 import wixData from 'wix-data';
+import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { getByWixOrderId, saveMapping } from 'backend/isendMappings';
 import { sendOrderToISend } from 'backend/isendService';
 
@@ -43,8 +45,25 @@ const BASE_RETRY_DELAY_MS = 5 * 60 * 1000;
 const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
 const UNKNOWN_REQUEUE_ERROR =
   'Unknown iSend outcomes cannot be automatically requeued without an authoritative upstream lookup';
+const INVALID_PAYLOAD_REQUEUE_ERROR =
+  'An invalid iSend order payload cannot be requeued with the same snapshot; correct the authoritative order and use a reviewed replacement or snapshot-remediation process';
 const TRUSTED_READ_OPTIONS = Object.freeze({ consistentRead: true, suppressAuth: true });
 const TRUSTED_WRITE_OPTIONS = Object.freeze({ suppressAuth: true });
+
+function assertEnvironmentBinding(record, currentEnvironment, recordLabel = 'iSend durable record') {
+  const boundEnvironment = String(record && record.environment || '').trim().toLowerCase();
+  if (!boundEnvironment) {
+    const error = new Error(`${recordLabel} has no environment binding`);
+    error.code = 'missing-isend-environment-binding';
+    throw error;
+  }
+  if (boundEnvironment !== currentEnvironment) {
+    const error = new Error(`${recordLabel} is bound to ${boundEnvironment}, not ${currentEnvironment}`);
+    error.code = 'isend-environment-mismatch';
+    throw error;
+  }
+  return boundEnvironment;
+}
 
 function clampInteger(value, fallback, minimum, maximum) {
   const parsed = Number(value);
@@ -91,9 +110,13 @@ function truncate(value, maxLength = 2000) {
 function summarizeError(error) {
   return {
     message: truncate(error && error.message ? error.message : error),
+    code: error && error.code ? truncate(error.code, 200) : null,
     requestPath: error && error.requestPath ? truncate(error.requestPath, 500) : null,
     upstreamStatus: error && error.upstreamStatus ? Number(error.upstreamStatus) : null,
     phase: error && error.isendPhase ? truncate(error.isendPhase, 100) : null,
+    validationErrors: error && Array.isArray(error.validationErrors)
+      ? error.validationErrors.slice(0, 20).map((value) => truncate(value, 500))
+      : [],
     attemptedPaths: error && Array.isArray(error.attemptedPaths)
       ? error.attemptedPaths.slice(0, 5)
       : [],
@@ -238,11 +261,11 @@ export function getWixOrderKey(order, event = {}) {
 }
 
 async function findByOrderKey(orderKey) {
-  const result = await wixData.query(OUTBOX_COLLECTION)
-    .eq('orderKey', orderKey)
-    .limit(1)
-    .find(TRUSTED_READ_OPTIONS);
-  return result.items && result.items.length ? result.items[0] : null;
+  return wixData.get(
+    OUTBOX_COLLECTION,
+    deterministicItemId('isend-order', orderKey),
+    TRUSTED_READ_OPTIONS,
+  );
 }
 
 function getClaimGeneration(claim) {
@@ -285,6 +308,7 @@ async function updateOutbox(item, changes, now = new Date()) {
  */
 export async function enqueueISendOrderEvent(event, options = {}) {
   const now = asDate(options.now, new Date());
+  const environment = await getConfiguredISendEnvironment({ environment: options.environment });
   const order = getOrderFromEvent(event);
   if (!order || typeof order !== 'object') {
     throw new Error('Cannot enqueue iSend order without an order snapshot');
@@ -302,6 +326,7 @@ export async function enqueueISendOrderEvent(event, options = {}) {
     _id: deterministicItemId('isend-order', orderKey),
     orderKey,
     wixOrderId,
+    environment,
     status: OUTBOX_STATUS.PENDING,
     orderSnapshot: normalizeOrderSnapshot(order, wixOrderId),
     sourceEventId: event && event.metadata && event.metadata.id
@@ -325,6 +350,7 @@ export async function enqueueISendOrderEvent(event, options = {}) {
   } catch (error) {
     const existing = await findByOrderKey(orderKey);
     if (existing) {
+      assertEnvironmentBinding(existing, environment, `iSend outbox item ${orderKey}`);
       return { enqueued: true, duplicate: true, item: existing };
     }
     throw error;
@@ -497,6 +523,19 @@ async function markRetry(item, failure, now) {
   }, now);
 }
 
+async function markRetryExhausted(item, failure, now) {
+  return updateOutbox(item, {
+    status: OUTBOX_STATUS.RETRY,
+    retryExhausted: true,
+    nextAttemptAt: null,
+    lastError: failure,
+    lastAttemptFinishedAt: now,
+    leaseToken: null,
+    claimGeneration: null,
+    leaseExpiresAt: null,
+  }, now);
+}
+
 async function markUnknownOutcome(item, reason, details, now) {
   return updateOutbox(item, {
     status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
@@ -543,9 +582,19 @@ function isDefinitelyBeforeSubmit(error) {
     || message.includes('not configured');
 }
 
-async function finishFromExistingMapping(item, now) {
+function isPermanentPayloadFailure(error) {
+  return String(error && error.code || '').toLowerCase() === 'invalid-isend-order-payload';
+}
+
+async function finishFromExistingMapping(item, now, currentEnvironment) {
+  assertEnvironmentBinding(item, currentEnvironment, `iSend outbox item ${item.orderKey}`);
   const mapping = await getByWixOrderId(item.wixOrderId);
   if (!mapping || !mapping.iSendOrderNo) return null;
+  assertEnvironmentBinding(
+    mapping,
+    currentEnvironment,
+    `iSend mapping for Wix order ${item.wixOrderId}`,
+  );
   const updated = await markSent(item, mapping.iSendOrderNo, now, {
     recoveredFromMapping: true,
   });
@@ -574,7 +623,7 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
   let result;
   try {
     result = await sendOrderToISend(processingItem.orderSnapshot, {
-      environment: options.environment,
+      environment: processingItem.environment,
     });
   } catch (error) {
     await assertClaimOwnership(
@@ -584,6 +633,15 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       'after submit error',
     );
     const failure = summarizeError(error);
+    if (isPermanentPayloadFailure(error)) {
+      processingItem = await markRetryExhausted(processingItem, failure, new Date());
+      return {
+        orderKey: item.orderKey,
+        status: OUTBOX_STATUS.RETRY,
+        retryExhausted: true,
+        error: failure,
+      };
+    }
     if (isDefinitelyBeforeSubmit(error)) {
       processingItem = await markRetry(processingItem, failure, new Date());
       return {
@@ -672,7 +730,7 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       source: 'isend-order-outbox',
       orderKey: processingItem.orderKey,
       raw: result,
-    });
+    }, processingItem.environment);
   } catch (error) {
     await assertClaimOwnership(
       item.orderKey,
@@ -741,10 +799,21 @@ export async function requeueISendOrder(orderKey, options = {}) {
   if (!normalizedKey) throw new Error('requeueISendOrder requires an orderKey');
 
   const now = asDate(options.now, new Date());
+  const currentEnvironment = await getConfiguredISendEnvironment({
+    environment: options.environment,
+  });
   const initialItem = await findByOrderKey(normalizedKey);
   if (!initialItem) throw new Error(`No iSend outbox item found for ${normalizedKey}`);
+  assertEnvironmentBinding(
+    initialItem,
+    currentEnvironment,
+    `iSend outbox item ${normalizedKey}`,
+  );
   if (initialItem.status === OUTBOX_STATUS.UNKNOWN_OUTCOME) {
     throw new Error(UNKNOWN_REQUEUE_ERROR);
+  }
+  if (initialItem.lastError?.code === 'invalid-isend-order-payload') {
+    throw new Error(INVALID_PAYLOAD_REQUEUE_ERROR);
   }
   const claim = await acquireClaim(initialItem, now);
   if (!claim.claimed) {
@@ -754,10 +823,14 @@ export async function requeueISendOrder(orderKey, options = {}) {
   try {
     const item = await findByOrderKey(normalizedKey);
     if (!item) throw new Error(`No iSend outbox item found for ${normalizedKey}`);
+    assertEnvironmentBinding(item, currentEnvironment, `iSend outbox item ${normalizedKey}`);
     const isUnknown = item.status === OUTBOX_STATUS.UNKNOWN_OUTCOME;
     const isExhaustedRetry = item.status === OUTBOX_STATUS.RETRY && item.retryExhausted;
     if (isUnknown) {
       throw new Error(UNKNOWN_REQUEUE_ERROR);
+    }
+    if (item.lastError?.code === 'invalid-isend-order-payload') {
+      throw new Error(INVALID_PAYLOAD_REQUEUE_ERROR);
     }
     if (!isExhaustedRetry) {
       throw new Error(`Only exhausted iSend retries can be requeued (${item.status})`);
@@ -798,7 +871,8 @@ export async function requeueISendOrder(orderKey, options = {}) {
 }
 
 async function processItem(item, options, now) {
-  const mapped = await finishFromExistingMapping(item, now);
+  assertEnvironmentBinding(item, options.environment, `iSend outbox item ${item.orderKey}`);
+  const mapped = await finishFromExistingMapping(item, now, options.environment);
   if (mapped) return mapped;
 
   const claim = await acquireClaim(item, now);
@@ -834,7 +908,12 @@ async function processItem(item, options, now) {
       };
     }
 
-    const recovered = await finishFromExistingMapping(freshItem, now);
+    assertEnvironmentBinding(
+      freshItem,
+      options.environment,
+      `iSend outbox item ${item.orderKey}`,
+    );
+    const recovered = await finishFromExistingMapping(freshItem, now, options.environment);
     if (recovered) return recovered;
     return await processClaimedItem(
       freshItem,
@@ -865,7 +944,7 @@ async function findReadyItems(status, now, limit) {
   return (result.items || []).filter((item) => !item.retryExhausted);
 }
 
-async function recoverStaleProcessing(now, limit) {
+async function recoverStaleProcessing(now, limit, environment) {
   const result = await wixData.query(OUTBOX_COLLECTION)
     .eq('status', OUTBOX_STATUS.PROCESSING)
     .le('leaseExpiresAt', now)
@@ -876,7 +955,20 @@ async function recoverStaleProcessing(now, limit) {
   const recovered = [];
 
   for (const item of staleItems) {
-    const mapped = await finishFromExistingMapping(item, now);
+    try {
+      assertEnvironmentBinding(item, environment, `iSend outbox item ${item.orderKey}`);
+    } catch (error) {
+      recovered.push({
+        orderKey: item.orderKey,
+        status: item.status,
+        workerFailure: true,
+        environmentFailure: true,
+        error: summarizeError(error),
+      });
+      continue;
+    }
+
+    const mapped = await finishFromExistingMapping(item, now, environment);
     if (mapped) {
       recovered.push(mapped);
     } else {
@@ -918,13 +1010,39 @@ function persistentAttentionDetail(item) {
   };
 }
 
+function persistentEnvironmentAttentionDetail(item, currentEnvironment) {
+  const boundEnvironment = String(item.environment || '').trim().toLowerCase();
+  return {
+    orderKey: item.orderKey,
+    itemId: item._id,
+    status: item.status,
+    environment: boundEnvironment || null,
+    currentEnvironment,
+    attentionReason: boundEnvironment
+      ? 'environment-mismatch'
+      : 'environment-unassigned',
+    environmentFailure: true,
+    persistent: true,
+  };
+}
+
 /**
  * Scan every durable state that must keep scheduled monitoring red until an
  * operator resolves it. Each query is deliberately bounded and reads from the
  * primary so an eventual-consistency gap cannot produce a false-green run.
  */
-async function findPersistentAttention(now) {
-  const [unknownResult, exhaustedRetryResult, staleProcessingResult] = await Promise.all([
+async function findPersistentAttention(now, currentEnvironment) {
+  const [
+    unknownResult,
+    exhaustedRetryResult,
+    staleProcessingResult,
+    pendingMismatchResult,
+    retryMismatchResult,
+    processingMismatchResult,
+    pendingUnassignedResult,
+    retryUnassignedResult,
+    processingUnassignedResult,
+  ] = await Promise.all([
     wixData.query(OUTBOX_COLLECTION)
       .eq('status', OUTBOX_STATUS.UNKNOWN_OUTCOME)
       .limit(ATTENTION_SCAN_LIMIT)
@@ -939,16 +1057,58 @@ async function findPersistentAttention(now) {
       .le('leaseExpiresAt', now)
       .limit(ATTENTION_SCAN_LIMIT)
       .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('status', OUTBOX_STATUS.PENDING)
+      .ne('environment', currentEnvironment)
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('status', OUTBOX_STATUS.RETRY)
+      .ne('environment', currentEnvironment)
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('status', OUTBOX_STATUS.PROCESSING)
+      .ne('environment', currentEnvironment)
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('status', OUTBOX_STATUS.PENDING)
+      .isEmpty('environment')
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('status', OUTBOX_STATUS.RETRY)
+      .isEmpty('environment')
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('status', OUTBOX_STATUS.PROCESSING)
+      .isEmpty('environment')
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
   ]);
 
-  return (unknownResult.items || [])
+  const durableAttention = (unknownResult.items || [])
     .concat(exhaustedRetryResult.items || [], staleProcessingResult.items || [])
     .map(persistentAttentionDetail);
+  const environmentAttention = (pendingMismatchResult.items || [])
+    .concat(
+      retryMismatchResult.items || [],
+      processingMismatchResult.items || [],
+      pendingUnassignedResult.items || [],
+      retryUnassignedResult.items || [],
+      processingUnassignedResult.items || [],
+    )
+    .map((item) => persistentEnvironmentAttentionDetail(item, currentEnvironment));
+
+  return mergeAttentionDetails(durableAttention, environmentAttention);
 }
 
 function isAttentionDetail(detail) {
   return Boolean(detail && (
     detail.workerFailure
+      || detail.environmentFailure
       || detail.status === OUTBOX_STATUS.UNKNOWN_OUTCOME
       || detail.retryExhausted
   ));
@@ -978,9 +1138,11 @@ export async function runISendOrderOutbox(options = {}) {
   const now = asDate(options.now, new Date());
   const limit = clampInteger(options.limit, DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
   const serviceWindow = getServiceWindow(now);
+  const environment = await getConfiguredISendEnvironment({ environment: options.environment });
+  const workerOptions = Object.assign({}, options, { environment });
 
   if (!serviceWindow.withinServiceWindow) {
-    const attentionDetails = await findPersistentAttention(now);
+    const attentionDetails = await findPersistentAttention(now, environment);
     return {
       success: attentionDetails.length === 0,
       skipped: true,
@@ -993,7 +1155,7 @@ export async function runISendOrderOutbox(options = {}) {
     };
   }
 
-  const recovered = await recoverStaleProcessing(now, limit);
+  const recovered = await recoverStaleProcessing(now, limit, environment);
   const pending = await findReadyItems(OUTBOX_STATUS.PENDING, now, limit);
   const retry = await findReadyItems(OUTBOX_STATUS.RETRY, now, limit);
   const byOrderKey = new Map();
@@ -1009,7 +1171,7 @@ export async function runISendOrderOutbox(options = {}) {
 
   for (const item of ready) {
     try {
-      details.push(await processItem(item, options, new Date()));
+      details.push(await processItem(item, workerOptions, new Date()));
     } catch (error) {
       console.error('iSend order outbox worker failed', {
         orderKey: item.orderKey,
@@ -1024,7 +1186,7 @@ export async function runISendOrderOutbox(options = {}) {
     }
   }
 
-  const persistentAttention = await findPersistentAttention(now);
+  const persistentAttention = await findPersistentAttention(now, environment);
   const attentionDetails = mergeAttentionDetails(
     persistentAttention,
     recovered.concat(details),

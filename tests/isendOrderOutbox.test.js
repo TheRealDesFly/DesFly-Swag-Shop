@@ -30,6 +30,14 @@ const mocks = vi.hoisted(() => {
         filters.push((item) => item[field] != null && new Date(item[field]).getTime() <= boundary);
         return builder;
       },
+      ne(field, value) {
+        filters.push((item) => item[field] !== value);
+        return builder;
+      },
+      isEmpty(field) {
+        filters.push((item) => item[field] === undefined || item[field] === null);
+        return builder;
+      },
       ascending(field) {
         sortField = field;
         sortDirection = 1;
@@ -84,6 +92,11 @@ const mocks = vi.hoisted(() => {
     return item;
   }
 
+  async function get(collectionName, id, options) {
+    findOptions.push(options);
+    return (collections[collectionName] || []).find((item) => item._id === id) || null;
+  }
+
   async function update(collectionName, value) {
     const items = collections[collectionName];
     const index = items.findIndex((item) => item._id === value._id);
@@ -110,17 +123,22 @@ const mocks = vi.hoisted(() => {
     resetData,
     wixData: {
       insert: vi.fn(insert),
+      get: vi.fn(get),
       update: vi.fn(update),
       remove: vi.fn(remove),
       query: vi.fn(query),
     },
     getByWixOrderId: vi.fn(),
+    getConfiguredISendEnvironment: vi.fn(),
     saveMapping: vi.fn(),
     sendOrderToISend: vi.fn(),
   };
 });
 
 vi.mock('wix-data', () => ({ default: mocks.wixData }));
+vi.mock('backend/isendConfig', () => ({
+  getConfiguredISendEnvironment: mocks.getConfiguredISendEnvironment,
+}));
 vi.mock('backend/isendMappings', () => ({
   getByWixOrderId: mocks.getByWixOrderId,
   saveMapping: mocks.saveMapping,
@@ -176,14 +194,19 @@ describe('durable iSend order outbox', () => {
     mocks.wixData.insert.mockImplementation(mocks.insertImpl);
     mocks.resetData();
     mocks.getByWixOrderId.mockResolvedValue(null);
+    mocks.getConfiguredISendEnvironment.mockImplementation(async (options = {}) => (
+      options.environment || 'staging'
+    ));
     mocks.sendOrderToISend.mockResolvedValue({
       success: true,
       returnObject: { custOrderNo: 'ISEND-1001' },
       msgList: { actualAdd: true },
     });
-    mocks.saveMapping.mockImplementation(async (wixOrderId, iSendOrderNo) => ({
+    mocks.saveMapping.mockImplementation(async (wixOrderId, iSendOrderNo, meta, environment) => ({
       wixOrderId,
       iSendOrderNo,
+      environment,
+      meta,
     }));
   });
 
@@ -198,6 +221,7 @@ describe('durable iSend order outbox', () => {
     expect(result.item).toMatchObject({
       orderKey: 'wix-order:wix-order-1',
       wixOrderId: 'wix-order-1',
+      environment: 'staging',
       status: 'pending',
       sourceShape: 'event.data.order',
       orderSnapshot: {
@@ -232,6 +256,46 @@ describe('durable iSend order outbox', () => {
     expect(mocks.collections.ISendOrderOutbox).toHaveLength(1);
   });
 
+  it('rejects a duplicate event after the site selector changes environments', async () => {
+    const event = modernOrderEvent();
+    await enqueueISendOrderEvent(event, {
+      now: withinServiceWindow,
+      environment: 'staging',
+    });
+
+    await expect(enqueueISendOrderEvent(event, {
+      now: withinServiceWindow,
+      environment: 'production',
+    })).rejects.toMatchObject({ code: 'isend-environment-mismatch' });
+    expect(mocks.collections.ISendOrderOutbox).toHaveLength(1);
+  });
+
+  it.each([
+    ['a staging row after a production switch', 'staging'],
+    ['a legacy row with no binding', undefined],
+  ])('holds %s without submitting upstream', async (description, rowEnvironment) => {
+    await enqueueISendOrderEvent(modernOrderEvent(), {
+      now: withinServiceWindow,
+      environment: 'staging',
+    });
+    mocks.collections.ISendOrderOutbox[0].environment = rowEnvironment;
+
+    const result = await runISendOrderOutbox({
+      now: withinServiceWindow,
+      limit: 1,
+      environment: 'production',
+    });
+
+    expect(result).toMatchObject({ success: false, processed: 1, requiresAttention: 1 });
+    expect(result.attentionDetails).toContainEqual(expect.objectContaining({
+      orderKey: 'wix-order:wix-order-1',
+      environmentFailure: true,
+    }));
+    expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
+    expect(mocks.saveMapping).not.toHaveBeenCalled();
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('pending');
+  });
+
   it('marks an order sent only after saving its Wix-to-iSend mapping', async () => {
     await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
 
@@ -247,6 +311,7 @@ describe('durable iSend order outbox', () => {
       'wix-order-1',
       'ISEND-1001',
       expect.objectContaining({ source: 'isend-order-outbox' }),
+      'staging',
     );
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
       status: 'sent',
@@ -375,6 +440,52 @@ describe('durable iSend order outbox', () => {
       retryExhausted: false,
     });
     expect(mocks.collections.ISendOrderOutbox[0].nextAttemptAt).toBeInstanceOf(Date);
+  });
+
+  it('fails deterministic payload validation once and preserves actionable details', async () => {
+    const payloadError = Object.assign(
+      new Error('Invalid iSend order payload: line item 1 SKU is required'),
+      {
+        name: 'ISendPayloadValidationError',
+        code: 'invalid-isend-order-payload',
+        isendPhase: 'payload',
+        validationErrors: ['line item 1 SKU is required'],
+      },
+    );
+    mocks.sendOrderToISend.mockRejectedValue(payloadError);
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+
+    const result = await runISendOrderOutbox({ now: withinServiceWindow, limit: 1 });
+
+    expect(result).toMatchObject({ success: false, requiresAttention: 1 });
+    expect(result.details[0]).toMatchObject({
+      status: 'retry',
+      retryExhausted: true,
+      error: {
+        code: 'invalid-isend-order-payload',
+        phase: 'payload',
+        validationErrors: ['line item 1 SKU is required'],
+      },
+    });
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'retry',
+      attemptCount: 1,
+      retryExhausted: true,
+      nextAttemptAt: null,
+      lastError: {
+        code: 'invalid-isend-order-payload',
+        phase: 'payload',
+        validationErrors: ['line item 1 SKU is required'],
+      },
+    });
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+
+    const claimCount = mocks.collections.ISendOrderOutboxClaims.length;
+    await expect(requeueISendOrder('wix-order:wix-order-1', {
+      now: withinServiceWindow,
+      reason: 'Retry unchanged payload',
+    })).rejects.toThrow('cannot be requeued with the same snapshot');
+    expect(mocks.collections.ISendOrderOutboxClaims).toHaveLength(claimCount);
   });
 
   it('fences a worker that loses its claim while waiting for iSend', async () => {
@@ -554,6 +665,7 @@ describe('durable iSend order outbox', () => {
         _id: 'unknown-row',
         _revision: '1',
         orderKey: 'wix-order:unknown',
+        environment: 'staging',
         status: 'unknown_outcome',
         retryExhausted: true,
       },
@@ -561,6 +673,7 @@ describe('durable iSend order outbox', () => {
         _id: 'exhausted-row',
         _revision: '1',
         orderKey: 'wix-order:exhausted',
+        environment: 'staging',
         status: 'retry',
         retryExhausted: true,
       },
@@ -568,6 +681,7 @@ describe('durable iSend order outbox', () => {
         _id: 'stale-row',
         _revision: '1',
         orderKey: 'wix-order:stale',
+        environment: 'staging',
         status: 'processing',
         leaseExpiresAt: expiredAt,
       },
