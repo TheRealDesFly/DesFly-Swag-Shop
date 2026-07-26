@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { testISendLogin } from 'backend/isendService';
 import {
   createISendSingleParcelFulfillment,
+  extractISendParcelContractMetadata,
   getSingleParcelFulfillmentKey,
 } from 'backend/orderFulfillment';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
@@ -154,11 +155,16 @@ export async function post_runISendPoller(request) {
       return jsonResponse(401, { success: false, message: 'Unauthorized' });
     }
 
-    const { payload } = await consumeJsonRequestBody(request);
-    const types = payload && payload.types ? payload.types : ['tracking', 'status'];
+    await consumeJsonRequestBody(request);
     // The site's configured ISTORE_ISEND_ENV is authoritative. A remote
-    // trigger must not redirect this Wix site across staging/production.
-    const result = await runPoller({ types });
+    // trigger must not redirect this Wix site across staging/production or
+    // expand the scheduled webhook safety net into a broad/manual data scan.
+    const result = await runPoller({
+      types: ['tracking', 'status'],
+      limit: 5,
+      maxPages: 1,
+      reconciliationOnly: true,
+    });
     if (!result || result.success !== true) {
       return jsonResponse(500, result || {
         success: false,
@@ -249,6 +255,11 @@ export async function post_createFulfillmentFromWix(request) {
       shippingProvider,
       trackingLink,
       idempotencyKey,
+      trackingNumbers,
+      parcels,
+      parcelCount,
+      totalParcels,
+      lineItemAllocations,
     } = payload || {};
 
     if (!orderId) {
@@ -272,7 +283,11 @@ export async function post_createFulfillmentFromWix(request) {
       });
     }
 
-    const canonicalIdempotencyKey = getSingleParcelFulfillmentKey(normalizedISendOrderNo);
+    const environment = await getConfiguredISendEnvironment();
+    const canonicalIdempotencyKey = getSingleParcelFulfillmentKey(
+      normalizedISendOrderNo,
+      environment,
+    );
     const suppliedIdempotencyKey = String(idempotencyKey || '').trim();
     if (suppliedIdempotencyKey && suppliedIdempotencyKey !== canonicalIdempotencyKey) {
       return jsonResponse(400, {
@@ -282,7 +297,14 @@ export async function post_createFulfillmentFromWix(request) {
       });
     }
 
-    const environment = await getConfiguredISendEnvironment();
+    const parcelContract = extractISendParcelContractMetadata({
+      ...(payload || {}),
+      trackingNumbers,
+      parcels,
+      parcelCount,
+      totalParcels,
+      lineItemAllocations,
+    });
     const result = await createISendSingleParcelFulfillment(
       normalizedISendOrderNo,
       orderId,
@@ -292,6 +314,7 @@ export async function post_createFulfillmentFromWix(request) {
         trackingNumber,
         shippingProvider,
         trackingLink,
+        ...parcelContract,
       },
     );
 
@@ -324,6 +347,17 @@ export async function post_createFulfillmentFromWix(request) {
         code: error.code,
         message: 'Fulfillment line items do not match the authoritative Wix order',
       });
+    }
+    if (error && error.retryable === false) {
+      return jsonResponse(
+        error.code === 'unsupported-isend-split-shipment' ? 409 : 422,
+        {
+          success: false,
+          retryable: false,
+          code: error.code || 'invalid-fulfillment-contract',
+          message: error.message,
+        },
+      );
     }
     return serverError({
       headers: { 'Content-Type': 'application/json' },

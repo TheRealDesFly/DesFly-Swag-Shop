@@ -16,12 +16,17 @@
  */
 import crypto from 'crypto';
 import wixData from 'wix-data';
+import { elevate } from 'wix-auth';
+import { orders } from 'wix-ecom-backend';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { getByWixOrderId, saveMapping } from 'backend/isendMappings';
 import { sendOrderToISend } from 'backend/isendService';
 
+const getWixOrder = elevate(orders.getOrder);
+
 export const OUTBOX_COLLECTION = 'ISendOrderOutbox';
 export const CLAIM_COLLECTION = 'ISendOrderOutboxClaims';
+export const LIFECYCLE_INTENT_COLLECTION = 'ISendOrderLifecycleIntents';
 
 export const OUTBOX_STATUS = Object.freeze({
   PENDING: 'pending',
@@ -29,6 +34,7 @@ export const OUTBOX_STATUS = Object.freeze({
   RETRY: 'retry',
   UNKNOWN_OUTCOME: 'unknown_outcome',
   SENT: 'sent',
+  CANCELED: 'canceled',
 });
 
 const MYT_OFFSET_MS = 8 * 60 * 60 * 1000;
@@ -47,6 +53,17 @@ const UNKNOWN_REQUEUE_ERROR =
   'Unknown iSend outcomes cannot be automatically requeued without an authoritative upstream lookup';
 const INVALID_PAYLOAD_REQUEUE_ERROR =
   'An invalid iSend order payload cannot be requeued with the same snapshot; correct the authoritative order and use a reviewed replacement or snapshot-remediation process';
+const WIX_APPROVED_STATUS = 'APPROVED';
+const TERMINAL_WIX_ORDER_STATUSES = new Set(['CANCELED', 'CANCELLED', 'REJECTED']);
+const ALREADY_FULFILLED_WIX_STATUSES = new Set(['PARTIALLY_FULFILLED', 'FULFILLED']);
+const FULL_REFUND_PAYMENT_STATUSES = new Set(['FULLY_REFUNDED']);
+const REFUND_REVIEW_PAYMENT_STATUSES = new Set([
+  'PARTIALLY_REFUNDED',
+  'CANCELED',
+  'CANCELLED',
+  'DECLINED',
+]);
+const LIFECYCLE_INTENT_SCAN_LIMIT = 100;
 const TRUSTED_READ_OPTIONS = Object.freeze({ consistentRead: true, suppressAuth: true });
 const TRUSTED_WRITE_OPTIONS = Object.freeze({ suppressAuth: true });
 
@@ -174,9 +191,19 @@ function moveIntoServiceWindow(dateValue) {
 
 function getOrderFromEvent(event) {
   if (!event || typeof event !== 'object') return null;
+  const entity = event.entity;
+  const entityLooksLikeOrder = entity && typeof entity === 'object' && (
+    Array.isArray(entity.lineItems)
+    || entity.shippingInfo
+    || entity.buyerInfo
+    || entity.priceSummary
+    || entity.status
+    || entity.orderStatus
+    || entity.number
+  );
   return event.order
     || (event.data && event.data.order)
-    || event.entity
+    || (entityLooksLikeOrder ? entity : null)
     || (event._id || event.id || event.orderId ? event : null);
 }
 
@@ -240,8 +267,98 @@ function normalizeOrderSnapshot(order, wixOrderId) {
   });
 }
 
+function normalizeWixOrderStatus(order) {
+  return String(order && (order.status || order.orderStatus) || '').trim().toUpperCase();
+}
+
+function normalizeWixFulfillmentStatus(order) {
+  return String(order && (
+    order.fulfillmentStatus
+    || order.fulfillment && order.fulfillment.status
+  ) || '').trim().toUpperCase();
+}
+
+function normalizeWixPaymentStatus(order) {
+  return String(order && order.paymentStatus || '').trim().toUpperCase();
+}
+
+function getWixPaymentLifecycleIssue(order) {
+  const paymentStatus = normalizeWixPaymentStatus(order);
+  if (FULL_REFUND_PAYMENT_STATUSES.has(paymentStatus)) {
+    return {
+      kind: 'fully-refunded',
+      paymentStatus,
+      terminal: true,
+    };
+  }
+  if (REFUND_REVIEW_PAYMENT_STATUSES.has(paymentStatus)) {
+    return {
+      kind: 'refund-review',
+      paymentStatus,
+      terminal: false,
+    };
+  }
+  return null;
+}
+
+function isTerminalWixOrder(order) {
+  return TERMINAL_WIX_ORDER_STATUSES.has(normalizeWixOrderStatus(order));
+}
+
+function canonicalizeFingerprintValue(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map(canonicalizeFingerprintValue);
+  if (!value || typeof value !== 'object') return value;
+
+  return Object.keys(value)
+    .filter((key) => ![
+      '_updatedDate',
+      'updatedDate',
+      'status',
+      'orderStatus',
+      'paymentStatus',
+      'fulfillmentStatus',
+    ].includes(key))
+    .sort()
+    .reduce((result, key) => {
+      result[key] = canonicalizeFingerprintValue(value[key]);
+      return result;
+    }, {});
+}
+
+/**
+ * Hash only fields that can affect the outbound order. Wix lifecycle fields
+ * are deliberately omitted so an innocuous status timestamp does not create a
+ * false post-submit change alert.
+ */
+function orderSubmissionFingerprint(order, wixOrderId) {
+  const snapshot = normalizeOrderSnapshot(order, wixOrderId) || {};
+  const outboundShape = {
+    _id: snapshot._id,
+    number: snapshot.number,
+    orderNumber: snapshot.orderNumber,
+    _createdDate: snapshot._createdDate,
+    createdDate: snapshot.createdDate,
+    buyerInfo: snapshot.buyerInfo,
+    shippingInfo: snapshot.shippingInfo,
+    recipientInfo: snapshot.recipientInfo,
+    lineItems: snapshot.lineItems,
+    totals: snapshot.totals,
+    total: snapshot.total,
+    totalPrice: snapshot.totalPrice,
+    priceSummary: snapshot.priceSummary,
+    currency: snapshot.currency,
+    note: snapshot.note,
+    buyerNote: snapshot.buyerNote,
+  };
+  return crypto.createHash('sha256')
+    .update(JSON.stringify(canonicalizeFingerprintValue(outboundShape)))
+    .digest('hex');
+}
+
 function getWixOrderId(order, event) {
-  const id = order && (order._id || order.id || order.orderId)
+  const id = order && (order.orderId || order._id || order.id)
+    || event && event.entity && event.entity.orderId
     || event && event.metadata && event.metadata.entityId
     || event && event.orderId;
   return id === undefined || id === null || id === '' ? null : String(id);
@@ -258,6 +375,189 @@ export function getWixOrderKey(order, event = {}) {
     throw new Error('Cannot enqueue iSend order without a Wix order ID');
   }
   return `wix-order:${wixOrderId}`;
+}
+
+function lifecycleEventFields(event, wixOrderStatus, now) {
+  return {
+    wixLifecycleStatus: wixOrderStatus || null,
+    lastLifecycleEventId: event && event.metadata && event.metadata.id
+      ? String(event.metadata.id)
+      : null,
+    lastLifecycleEventTime: event && event.metadata && event.metadata.eventTime
+      ? asDate(event.metadata.eventTime)
+      : now,
+    lastLifecycleEventAt: now,
+  };
+}
+
+function lifecycleIntentRecordedAt(intent) {
+  return asDate(
+    intent && (intent.recordedAt || intent.sourceEventTime),
+    new Date(0),
+  );
+}
+
+function lifecycleIntentIdentity(event, intentType, order, orderKey, now) {
+  const sourceEventId = event && event.metadata && event.metadata.id;
+  if (sourceEventId) return `event:${sourceEventId}`;
+  const sourceEventTime = event && event.metadata && event.metadata.eventTime;
+  const fallback = {
+    orderKey,
+    intentType,
+    sourceEventTime: sourceEventTime || now.toISOString(),
+    wixOrderStatus: normalizeWixOrderStatus(order),
+    wixPaymentStatus: normalizeWixPaymentStatus(order),
+    orderSnapshotFingerprint: order
+      ? orderSubmissionFingerprint(order, getWixOrderId(order, event))
+      : null,
+  };
+  return `derived:${crypto.createHash('sha256').update(JSON.stringify(fallback)).digest('hex')}`;
+}
+
+/**
+ * Lifecycle events are inserted before contending for the outbox claim. The
+ * append-only intent row is the durable handoff when an update/cancellation
+ * races a worker; event redelivery is never required for correctness.
+ */
+async function persistLifecycleIntent(
+  event,
+  intentType,
+  environment,
+  now,
+  order = getOrderFromEvent(event),
+) {
+  const wixOrderId = getWixOrderId(order, event);
+  if (!wixOrderId) {
+    throw new Error('Cannot persist iSend lifecycle intent without a Wix order ID');
+  }
+  const orderKey = getWixOrderKey(order, event);
+  const identity = lifecycleIntentIdentity(event, intentType, order, orderKey, now);
+  const item = {
+    _id: deterministicItemId('isend-lifecycle', `${orderKey}:${identity}`),
+    orderKey,
+    wixOrderId,
+    environment,
+    intentType,
+    wixOrderStatus: normalizeWixOrderStatus(order) || null,
+    wixPaymentStatus: normalizeWixPaymentStatus(order) || null,
+    orderSnapshotFingerprint: order
+      ? orderSubmissionFingerprint(order, wixOrderId)
+      : null,
+    sourceEventId: event && event.metadata && event.metadata.id
+      ? String(event.metadata.id)
+      : null,
+    sourceEventTime: event && event.metadata && event.metadata.eventTime
+      ? asDate(event.metadata.eventTime)
+      : null,
+    recordedAt: now,
+  };
+
+  try {
+    return await wixData.insert(
+      LIFECYCLE_INTENT_COLLECTION,
+      item,
+      TRUSTED_WRITE_OPTIONS,
+    );
+  } catch (error) {
+    const existing = await wixData.get(
+      LIFECYCLE_INTENT_COLLECTION,
+      item._id,
+      TRUSTED_READ_OPTIONS,
+    );
+    if (existing) {
+      assertEnvironmentBinding(
+        existing,
+        environment,
+        `iSend lifecycle intent ${item._id}`,
+      );
+      return existing;
+    }
+    throw error;
+  }
+}
+
+async function readLifecycleIntentState(
+  orderKey,
+  environment,
+  since = null,
+  knownIntentIds = null,
+) {
+  const result = await wixData.query(LIFECYCLE_INTENT_COLLECTION)
+    .eq('orderKey', orderKey)
+    .eq('environment', environment)
+    .descending('recordedAt')
+    .limit(LIFECYCLE_INTENT_SCAN_LIMIT + 1)
+    .find(TRUSTED_READ_OPTIONS);
+  const allItems = result.items || [];
+  const overflow = allItems.length > LIFECYCLE_INTENT_SCAN_LIMIT
+    || Number(result.totalCount || 0) > LIFECYCLE_INTENT_SCAN_LIMIT;
+  const items = allItems.slice(0, LIFECYCLE_INTENT_SCAN_LIMIT);
+  const knownIds = knownIntentIds instanceof Set ? knownIntentIds : null;
+  const sinceDate = !knownIds && since ? asDate(since, new Date(0)) : null;
+  const recent = knownIds
+    ? items.filter((intent) => !knownIds.has(intent._id))
+    : (sinceDate
+      ? items.filter((intent) => (
+        lifecycleIntentRecordedAt(intent).getTime() >= sinceDate.getTime()
+      ))
+      : items);
+  const isCancellation = (intent) => (
+    intent.intentType === 'cancellation'
+    || TERMINAL_WIX_ORDER_STATUSES.has(String(intent.wixOrderStatus || '').toUpperCase())
+  );
+  const isFullRefund = (intent) => (
+    FULL_REFUND_PAYMENT_STATUSES.has(String(intent.wixPaymentStatus || '').toUpperCase())
+  );
+  const isRefundReview = (intent) => (
+    REFUND_REVIEW_PAYMENT_STATUSES.has(String(intent.wixPaymentStatus || '').toUpperCase())
+  );
+
+  return {
+    overflow,
+    items,
+    recent,
+    cancellationIntent: items.find(isCancellation) || null,
+    fullRefundIntent: items.find(isFullRefund) || null,
+    refundReviewIntent: items.find(isRefundReview) || null,
+    recentCancellationIntent: recent.find(isCancellation) || null,
+    recentFullRefundIntent: recent.find(isFullRefund) || null,
+    recentRefundReviewIntent: recent.find(isRefundReview) || null,
+  };
+}
+
+function authoritativeOrderError(message, code = 'wix-order-read-failed', cause = null) {
+  const error = new Error(message);
+  error.code = code;
+  error.isendPhase = 'authoritative-order';
+  if (cause) error.cause = cause;
+  return error;
+}
+
+async function readAuthoritativeWixOrder(wixOrderId) {
+  let order;
+  try {
+    order = await getWixOrder(wixOrderId);
+  } catch (error) {
+    throw authoritativeOrderError(
+      `Could not re-read Wix order ${wixOrderId} before iSend submission`,
+      'wix-order-read-failed',
+      error,
+    );
+  }
+  if (!order || typeof order !== 'object') {
+    throw authoritativeOrderError(
+      `Wix order lookup returned no order for ${wixOrderId}`,
+      'wix-order-not-found',
+    );
+  }
+  const returnedOrderId = getWixOrderId(order);
+  if (!returnedOrderId || String(returnedOrderId) !== String(wixOrderId)) {
+    throw authoritativeOrderError(
+      `Wix order lookup returned a different order for ${wixOrderId}`,
+      'wix-order-id-mismatch',
+    );
+  }
+  return order;
 }
 
 async function findByOrderKey(orderKey) {
@@ -321,14 +621,18 @@ export async function enqueueISendOrderEvent(event, options = {}) {
     1,
     MAX_CONFIGURED_ATTEMPTS,
   );
+  const wixOrderStatus = normalizeWixOrderStatus(order);
+  const canceled = isTerminalWixOrder(order);
+  const normalizedSnapshot = normalizeOrderSnapshot(order, wixOrderId);
 
   const item = {
     _id: deterministicItemId('isend-order', orderKey),
     orderKey,
     wixOrderId,
     environment,
-    status: OUTBOX_STATUS.PENDING,
-    orderSnapshot: normalizeOrderSnapshot(order, wixOrderId),
+    status: canceled ? OUTBOX_STATUS.CANCELED : OUTBOX_STATUS.PENDING,
+    orderSnapshot: normalizedSnapshot,
+    orderSnapshotFingerprint: orderSubmissionFingerprint(normalizedSnapshot, wixOrderId),
     sourceEventId: event && event.metadata && event.metadata.id
       ? String(event.metadata.id)
       : null,
@@ -339,9 +643,14 @@ export async function enqueueISendOrderEvent(event, options = {}) {
     attemptCount: 0,
     maxAttempts,
     retryExhausted: false,
-    nextAttemptAt: moveIntoServiceWindow(now),
+    nextAttemptAt: canceled ? null : moveIntoServiceWindow(now),
     enqueuedAt: now,
     updatedAt: now,
+    ...(canceled ? {
+      canceledAt: now,
+      cancellationReason: `wix-order-${wixOrderStatus.toLowerCase()}`,
+    } : {}),
+    ...lifecycleEventFields(event, wixOrderStatus, now),
   };
 
   try {
@@ -523,8 +832,9 @@ async function markRetry(item, failure, now) {
   }, now);
 }
 
-async function markRetryExhausted(item, failure, now) {
+async function markRetryExhausted(item, failure, now, lifecycleChanges = {}) {
   return updateOutbox(item, {
+    ...lifecycleChanges,
     status: OUTBOX_STATUS.RETRY,
     retryExhausted: true,
     nextAttemptAt: null,
@@ -536,8 +846,9 @@ async function markRetryExhausted(item, failure, now) {
   }, now);
 }
 
-async function markUnknownOutcome(item, reason, details, now) {
+async function markUnknownOutcome(item, reason, details, now, lifecycleChanges = {}) {
   return updateOutbox(item, {
+    ...lifecycleChanges,
     status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
     unknownOutcomeReason: reason,
     unknownOutcomeDetails: details,
@@ -551,8 +862,15 @@ async function markUnknownOutcome(item, reason, details, now) {
   }, now);
 }
 
-async function markSent(item, iSendOrderNo, now, responseSummary = null) {
+async function markSent(
+  item,
+  iSendOrderNo,
+  now,
+  responseSummary = null,
+  lifecycleChanges = {},
+) {
   return updateOutbox(item, {
+    ...lifecycleChanges,
     status: OUTBOX_STATUS.SENT,
     iSendOrderNo: String(iSendOrderNo),
     sentAt: now,
@@ -567,9 +885,694 @@ async function markSent(item, iSendOrderNo, now, responseSummary = null) {
   }, now);
 }
 
+async function markCanceled(item, order, event, reason, now, options = {}) {
+  const wixOrderStatus = normalizeWixOrderStatus(order);
+  const attemptCount = options.restoreUnsubmittedAttempt
+    ? Math.max(0, Number(item.attemptCount || 0) - 1)
+    : Number(item.attemptCount || 0);
+  return updateOutbox(item, {
+    status: OUTBOX_STATUS.CANCELED,
+    attemptCount,
+    canceledAt: now,
+    cancellationReason: reason || (
+      wixOrderStatus ? `wix-order-${wixOrderStatus.toLowerCase()}` : 'wix-order-canceled'
+    ),
+    orderSnapshot: order
+      ? normalizeOrderSnapshot(order, item.wixOrderId)
+      : item.orderSnapshot,
+    orderSnapshotFingerprint: order
+      ? orderSubmissionFingerprint(order, item.wixOrderId)
+      : item.orderSnapshotFingerprint,
+    wixPaymentStatus: normalizeWixPaymentStatus(order) || item.wixPaymentStatus || null,
+    retryExhausted: false,
+    nextAttemptAt: null,
+    lastError: null,
+    lastAttemptFinishedAt: options.restoreUnsubmittedAttempt ? now : item.lastAttemptFinishedAt,
+    leaseToken: null,
+    claimGeneration: null,
+    leaseExpiresAt: null,
+    lifecycleRequiresAttention: false,
+    attentionReason: null,
+    ...lifecycleEventFields(event, wixOrderStatus, now),
+  }, now);
+}
+
+function lifecycleFailure(code, message, details = {}) {
+  return {
+    code,
+    message: truncate(message, 1000),
+    ...details,
+  };
+}
+
+async function markLifecycleDeferred(item, reason, now) {
+  const attemptCount = Math.max(0, Number(item.attemptCount || 0) - 1);
+  return updateOutbox(item, {
+    status: OUTBOX_STATUS.RETRY,
+    attemptCount,
+    retryExhausted: false,
+    nextAttemptAt: moveIntoServiceWindow(now),
+    lastError: lifecycleFailure(
+      'wix-order-lifecycle-changed-before-submit',
+      reason,
+    ),
+    lastAttemptFinishedAt: now,
+    leaseToken: null,
+    claimGeneration: null,
+    leaseExpiresAt: null,
+  }, now);
+}
+
+/**
+ * Apply every lifecycle state that proves no submit should start. Persistent
+ * cancellation/refund intents are honored even if the Wix order read lagged;
+ * ordinary updates only defer when recorded during the authoritative read.
+ */
+async function transitionForLifecycleStateBeforeSideEffect(
+  item,
+  order,
+  event,
+  lifecycleState,
+  now,
+  options = {},
+) {
+  const restoreAttempt = Boolean(options.restoreAttempt);
+  const transitionItem = restoreAttempt
+    ? Object.assign({}, item, {
+      attemptCount: Math.max(0, Number(item.attemptCount || 0) - 1),
+    })
+    : item;
+  const wixOrderStatus = normalizeWixOrderStatus(order);
+  if (isTerminalWixOrder(order) || lifecycleState.cancellationIntent) {
+    const intentStatus = lifecycleState.cancellationIntent
+      && lifecycleState.cancellationIntent.wixOrderStatus;
+    const reasonStatus = intentStatus || wixOrderStatus || 'CANCELED';
+    const updated = await markCanceled(
+      transitionItem,
+      order,
+      event,
+      `wix-order-${String(reasonStatus).toLowerCase()}-before-submit`,
+      now,
+    );
+    return {
+      transitioned: true,
+      status: OUTBOX_STATUS.CANCELED,
+      reason: 'authoritative-wix-order-canceled',
+      item: updated,
+    };
+  }
+
+  const paymentIssue = getWixPaymentLifecycleIssue(order);
+  if ((paymentIssue && paymentIssue.terminal) || lifecycleState.fullRefundIntent) {
+    const paymentStatus = paymentIssue?.paymentStatus
+      || lifecycleState.fullRefundIntent?.wixPaymentStatus
+      || 'FULLY_REFUNDED';
+    const updated = await markCanceled(
+      transitionItem,
+      order,
+      event,
+      `wix-payment-${String(paymentStatus).toLowerCase()}-before-submit`,
+      now,
+    );
+    return {
+      transitioned: true,
+      status: OUTBOX_STATUS.CANCELED,
+      reason: 'wix-order-fully-refunded',
+      item: updated,
+    };
+  }
+
+  const refundReviewStatus = paymentIssue?.paymentStatus
+    || lifecycleState.refundReviewIntent?.wixPaymentStatus;
+  if ((paymentIssue && !paymentIssue.terminal) || lifecycleState.refundReviewIntent) {
+    const failure = lifecycleFailure(
+      'wix-order-refund-review-required',
+      `Wix order ${item.wixOrderId} requires refund review before iSend submission`,
+      { wixPaymentStatus: refundReviewStatus || null },
+    );
+    const updated = await markRetryExhausted(
+      transitionItem,
+      failure,
+      now,
+      {
+        lifecycleRequiresAttention: true,
+        attentionReason: 'wix-order-refund-review-before-isend-submit',
+        wixPaymentStatus: refundReviewStatus || null,
+      },
+    );
+    return {
+      transitioned: true,
+      status: OUTBOX_STATUS.RETRY,
+      retryExhausted: true,
+      reason: 'wix-order-refund-review-required',
+      item: updated,
+      error: failure,
+    };
+  }
+
+  if (lifecycleState.overflow) {
+    const failure = lifecycleFailure(
+      'wix-order-lifecycle-intent-overflow',
+      `Wix order ${item.wixOrderId} has more lifecycle intents than can be reviewed safely`,
+    );
+    const updated = await markRetryExhausted(
+      transitionItem,
+      failure,
+      now,
+      {
+        lifecycleRequiresAttention: true,
+        attentionReason: 'wix-order-lifecycle-intent-overflow',
+      },
+    );
+    return {
+      transitioned: true,
+      status: OUTBOX_STATUS.RETRY,
+      retryExhausted: true,
+      reason: 'wix-order-lifecycle-intent-overflow',
+      item: updated,
+      error: failure,
+    };
+  }
+
+  if (lifecycleState.recent.length > 0) {
+    const updated = await markLifecycleDeferred(
+      item,
+      `Wix order ${item.wixOrderId} changed during the authoritative pre-submit read`,
+      now,
+    );
+    return {
+      transitioned: true,
+      status: OUTBOX_STATUS.RETRY,
+      deferred: true,
+      reason: 'wix-order-lifecycle-changed-before-submit',
+      item: updated,
+    };
+  }
+
+  return { transitioned: false };
+}
+
+function postSubmitLifecycleChanges(lifecycleState, now) {
+  if (!lifecycleState || (
+    !lifecycleState.overflow
+    && lifecycleState.recent.length === 0
+  )) return {};
+
+  let attentionReason = 'wix-order-changed-during-isend-submit';
+  if (lifecycleState.recentRefundReviewIntent) {
+    attentionReason = 'wix-order-refund-review-during-isend-submit';
+  }
+  if (lifecycleState.recentFullRefundIntent) {
+    attentionReason = 'wix-order-fully-refunded-during-isend-submit';
+  }
+  if (lifecycleState.recentCancellationIntent) {
+    attentionReason = 'wix-order-canceled-during-isend-submit';
+  }
+  if (lifecycleState.overflow) {
+    attentionReason = 'wix-order-lifecycle-intent-overflow';
+  }
+  return {
+    lifecycleRequiresAttention: true,
+    attentionReason,
+    lifecycleChangedDuringSubmitAt: now,
+    latestLifecycleIntentId: lifecycleState.recent[0]?._id || null,
+  };
+}
+
+async function readFinalPostSubmitLifecycleChanges(
+  item,
+  knownIntentIds,
+  now,
+  existingChanges = {},
+) {
+  try {
+    const lifecycleState = await readLifecycleIntentState(
+      item.orderKey,
+      item.environment,
+      null,
+      knownIntentIds,
+    );
+    return {
+      ...existingChanges,
+      ...postSubmitLifecycleChanges(lifecycleState, now),
+    };
+  } catch {
+    return {
+      ...existingChanges,
+      lifecycleRequiresAttention: true,
+      attentionReason: 'lifecycle-intent-read-failed-after-isend-submit',
+      lifecycleChangedDuringSubmitAt: now,
+    };
+  }
+}
+
+/**
+ * Record a Wix cancellation without pretending that iSend was canceled too.
+ * Unsubmitted rows become terminal tombstones. A conclusive prior submit stays
+ * sent and raises durable attention because this integration has no upstream
+ * cancel contract. An expired in-flight row remains outcome-ambiguous.
+ */
+export async function cancelISendOrderEvent(event, options = {}) {
+  const now = asDate(options.now, new Date());
+  const environment = await getConfiguredISendEnvironment({
+    environment: options.environment,
+  });
+  let order = getOrderFromEvent(event);
+  const wixOrderId = getWixOrderId(order, event);
+  if (!wixOrderId) {
+    throw new Error('Cannot cancel iSend order lifecycle without a Wix order ID');
+  }
+  const orderKey = getWixOrderKey(order, event);
+  const lifecycleIntent = options.persistedLifecycleIntent
+    || await persistLifecycleIntent(
+      event,
+      'cancellation',
+      environment,
+      now,
+      order,
+    );
+  let initialItem = await findByOrderKey(orderKey);
+
+  if (!initialItem) {
+    if (!order || typeof order !== 'object') {
+      order = await readAuthoritativeWixOrder(wixOrderId);
+    }
+    const enqueueEvent = order === getOrderFromEvent(event)
+      ? event
+      : Object.assign({}, event, { order });
+    const enqueued = await enqueueISendOrderEvent(enqueueEvent, {
+      ...options,
+      environment,
+      now,
+    });
+    initialItem = enqueued.item;
+  }
+
+  assertEnvironmentBinding(initialItem, environment, `iSend outbox item ${orderKey}`);
+  if (initialItem.status === OUTBOX_STATUS.CANCELED) {
+    return {
+      updated: false,
+      duplicate: true,
+      status: OUTBOX_STATUS.CANCELED,
+      item: initialItem,
+      lifecycleIntent,
+    };
+  }
+
+  const claim = await acquireClaim(initialItem, now);
+  if (!claim.claimed) {
+    return {
+      updated: false,
+      deferred: true,
+      status: initialItem.status,
+      reason: 'active-worker-will-recheck-lifecycle-intent',
+      item: initialItem,
+      lifecycleIntent,
+    };
+  }
+
+  try {
+    const item = await findByOrderKey(orderKey);
+    if (!item) throw new Error(`No iSend outbox item found for ${orderKey}`);
+    assertEnvironmentBinding(item, environment, `iSend outbox item ${orderKey}`);
+    if (item.status === OUTBOX_STATUS.CANCELED) {
+      return {
+        updated: false,
+        duplicate: true,
+        status: OUTBOX_STATUS.CANCELED,
+        item,
+        lifecycleIntent,
+      };
+    }
+
+    const wixOrderStatus = normalizeWixOrderStatus(order) || 'CANCELED';
+    const eventFields = lifecycleEventFields(event, wixOrderStatus, now);
+    if (item.status === OUTBOX_STATUS.SENT) {
+      const updated = await updateOutbox(item, {
+        ...eventFields,
+        lifecycleRequiresAttention: true,
+        attentionReason: 'wix-order-canceled-after-isend-submit',
+        canceledAt: now,
+        cancellationReason: `wix-order-${wixOrderStatus.toLowerCase()}`,
+        latestOrderSnapshotFingerprint: order
+          ? orderSubmissionFingerprint(order, wixOrderId)
+          : null,
+      }, now);
+      return {
+        updated: true,
+        status: OUTBOX_STATUS.SENT,
+        requiresAttention: true,
+        item: updated,
+        lifecycleIntent,
+      };
+    }
+
+    if (item.status === OUTBOX_STATUS.UNKNOWN_OUTCOME
+      || item.status === OUTBOX_STATUS.PROCESSING) {
+      const updated = await markUnknownOutcome(
+        item,
+        'wix-order-canceled-with-ambiguous-submit-outcome',
+        {
+          wixOrderStatus,
+          message: 'Reconcile iSend before deciding whether an upstream cancellation is required',
+        },
+        now,
+        {
+          ...eventFields,
+          lifecycleRequiresAttention: true,
+          attentionReason: 'wix-order-canceled-with-ambiguous-submit-outcome',
+          canceledAt: now,
+          cancellationReason: `wix-order-${wixOrderStatus.toLowerCase()}`,
+        },
+      );
+      return {
+        updated: true,
+        status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
+        requiresAttention: true,
+        item: updated,
+        lifecycleIntent,
+      };
+    }
+
+    const updated = await markCanceled(
+      item,
+      order,
+      event,
+      `wix-order-${wixOrderStatus.toLowerCase()}`,
+      now,
+    );
+    return {
+      updated: true,
+      status: OUTBOX_STATUS.CANCELED,
+      item: updated,
+      lifecycleIntent,
+    };
+  } finally {
+    try {
+      await releaseClaim(orderKey, claim.leaseToken, claim.generation);
+    } catch (error) {
+      console.error('Failed to release iSend cancellation claim', {
+        orderKey,
+        message: error.message,
+      });
+    }
+  }
+}
+
+/**
+ * Refresh an unsent snapshot from an order-update event. Post-submit or
+ * ambiguous changes never rewrite the submitted snapshot; they become durable
+ * reconciliation alerts instead.
+ */
+export async function refreshISendOrderEvent(event, options = {}) {
+  const now = asDate(options.now, new Date());
+  const environment = await getConfiguredISendEnvironment({
+    environment: options.environment,
+  });
+  let order = getOrderFromEvent(event);
+  const wixOrderId = getWixOrderId(order, event);
+  if (!wixOrderId) {
+    throw new Error('Cannot refresh iSend order lifecycle without a Wix order ID');
+  }
+  const lifecycleIntent = await persistLifecycleIntent(
+    event,
+    'update',
+    environment,
+    now,
+    order,
+  );
+  if (!order || typeof order !== 'object') {
+    order = await readAuthoritativeWixOrder(wixOrderId);
+  }
+  if (isTerminalWixOrder(order)) {
+    const cancelEvent = order === getOrderFromEvent(event)
+      ? event
+      : Object.assign({}, event, { order });
+    return cancelISendOrderEvent(cancelEvent, {
+      ...options,
+      environment,
+      now,
+      persistedLifecycleIntent: lifecycleIntent,
+    });
+  }
+
+  const orderKey = getWixOrderKey(order, event);
+  const paymentIssue = getWixPaymentLifecycleIssue(order);
+  let initialItem = await findByOrderKey(orderKey);
+  if (!initialItem) {
+    const wixOrderStatus = normalizeWixOrderStatus(order);
+    if (wixOrderStatus !== WIX_APPROVED_STATUS) {
+      return {
+        updated: false,
+        ignored: true,
+        status: wixOrderStatus || 'UNKNOWN',
+        reason: 'order-update-before-approval',
+        item: null,
+      };
+    }
+    const enqueueEvent = order === getOrderFromEvent(event)
+      ? event
+      : Object.assign({}, event, { order });
+    const enqueued = await enqueueISendOrderEvent(enqueueEvent, {
+      ...options,
+      environment,
+      now,
+    });
+    if (paymentIssue) {
+      initialItem = enqueued.item;
+    } else {
+      return {
+        updated: true,
+        enqueued: true,
+        status: enqueued.item.status,
+        item: enqueued.item,
+        lifecycleIntent,
+      };
+    }
+  }
+
+  assertEnvironmentBinding(initialItem, environment, `iSend outbox item ${orderKey}`);
+  const claim = await acquireClaim(initialItem, now);
+  if (!claim.claimed) {
+    return {
+      updated: false,
+      deferred: true,
+      status: initialItem.status,
+      reason: 'active-worker-will-recheck-lifecycle-intent',
+      item: initialItem,
+      lifecycleIntent,
+    };
+  }
+
+  try {
+    const item = await findByOrderKey(orderKey);
+    if (!item) throw new Error(`No iSend outbox item found for ${orderKey}`);
+    assertEnvironmentBinding(item, environment, `iSend outbox item ${orderKey}`);
+    if (item.status === OUTBOX_STATUS.CANCELED) {
+      return {
+        updated: false,
+        status: OUTBOX_STATUS.CANCELED,
+        item,
+        lifecycleIntent,
+      };
+    }
+
+    const nextFingerprint = orderSubmissionFingerprint(order, wixOrderId);
+    const submittedFingerprint = item.orderSnapshotFingerprint
+      || orderSubmissionFingerprint(item.orderSnapshot, wixOrderId);
+    const changed = nextFingerprint !== submittedFingerprint;
+    const wixOrderStatus = normalizeWixOrderStatus(order);
+    const eventFields = lifecycleEventFields(event, wixOrderStatus, now);
+    if (paymentIssue && item.status === OUTBOX_STATUS.SENT) {
+      const attentionReason = paymentIssue.terminal
+        ? 'wix-order-fully-refunded-after-isend-submit'
+        : 'wix-order-refund-review-after-isend-submit';
+      const updated = await updateOutbox(item, {
+        ...eventFields,
+        lifecycleRequiresAttention: true,
+        attentionReason,
+        wixPaymentStatus: paymentIssue.paymentStatus,
+        latestOrderSnapshotFingerprint: nextFingerprint,
+      }, now);
+      return {
+        updated: true,
+        changed,
+        status: OUTBOX_STATUS.SENT,
+        requiresAttention: true,
+        item: updated,
+        lifecycleIntent,
+      };
+    }
+
+    if (paymentIssue && (
+      item.status === OUTBOX_STATUS.UNKNOWN_OUTCOME
+      || item.status === OUTBOX_STATUS.PROCESSING
+    )) {
+      const attentionReason = paymentIssue.terminal
+        ? 'wix-order-fully-refunded-with-ambiguous-submit-outcome'
+        : 'wix-order-refund-review-with-ambiguous-submit-outcome';
+      const updated = await markUnknownOutcome(
+        item,
+        attentionReason,
+        {
+          wixPaymentStatus: paymentIssue.paymentStatus,
+          message: 'Reconcile iSend before deciding whether cancellation is required',
+        },
+        now,
+        {
+          ...eventFields,
+          lifecycleRequiresAttention: true,
+          attentionReason,
+          wixPaymentStatus: paymentIssue.paymentStatus,
+          latestOrderSnapshotFingerprint: nextFingerprint,
+        },
+      );
+      return {
+        updated: true,
+        changed,
+        status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
+        requiresAttention: true,
+        item: updated,
+        lifecycleIntent,
+      };
+    }
+
+    if (paymentIssue) {
+      const paymentTransition = await transitionForLifecycleStateBeforeSideEffect(
+        item,
+        order,
+        event,
+        {
+          overflow: false,
+          recent: [],
+          cancellationIntent: null,
+          fullRefundIntent: null,
+          refundReviewIntent: null,
+        },
+        now,
+      );
+      return {
+        updated: true,
+        status: paymentTransition.status,
+        requiresAttention: Boolean(paymentTransition.retryExhausted),
+        item: paymentTransition.item,
+        lifecycleIntent,
+      };
+    }
+
+    if (item.status === OUTBOX_STATUS.SENT) {
+      if (!changed) {
+        return {
+          updated: false,
+          changed: false,
+          status: OUTBOX_STATUS.SENT,
+          item,
+          lifecycleIntent,
+        };
+      }
+      const updated = await updateOutbox(item, {
+        ...eventFields,
+        lifecycleRequiresAttention: true,
+        attentionReason: 'wix-order-changed-after-isend-submit',
+        latestOrderSnapshotFingerprint: nextFingerprint,
+      }, now);
+      return {
+        updated: true,
+        changed: true,
+        status: OUTBOX_STATUS.SENT,
+        requiresAttention: true,
+        item: updated,
+        lifecycleIntent,
+      };
+    }
+
+    if (item.status === OUTBOX_STATUS.UNKNOWN_OUTCOME
+      || item.status === OUTBOX_STATUS.PROCESSING) {
+      if (!changed && item.status === OUTBOX_STATUS.UNKNOWN_OUTCOME) {
+        return {
+          updated: false,
+          changed: false,
+          status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
+          requiresAttention: true,
+          item,
+          lifecycleIntent,
+        };
+      }
+      const updated = await markUnknownOutcome(
+        item,
+        'wix-order-changed-with-ambiguous-submit-outcome',
+        {
+          previousOrderSnapshotFingerprint: submittedFingerprint,
+          latestOrderSnapshotFingerprint: nextFingerprint,
+        },
+        now,
+        {
+          ...eventFields,
+          lifecycleRequiresAttention: true,
+          attentionReason: 'wix-order-changed-with-ambiguous-submit-outcome',
+          latestOrderSnapshotFingerprint: nextFingerprint,
+        },
+      );
+      return {
+        updated: true,
+        changed,
+        status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
+        requiresAttention: true,
+        item: updated,
+        lifecycleIntent,
+      };
+    }
+
+    const correctedPreSubmitPayload = changed
+      && item.status === OUTBOX_STATUS.RETRY
+      && item.retryExhausted
+      && item.lastError
+      && item.lastError.code === 'invalid-isend-order-payload';
+    const lifecycleNeedsAttention = Boolean(
+      changed && item.retryExhausted && !correctedPreSubmitPayload,
+    );
+    const updated = await updateOutbox(item, {
+      ...eventFields,
+      orderSnapshot: normalizeOrderSnapshot(order, wixOrderId),
+      orderSnapshotFingerprint: nextFingerprint,
+      ...(correctedPreSubmitPayload ? {
+        status: OUTBOX_STATUS.RETRY,
+        attemptCount: 0,
+        retryExhausted: false,
+        nextAttemptAt: moveIntoServiceWindow(now),
+        lastError: null,
+        remediatedAt: now,
+      } : {}),
+      ...(lifecycleNeedsAttention ? {
+        lifecycleRequiresAttention: true,
+        attentionReason: 'updated-order-requires-reviewed-requeue',
+      } : {}),
+    }, now);
+    return {
+      updated: true,
+      changed,
+      status: updated.status,
+      requiresAttention: lifecycleNeedsAttention,
+      item: updated,
+      lifecycleIntent,
+    };
+  } finally {
+    try {
+      await releaseClaim(orderKey, claim.leaseToken, claim.generation);
+    } catch (error) {
+      console.error('Failed to release iSend order-update claim', {
+        orderKey,
+        message: error.message,
+      });
+    }
+  }
+}
+
 function isDefinitelyBeforeSubmit(error) {
   const phase = String(error && error.isendPhase || '').toLowerCase();
-  if (phase) return ['configuration', 'payload', 'login'].includes(phase);
+  if (phase) {
+    return ['configuration', 'payload', 'login', 'authoritative-order'].includes(phase);
+  }
 
   const message = String(error && error.message || '').toLowerCase();
   const path = String(error && error.requestPath || '').toLowerCase();
@@ -586,7 +1589,12 @@ function isPermanentPayloadFailure(error) {
   return String(error && error.code || '').toLowerCase() === 'invalid-isend-order-payload';
 }
 
-async function finishFromExistingMapping(item, now, currentEnvironment) {
+async function finishFromExistingMapping(
+  item,
+  now,
+  currentEnvironment,
+  ownership = null,
+) {
   assertEnvironmentBinding(item, currentEnvironment, `iSend outbox item ${item.orderKey}`);
   const mapping = await getByWixOrderId(item.wixOrderId);
   if (!mapping || !mapping.iSendOrderNo) return null;
@@ -595,9 +1603,80 @@ async function finishFromExistingMapping(item, now, currentEnvironment) {
     currentEnvironment,
     `iSend mapping for Wix order ${item.wixOrderId}`,
   );
+  let lifecycleChanges = {};
+  let lifecycleBaselineIds = new Set();
+  try {
+    const lifecycleState = await readLifecycleIntentState(
+      item.orderKey,
+      currentEnvironment,
+    );
+    lifecycleBaselineIds = new Set(
+      lifecycleState.items.map((intent) => intent._id),
+    );
+    const authoritativeOrder = await readAuthoritativeWixOrder(item.wixOrderId);
+    const wixOrderStatus = normalizeWixOrderStatus(authoritativeOrder);
+    const paymentIssue = getWixPaymentLifecycleIssue(authoritativeOrder);
+    const latestFingerprint = orderSubmissionFingerprint(
+      authoritativeOrder,
+      item.wixOrderId,
+    );
+    const submittedFingerprint = item.orderSnapshotFingerprint
+      || orderSubmissionFingerprint(item.orderSnapshot, item.wixOrderId);
+    lifecycleChanges = {
+      authoritativeOrderReadAt: now,
+      wixLifecycleStatus: wixOrderStatus || null,
+      latestOrderSnapshotFingerprint: latestFingerprint,
+    };
+    if (isTerminalWixOrder(authoritativeOrder) || lifecycleState.cancellationIntent) {
+      lifecycleChanges.lifecycleRequiresAttention = true;
+      lifecycleChanges.attentionReason = 'wix-order-canceled-after-isend-submit';
+      lifecycleChanges.canceledAt = now;
+      lifecycleChanges.cancellationReason = wixOrderStatus
+        ? `wix-order-${wixOrderStatus.toLowerCase()}`
+        : 'wix-order-cancellation-intent';
+    } else if (paymentIssue || lifecycleState.fullRefundIntent
+      || lifecycleState.refundReviewIntent) {
+      const paymentStatus = paymentIssue?.paymentStatus
+        || lifecycleState.fullRefundIntent?.wixPaymentStatus
+        || lifecycleState.refundReviewIntent?.wixPaymentStatus
+        || null;
+      lifecycleChanges.lifecycleRequiresAttention = true;
+      lifecycleChanges.attentionReason = paymentStatus === 'FULLY_REFUNDED'
+        ? 'wix-order-fully-refunded-after-isend-submit'
+        : 'wix-order-refund-review-after-isend-submit';
+      lifecycleChanges.wixPaymentStatus = paymentStatus;
+    } else if (lifecycleState.overflow) {
+      lifecycleChanges.lifecycleRequiresAttention = true;
+      lifecycleChanges.attentionReason = 'wix-order-lifecycle-intent-overflow';
+    } else if (latestFingerprint !== submittedFingerprint) {
+      lifecycleChanges.lifecycleRequiresAttention = true;
+      lifecycleChanges.attentionReason = 'wix-order-changed-after-isend-submit';
+    }
+  } catch (error) {
+    lifecycleChanges = {
+      lifecycleRequiresAttention: true,
+      attentionReason: 'authoritative-order-read-failed-after-isend-submit',
+      authoritativeOrderReadError: summarizeError(error),
+    };
+  }
+  const finalLifecycleReadAt = new Date();
+  lifecycleChanges = await readFinalPostSubmitLifecycleChanges(
+    item,
+    lifecycleBaselineIds,
+    finalLifecycleReadAt,
+    lifecycleChanges,
+  );
+  if (ownership) {
+    await assertClaimOwnership(
+      item.orderKey,
+      ownership.leaseToken,
+      ownership.generation,
+      'before mapping recovery',
+    );
+  }
   const updated = await markSent(item, mapping.iSendOrderNo, now, {
     recoveredFromMapping: true,
-  });
+  }, lifecycleChanges);
   return {
     orderKey: item.orderKey,
     status: OUTBOX_STATUS.SENT,
@@ -620,6 +1699,173 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
 
   await assertClaimOwnership(item.orderKey, leaseToken, claimGeneration, 'before submit');
 
+  const lifecycleBaseline = await readLifecycleIntentState(
+    processingItem.orderKey,
+    processingItem.environment,
+  );
+  const lifecycleBaselineIds = new Set(
+    lifecycleBaseline.items.map((intent) => intent._id),
+  );
+  let authoritativeOrder;
+  try {
+    authoritativeOrder = await readAuthoritativeWixOrder(processingItem.wixOrderId);
+  } catch (error) {
+    await assertClaimOwnership(
+      item.orderKey,
+      leaseToken,
+      claimGeneration,
+      'after authoritative order read failure',
+    );
+    const failure = summarizeError(error);
+    processingItem = await markRetry(processingItem, failure, new Date());
+    return {
+      orderKey: item.orderKey,
+      status: OUTBOX_STATUS.RETRY,
+      retryExhausted: processingItem.retryExhausted,
+      error: failure,
+    };
+  }
+
+  await assertClaimOwnership(
+    item.orderKey,
+    leaseToken,
+    claimGeneration,
+    'after authoritative order read',
+  );
+  let preSubmitLifecycleState = await readLifecycleIntentState(
+    processingItem.orderKey,
+    processingItem.environment,
+    null,
+    lifecycleBaselineIds,
+  );
+  let lifecycleTransition = await transitionForLifecycleStateBeforeSideEffect(
+    processingItem,
+    authoritativeOrder,
+    null,
+    preSubmitLifecycleState,
+    new Date(),
+    { restoreAttempt: true },
+  );
+  if (lifecycleTransition.transitioned) {
+    return {
+      orderKey: item.orderKey,
+      status: lifecycleTransition.status,
+      retryExhausted: lifecycleTransition.retryExhausted,
+      skipped: lifecycleTransition.status === OUTBOX_STATUS.CANCELED,
+      deferred: lifecycleTransition.deferred,
+      reason: lifecycleTransition.reason,
+      error: lifecycleTransition.error,
+      item: lifecycleTransition.item,
+    };
+  }
+
+  const wixOrderStatus = normalizeWixOrderStatus(authoritativeOrder);
+  if (wixOrderStatus !== WIX_APPROVED_STATUS) {
+    const statusError = authoritativeOrderError(
+      `Wix order ${processingItem.wixOrderId} is ${wixOrderStatus || 'missing a status'}, not APPROVED`,
+      'wix-order-not-approved',
+    );
+    const failure = summarizeError(statusError);
+    processingItem = await markRetry(processingItem, failure, new Date());
+    return {
+      orderKey: item.orderKey,
+      status: OUTBOX_STATUS.RETRY,
+      retryExhausted: processingItem.retryExhausted,
+      error: failure,
+    };
+  }
+
+  const fulfillmentStatus = normalizeWixFulfillmentStatus(authoritativeOrder);
+  if (ALREADY_FULFILLED_WIX_STATUSES.has(fulfillmentStatus)) {
+    const fulfillmentError = authoritativeOrderError(
+      `Wix order ${processingItem.wixOrderId} is already ${fulfillmentStatus}`,
+      'unsupported-existing-wix-fulfillment',
+    );
+    const failure = summarizeError(fulfillmentError);
+    processingItem = await markRetryExhausted(
+      processingItem,
+      failure,
+      new Date(),
+      {
+        lifecycleRequiresAttention: true,
+        attentionReason: 'wix-order-already-fulfilled-before-isend-submit',
+        wixFulfillmentStatus: fulfillmentStatus,
+      },
+    );
+    return {
+      orderKey: item.orderKey,
+      status: OUTBOX_STATUS.RETRY,
+      retryExhausted: true,
+      error: failure,
+    };
+  }
+
+  await assertClaimOwnership(
+    item.orderKey,
+    leaseToken,
+    claimGeneration,
+    'before authoritative snapshot transition',
+  );
+  const authoritativeReadAt = new Date();
+  processingItem = await updateOutbox(processingItem, {
+    orderSnapshot: normalizeOrderSnapshot(
+      authoritativeOrder,
+      processingItem.wixOrderId,
+    ),
+    orderSnapshotFingerprint: orderSubmissionFingerprint(
+      authoritativeOrder,
+      processingItem.wixOrderId,
+    ),
+    authoritativeOrderReadAt: authoritativeReadAt,
+    wixLifecycleStatus: wixOrderStatus,
+    wixFulfillmentStatus: fulfillmentStatus || null,
+    wixPaymentStatus: normalizeWixPaymentStatus(authoritativeOrder) || null,
+  }, authoritativeReadAt);
+
+  await assertClaimOwnership(
+    item.orderKey,
+    leaseToken,
+    claimGeneration,
+    'after authoritative snapshot transition',
+  );
+  // Close the event/read gap as tightly as possible. A newly persisted update
+  // defers this attempt; cancellation/refund intents transition terminally.
+  preSubmitLifecycleState = await readLifecycleIntentState(
+    processingItem.orderKey,
+    processingItem.environment,
+    null,
+    lifecycleBaselineIds,
+  );
+  lifecycleTransition = await transitionForLifecycleStateBeforeSideEffect(
+    processingItem,
+    authoritativeOrder,
+    null,
+    preSubmitLifecycleState,
+    new Date(),
+    { restoreAttempt: true },
+  );
+  if (lifecycleTransition.transitioned) {
+    return {
+      orderKey: item.orderKey,
+      status: lifecycleTransition.status,
+      retryExhausted: lifecycleTransition.retryExhausted,
+      skipped: lifecycleTransition.status === OUTBOX_STATUS.CANCELED,
+      deferred: lifecycleTransition.deferred,
+      reason: lifecycleTransition.reason,
+      error: lifecycleTransition.error,
+      item: lifecycleTransition.item,
+    };
+  }
+  await assertClaimOwnership(
+    item.orderKey,
+    leaseToken,
+    claimGeneration,
+    'immediately before submit',
+  );
+  const preSubmitIntentIds = new Set(
+    preSubmitLifecycleState.items.map((intent) => intent._id),
+  );
+
   let result;
   try {
     result = await sendOrderToISend(processingItem.orderSnapshot, {
@@ -632,9 +1878,40 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       claimGeneration,
       'after submit error',
     );
+    const failedAt = new Date();
+    const postAttemptLifecycleState = await readLifecycleIntentState(
+      processingItem.orderKey,
+      processingItem.environment,
+      null,
+      preSubmitIntentIds,
+    );
+    const lifecycleChanges = postSubmitLifecycleChanges(
+      postAttemptLifecycleState,
+      failedAt,
+    );
     const failure = summarizeError(error);
     if (isPermanentPayloadFailure(error)) {
-      processingItem = await markRetryExhausted(processingItem, failure, new Date());
+      const transition = await transitionForLifecycleStateBeforeSideEffect(
+        processingItem,
+        authoritativeOrder,
+        null,
+        postAttemptLifecycleState,
+        failedAt,
+        { restoreAttempt: true },
+      );
+      if (transition.transitioned) {
+        return {
+          orderKey: item.orderKey,
+          status: transition.status,
+          retryExhausted: transition.retryExhausted,
+          skipped: transition.status === OUTBOX_STATUS.CANCELED,
+          deferred: transition.deferred,
+          reason: transition.reason,
+          error: transition.error,
+          item: transition.item,
+        };
+      }
+      processingItem = await markRetryExhausted(processingItem, failure, failedAt);
       return {
         orderKey: item.orderKey,
         status: OUTBOX_STATUS.RETRY,
@@ -643,7 +1920,27 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       };
     }
     if (isDefinitelyBeforeSubmit(error)) {
-      processingItem = await markRetry(processingItem, failure, new Date());
+      const transition = await transitionForLifecycleStateBeforeSideEffect(
+        processingItem,
+        authoritativeOrder,
+        null,
+        postAttemptLifecycleState,
+        failedAt,
+        { restoreAttempt: true },
+      );
+      if (transition.transitioned) {
+        return {
+          orderKey: item.orderKey,
+          status: transition.status,
+          retryExhausted: transition.retryExhausted,
+          skipped: transition.status === OUTBOX_STATUS.CANCELED,
+          deferred: transition.deferred,
+          reason: transition.reason,
+          error: transition.error,
+          item: transition.item,
+        };
+      }
+      processingItem = await markRetry(processingItem, failure, failedAt);
       return {
         orderKey: item.orderKey,
         status: OUTBOX_STATUS.RETRY,
@@ -652,7 +1949,13 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       };
     }
 
-    await markUnknownOutcome(processingItem, 'submit-result-ambiguous', failure, new Date());
+    await markUnknownOutcome(
+      processingItem,
+      'submit-result-ambiguous',
+      failure,
+      failedAt,
+      lifecycleChanges,
+    );
     return {
       orderKey: item.orderKey,
       status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
@@ -666,8 +1969,39 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
     claimGeneration,
     'after submit response',
   );
+  const submitFinishedAt = new Date();
+  const postResponseLifecycleState = await readLifecycleIntentState(
+    processingItem.orderKey,
+    processingItem.environment,
+    null,
+    preSubmitIntentIds,
+  );
+  const postResponseLifecycleChanges = postSubmitLifecycleChanges(
+    postResponseLifecycleState,
+    submitFinishedAt,
+  );
 
   if (result && result.skipped) {
+    const transition = await transitionForLifecycleStateBeforeSideEffect(
+      processingItem,
+      authoritativeOrder,
+      null,
+      postResponseLifecycleState,
+      submitFinishedAt,
+      { restoreAttempt: true },
+    );
+    if (transition.transitioned) {
+      return {
+        orderKey: item.orderKey,
+        status: transition.status,
+        retryExhausted: transition.retryExhausted,
+        skipped: transition.status === OUTBOX_STATUS.CANCELED,
+        deferred: transition.deferred,
+        reason: transition.reason,
+        error: transition.error,
+        item: transition.item,
+      };
+    }
     const skippedAt = new Date();
     processingItem.attemptCount = Math.max(0, processingItem.attemptCount - 1);
     await updateOutbox(processingItem, {
@@ -691,6 +2025,26 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
 
   const submitResponse = classifySubmitResponse(result);
   if (submitResponse.outcome === 'rejected') {
+    const transition = await transitionForLifecycleStateBeforeSideEffect(
+      processingItem,
+      authoritativeOrder,
+      null,
+      postResponseLifecycleState,
+      submitFinishedAt,
+      { restoreAttempt: true },
+    );
+    if (transition.transitioned) {
+      return {
+        orderKey: item.orderKey,
+        status: transition.status,
+        retryExhausted: transition.retryExhausted,
+        skipped: transition.status === OUTBOX_STATUS.CANCELED,
+        deferred: transition.deferred,
+        reason: transition.reason,
+        error: transition.error,
+        item: transition.item,
+      };
+    }
     const failure = summarizeResponse(result, submitResponse.iSendOrderNo);
     processingItem = await markRetry(processingItem, failure, new Date());
     return {
@@ -714,6 +2068,7 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       reason,
       details,
       new Date(),
+      postResponseLifecycleChanges,
     );
     return {
       orderKey: item.orderKey,
@@ -738,8 +2093,27 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       claimGeneration,
       'after mapping failure',
     );
+    const mappingFailureAt = new Date();
+    const finalLifecycleChanges = await readFinalPostSubmitLifecycleChanges(
+      processingItem,
+      preSubmitIntentIds,
+      mappingFailureAt,
+      postResponseLifecycleChanges,
+    );
+    await assertClaimOwnership(
+      item.orderKey,
+      leaseToken,
+      claimGeneration,
+      'before mapping-failure transition',
+    );
     const details = Object.assign({ iSendOrderNo }, summarizeError(error));
-    await markUnknownOutcome(processingItem, 'mapping-save-failed-after-submit', details, new Date());
+    await markUnknownOutcome(
+      processingItem,
+      'mapping-save-failed-after-submit',
+      details,
+      mappingFailureAt,
+      finalLifecycleChanges,
+    );
     return {
       orderKey: item.orderKey,
       status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
@@ -747,6 +2121,14 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       error: details,
     };
   }
+
+  const mappingFinishedAt = new Date();
+  const finalPostSubmitLifecycleChanges = await readFinalPostSubmitLifecycleChanges(
+    processingItem,
+    preSubmitIntentIds,
+    mappingFinishedAt,
+    postResponseLifecycleChanges,
+  );
 
   if (!mapping
     || String(mapping.wixOrderId) !== String(processingItem.wixOrderId)
@@ -762,7 +2144,13 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       claimGeneration,
       'before mapping-conflict transition',
     );
-    await markUnknownOutcome(processingItem, 'mapping-conflict-after-submit', details, new Date());
+    await markUnknownOutcome(
+      processingItem,
+      'mapping-conflict-after-submit',
+      details,
+      mappingFinishedAt,
+      finalPostSubmitLifecycleChanges,
+    );
     return {
       orderKey: item.orderKey,
       status: OUTBOX_STATUS.UNKNOWN_OUTCOME,
@@ -780,7 +2168,13 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
     claimGeneration,
     'before sent transition',
   );
-  await markSent(processingItem, iSendOrderNo, new Date(), summarizeResponse(result, iSendOrderNo));
+  await markSent(
+    processingItem,
+    iSendOrderNo,
+    mappingFinishedAt,
+    summarizeResponse(result, iSendOrderNo),
+    finalPostSubmitLifecycleChanges,
+  );
   return {
     orderKey: item.orderKey,
     status: OUTBOX_STATUS.SENT,
@@ -872,9 +2266,6 @@ export async function requeueISendOrder(orderKey, options = {}) {
 
 async function processItem(item, options, now) {
   assertEnvironmentBinding(item, options.environment, `iSend outbox item ${item.orderKey}`);
-  const mapped = await finishFromExistingMapping(item, now, options.environment);
-  if (mapped) return mapped;
-
   const claim = await acquireClaim(item, now);
   if (!claim.claimed) {
     return {
@@ -913,7 +2304,15 @@ async function processItem(item, options, now) {
       options.environment,
       `iSend outbox item ${item.orderKey}`,
     );
-    const recovered = await finishFromExistingMapping(freshItem, now, options.environment);
+    const recovered = await finishFromExistingMapping(
+      freshItem,
+      now,
+      options.environment,
+      {
+        leaseToken: claim.leaseToken,
+        generation: claim.generation,
+      },
+    );
     if (recovered) return recovered;
     return await processClaimedItem(
       freshItem,
@@ -934,9 +2333,10 @@ async function processItem(item, options, now) {
   }
 }
 
-async function findReadyItems(status, now, limit) {
+async function findReadyItems(status, now, limit, environment) {
   const result = await wixData.query(OUTBOX_COLLECTION)
     .eq('status', status)
+    .eq('environment', environment)
     .le('nextAttemptAt', now)
     .ascending('nextAttemptAt')
     .limit(limit)
@@ -947,6 +2347,7 @@ async function findReadyItems(status, now, limit) {
 async function recoverStaleProcessing(now, limit, environment) {
   const result = await wixData.query(OUTBOX_COLLECTION)
     .eq('status', OUTBOX_STATUS.PROCESSING)
+    .eq('environment', environment)
     .le('leaseExpiresAt', now)
     .ascending('leaseExpiresAt')
     .limit(limit)
@@ -995,7 +2396,7 @@ async function recoverStaleProcessing(now, limit, environment) {
 }
 
 function persistentAttentionDetail(item) {
-  let attentionReason = 'terminal-unknown-outcome';
+  let attentionReason = item.attentionReason || 'terminal-unknown-outcome';
   if (item.status === OUTBOX_STATUS.RETRY) attentionReason = 'retry-exhausted';
   if (item.status === OUTBOX_STATUS.PROCESSING) attentionReason = 'worker-lease-expired';
 
@@ -1005,6 +2406,7 @@ function persistentAttentionDetail(item) {
     status: item.status,
     retryExhausted: Boolean(item.retryExhausted),
     unknownOutcomeReason: item.unknownOutcomeReason || null,
+    lifecycleRequiresAttention: Boolean(item.lifecycleRequiresAttention),
     attentionReason,
     persistent: true,
   };
@@ -1042,6 +2444,7 @@ async function findPersistentAttention(now, currentEnvironment) {
     pendingUnassignedResult,
     retryUnassignedResult,
     processingUnassignedResult,
+    lifecycleAttentionResult,
   ] = await Promise.all([
     wixData.query(OUTBOX_COLLECTION)
       .eq('status', OUTBOX_STATUS.UNKNOWN_OUTCOME)
@@ -1087,10 +2490,18 @@ async function findPersistentAttention(now, currentEnvironment) {
       .isEmpty('environment')
       .limit(ATTENTION_SCAN_LIMIT)
       .find(TRUSTED_READ_OPTIONS),
+    wixData.query(OUTBOX_COLLECTION)
+      .eq('lifecycleRequiresAttention', true)
+      .limit(ATTENTION_SCAN_LIMIT)
+      .find(TRUSTED_READ_OPTIONS),
   ]);
 
   const durableAttention = (unknownResult.items || [])
-    .concat(exhaustedRetryResult.items || [], staleProcessingResult.items || [])
+    .concat(
+      exhaustedRetryResult.items || [],
+      staleProcessingResult.items || [],
+      lifecycleAttentionResult.items || [],
+    )
     .map(persistentAttentionDetail);
   const environmentAttention = (pendingMismatchResult.items || [])
     .concat(
@@ -1111,6 +2522,7 @@ function isAttentionDetail(detail) {
       || detail.environmentFailure
       || detail.status === OUTBOX_STATUS.UNKNOWN_OUTCOME
       || detail.retryExhausted
+      || detail.lifecycleRequiresAttention
   ));
 }
 
@@ -1156,8 +2568,18 @@ export async function runISendOrderOutbox(options = {}) {
   }
 
   const recovered = await recoverStaleProcessing(now, limit, environment);
-  const pending = await findReadyItems(OUTBOX_STATUS.PENDING, now, limit);
-  const retry = await findReadyItems(OUTBOX_STATUS.RETRY, now, limit);
+  const pending = await findReadyItems(
+    OUTBOX_STATUS.PENDING,
+    now,
+    limit,
+    environment,
+  );
+  const retry = await findReadyItems(
+    OUTBOX_STATUS.RETRY,
+    now,
+    limit,
+    environment,
+  );
   const byOrderKey = new Map();
 
   pending.concat(retry).forEach((item) => {
@@ -1215,8 +2637,10 @@ export async function runISendOrderOutboxJob(options = {}) {
 }
 
 export default {
+  cancelISendOrderEvent,
   enqueueISendOrderEvent,
   getWixOrderKey,
+  refreshISendOrderEvent,
   requeueISendOrder,
   runISendOrderOutbox,
   runISendOrderOutboxJob,

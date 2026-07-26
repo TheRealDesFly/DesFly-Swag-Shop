@@ -2,9 +2,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   createFulfillment: vi.fn(),
+  extractParcelContract: vi.fn((source) => ({
+    trackingNumbers: source?.trackingNumbers,
+    parcels: source?.parcels,
+    parcelCount: source?.parcelCount,
+    totalParcels: source?.totalParcels,
+    lineItemAllocations: source?.lineItemAllocations,
+  })),
   getConfiguredISendEnvironment: vi.fn(),
-  getSingleParcelFulfillmentKey: vi.fn((iSendOrderNo) => (
-    `isend:${String(iSendOrderNo).trim()}:single-parcel-fulfillment`
+  getSingleParcelFulfillmentKey: vi.fn((iSendOrderNo, environment) => (
+    `isend:${environment}:${String(iSendOrderNo).trim()}:single-parcel-fulfillment`
   )),
   getSecret: vi.fn(),
   handleWebhook: vi.fn(),
@@ -17,6 +24,7 @@ vi.mock('wix-secrets-backend', () => ({ getSecret: mocks.getSecret }));
 vi.mock('backend/isendService', () => ({ testISendLogin: mocks.testISendLogin }));
 vi.mock('backend/orderFulfillment', () => ({
   createISendSingleParcelFulfillment: mocks.createFulfillment,
+  extractISendParcelContractMetadata: mocks.extractParcelContract,
   getSingleParcelFulfillmentKey: mocks.getSingleParcelFulfillmentKey,
 }));
 vi.mock('backend/isendConfig', () => ({
@@ -109,8 +117,14 @@ describe('Wix HTTP functions', () => {
     });
   });
 
-  it('consumes the poller body once and ignores a caller-supplied environment', async () => {
-    const text = vi.fn().mockResolvedValue('{"types":["tracking"],"environment":"production"}');
+  it('consumes the poller body once and clamps all caller options to the scheduled safety net', async () => {
+    const text = vi.fn().mockResolvedValue(JSON.stringify({
+      types: ['inventory'],
+      environment: 'production',
+      limit: 10000,
+      maxPages: 10000,
+      reconciliationOnly: false,
+    }));
 
     const response = await post_runISendPoller({
       headers: { 'x-isend-poller-secret': 'trigger-secret' },
@@ -119,7 +133,12 @@ describe('Wix HTTP functions', () => {
 
     expect(response.status).toBe(200);
     expect(text).toHaveBeenCalledTimes(1);
-    expect(mocks.runPoller).toHaveBeenCalledWith({ types: ['tracking'] });
+    expect(mocks.runPoller).toHaveBeenCalledWith({
+      types: ['tracking', 'status'],
+      limit: 5,
+      maxPages: 1,
+      reconciliationOnly: true,
+    });
   });
 
   it('returns a failing HTTP status when the poller reports partial failures', async () => {
@@ -265,7 +284,7 @@ describe('Wix HTTP functions', () => {
           iSendOrderNo: ' ISEND-1 ',
           lineItems: [{ _id: 'line-item-1', quantity: 1 }],
           trackingNumber: 'TRACK123',
-          idempotencyKey: 'isend:ISEND-1:single-parcel-fulfillment',
+          idempotencyKey: 'isend:staging:ISEND-1:single-parcel-fulfillment',
         })),
       },
     });
@@ -348,7 +367,7 @@ describe('Wix HTTP functions', () => {
           iSendOrderNo: 'ISEND-1',
           lineItems: [{ _id: 'line-item-1', quantity: 1 }],
           trackingNumber: 'TRACK123',
-          idempotencyKey: 'isend:ISEND-1:single-parcel-fulfillment',
+          idempotencyKey: 'isend:staging:ISEND-1:single-parcel-fulfillment',
         })),
       },
     });

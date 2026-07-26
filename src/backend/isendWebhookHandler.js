@@ -11,7 +11,11 @@ import wixData from 'wix-data';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { hasProcessed, markProcessed } from 'backend/isendIdempotency';
 import { getByISendOrderNo } from 'backend/isendMappings';
-import { createISendSingleParcelFulfillment } from 'backend/orderFulfillment';
+import {
+  createISendSingleParcelFulfillment,
+  extractISendParcelContractMetadata,
+  validateISendSingleParcelEvidence,
+} from 'backend/orderFulfillment';
 import { mapISendStatus, updateMappingStatus } from 'backend/isendStatusMapping';
 import { handleDelivered } from 'backend/orderStateTransitions';
 import { consumeRequestBody, parseJsonBody, RequestBodyError } from 'backend/requestBody';
@@ -32,11 +36,34 @@ function getHeader(request, name) {
   return undefined;
 }
 
-function reportSignatureRejection(request, reason) {
+function reportSignatureRejection(reason) {
   console.warn('iSend webhook signature rejected', {
     reason,
-    deliveryId: getHeader(request, 'X-ISEND-Delivery-Id') || null,
   });
+}
+
+function getSignedDeliveryId(payload) {
+  for (const value of [payload?.deliveryId, payload?.eventId]) {
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    const normalized = String(value).trim();
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function permanentWebhookErrorResponse(error) {
+  if (!error || error.retryable !== false) return null;
+  const conflictCodes = new Set([
+    'isend-fulfillment-line-items-mismatch',
+    'unsupported-isend-split-shipment',
+  ]);
+  return {
+    success: false,
+    status: conflictCodes.has(error.code) ? 409 : 422,
+    retryable: false,
+    code: error.code || 'invalid-webhook-contract',
+    message: error.message || 'Webhook payload violates the fulfillment contract',
+  };
 }
 
 /**
@@ -219,7 +246,6 @@ export async function handleWebhook(request) {
   try {
     const signatureHeader = getHeader(request, 'X-ISEND-Signature');
     const providedSig = String(signatureHeader || '').replace(/^sha256=/i, '').trim();
-    const eventHeader = getHeader(request, 'X-ISEND-Event');
     let secret;
     try {
       secret = await getSecret('ISTORE_ISEND_WEBHOOK_SECRET');
@@ -244,21 +270,21 @@ export async function handleWebhook(request) {
     }
 
     if (!providedSig) {
-      reportSignatureRejection(request, 'missing-signature');
+      reportSignatureRejection('missing-signature');
       return { success: false, status: 401, code: 'invalid-signature', message: 'Invalid signature' };
     }
 
     const { rawBody, rawBytes } = await consumeRequestBody(request);
     const computed = crypto.createHmac('sha256', secret).update(rawBytes).digest('hex');
     if (!safeTimingEqual(computed, providedSig)) {
-      reportSignatureRejection(request, 'signature-mismatch');
+      reportSignatureRejection('signature-mismatch');
       return { success: false, status: 401, code: 'invalid-signature', message: 'Invalid signature' };
     }
 
     // Parse only after authenticating the exact bytes received from iSend.
     const payload = parseJsonBody(rawBody, { allowEmpty: false });
     const trackingCandidates = extractTrackingNumbers(payload);
-    const eventType = String(eventHeader || payload.eventType || payload.type || '').toLowerCase();
+    const eventType = String(payload.eventType || payload.type || '').toLowerCase();
     const possibleStatus = payload.orderStatus
       || payload.order && (payload.order.orderStatus || payload.order.status)
       || payload.tracking && payload.tracking.status
@@ -275,20 +301,34 @@ export async function handleWebhook(request) {
       && (isTrackingEvent || !hasRecognizedEventType))
       || (isTrackingEvent && !possibleStatus);
     const isOrderEvent = isTrackingEvent || isStatusEvent || !hasRecognizedEventType;
+    const parcelContract = extractISendParcelContractMetadata(payload, trackingCandidates);
     if (isOrderEvent && trackingCandidates.length > 1) {
       return {
         success: false,
         status: 409,
+        retryable: false,
         code: 'unsupported-multi-tracking',
         message: 'Multiple tracking numbers require a line-item allocation contract',
         trackingCount: trackingCandidates.length,
       };
     }
+    const hasDeclaredParcelEvidence = [
+      parcelContract.parcels,
+      parcelContract.parcelCount,
+      parcelContract.totalParcels,
+      parcelContract.lineItemAllocations,
+    ].some((value) => value !== undefined);
+    if (isOrderEvent && (trackingCandidates.length > 0 || hasDeclaredParcelEvidence)) {
+      validateISendSingleParcelEvidence({
+        ...parcelContract,
+        trackingNumber: trackingCandidates[0],
+      });
+    }
 
-    const deliveryId = getHeader(request, 'X-ISEND-Delivery-Id') || payload.deliveryId || payload.eventId;
+    const deliveryId = getSignedDeliveryId(payload);
     const payloadHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
     const environment = await getConfiguredISendEnvironment();
-    const deliveryKey = deliveryId || `${payload.eventType || eventHeader || 'isend'}:${payloadHash}`;
+    const deliveryKey = deliveryId || `${eventType || 'isend'}:${payloadHash}`;
     // Delivery IDs are partner-controlled and may be reused by separate iSend
     // environments. Scope the event claim before any side effect runs.
     const idKey = `${environment}:${deliveryKey}`;
@@ -380,6 +420,7 @@ export async function handleWebhook(request) {
           trackingNumber: trackingNo,
           shippingProvider,
           trackingLink,
+          ...parcelContract,
         },
       );
       if (fulfillmentResult?.reason === 'final-status-preserved') {
@@ -475,6 +516,8 @@ export async function handleWebhook(request) {
     if (err instanceof RequestBodyError) {
       return { success: false, status: 400, code: err.code, message: err.message };
     }
+    const permanentResponse = permanentWebhookErrorResponse(err);
+    if (permanentResponse) return permanentResponse;
     console.error('isendWebhookHandler error', err.message);
     return {
       success: false,

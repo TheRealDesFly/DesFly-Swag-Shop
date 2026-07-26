@@ -14,7 +14,11 @@ import {
 } from 'backend/isendMappings';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { getTrackingInfo } from 'backend/isendService';
-import { createISendSingleParcelFulfillment } from 'backend/orderFulfillment';
+import {
+  createISendSingleParcelFulfillment,
+  extractISendParcelContractMetadata,
+  validateISendSingleParcelEvidence,
+} from 'backend/orderFulfillment';
 import { updateMappingStatus, mapISendStatus } from 'backend/isendStatusMapping';
 import { handleDelivered } from 'backend/orderStateTransitions';
 
@@ -336,6 +340,10 @@ export async function runPoller(options = {}) {
           const trackingNumbers = types.includes('tracking')
             ? (extractTrackingNumbers(selectedOrder.row) || [])
             : [];
+          const parcelContract = extractISendParcelContractMetadata(
+            selectedOrder.row,
+            trackingNumbers,
+          );
           if (trackingNumbers.length > 1) {
             failMapping(
               'tracking-allocation',
@@ -346,6 +354,24 @@ export async function runPoller(options = {}) {
               },
             );
             continue;
+          }
+          if (types.includes('tracking')) {
+            try {
+              validateISendSingleParcelEvidence({
+                ...parcelContract,
+                trackingNumber: trackingNumbers[0],
+              });
+            } catch (error) {
+              // A status-only row may legitimately have no tracking yet. Every
+              // explicit split/count/allocation violation still fails before
+              // the mapping status or Wix fulfillment is mutated.
+              if (error.code !== 'missing-isend-tracking-number') {
+                failMapping('tracking-allocation', error, {
+                  code: error.code,
+                });
+                continue;
+              }
+            }
           }
 
           let statusTransition = null;
@@ -401,6 +427,7 @@ export async function runPoller(options = {}) {
                     environment,
                     lineItems,
                     trackingNumber,
+                    ...parcelContract,
                   },
                 );
                 if (fulfillmentResult?.reason === 'final-status-preserved') {

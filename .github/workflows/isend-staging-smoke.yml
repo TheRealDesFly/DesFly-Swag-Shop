@@ -12,8 +12,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: isend-staging-smoke-${{ github.ref }}
-  cancel-in-progress: true
+  # Scheduled and manual probes share a serialized live group. Offline push/PR
+  # validation uses event-specific groups and cannot cancel an active live probe.
+  group: isend-staging-smoke-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'live' || github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   offline_checks:
@@ -22,12 +24,12 @@ jobs:
     timeout-minutes: 8
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6.0.2
         with:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # actions/setup-node v6.4.0
         with:
           node-version: "22"
           cache: npm
@@ -49,7 +51,7 @@ jobs:
         env:
           ISTORE_ISEND_API_USER_ID: offline-check-user
           ISTORE_ISEND_API_PASSWORD: offline-check-password
-          ISTORE_ISEND_SANDBOX_URL: https://example.invalid/IsisWMS-War
+          ISTORE_ISEND_SANDBOX_URL: https://staging.istoreisend-wms.com:5191/IsisWMS-War
 
       - name: Reject a Wix function URL as the iSend root
         shell: bash
@@ -109,12 +111,12 @@ jobs:
     timeout-minutes: 8
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6.0.2
         with:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # actions/setup-node v6.4.0
         with:
           node-version: "22"
           cache: npm

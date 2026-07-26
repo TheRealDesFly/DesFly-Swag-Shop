@@ -13,9 +13,10 @@ Environment variables supported (used as defaults):
   ISTORE_ISEND_PRODUCTION_URL
 */
 
-const http = require('http');
 const https = require('https');
+const { validateDirectISendRoot } = require('./check-staging-connection');
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 function parseArgs() {
   const argv = process.argv.slice(2);
@@ -52,7 +53,13 @@ function postJson(urlString, body, timeout) {
     } catch (err) {
       return reject(new Error('Invalid URL: ' + urlString));
     }
-    const lib = parsed.protocol === 'https:' ? https : http;
+    if (parsed.protocol !== 'https:') {
+      return reject(new Error('iSend login requests must use HTTPS'));
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      return reject(new Error('iSend login URL must not contain credentials, a query, or a fragment'));
+    }
+
     const data = JSON.stringify(body);
     const options = {
       method: 'POST',
@@ -65,11 +72,47 @@ function postJson(urlString, body, timeout) {
       },
       timeout: timeout || 10000,
     };
+    const requestTimeout = timeout || 10000;
+    let req;
+    let response;
+    let settled = false;
+    let deadlineId;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineId);
+      callback(value);
+    };
+    const abortRequest = (error) => {
+      settle(reject, error);
+      if (response && !response.destroyed) response.destroy(error);
+      if (req && !req.destroyed) req.destroy(error);
+    };
 
-    const req = lib.request(options, (res) => {
+    deadlineId = setTimeout(
+      () => abortRequest(new Error(`Request timed out after ${requestTimeout}ms`)),
+      requestTimeout,
+    );
+    req = https.request(options, (res) => {
+      response = res;
+      if (res.statusCode >= 300 && res.statusCode < 400) {
+        abortRequest(new Error(`Redirect response rejected with status ${res.statusCode}`));
+        return;
+      }
+
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let receivedBytes = 0;
+      res.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_RESPONSE_BYTES) {
+          abortRequest(new Error(`Response exceeded ${MAX_RESPONSE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('error', (error) => settle(reject, error));
       res.on('end', () => {
+        if (settled) return;
         const text = Buffer.concat(chunks).toString();
         let json;
         try {
@@ -77,7 +120,7 @@ function postJson(urlString, body, timeout) {
         } catch (e) {
           json = text;
         }
-        resolve({
+        settle(resolve, {
           statusCode: res.statusCode,
           headers: res.headers || {},
           body: json,
@@ -86,10 +129,9 @@ function postJson(urlString, body, timeout) {
       });
     });
 
-    req.on('error', (err) => reject(err));
+    req.on('error', (err) => settle(reject, err));
     req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timed out'));
+      abortRequest(new Error(`Request timed out after ${requestTimeout}ms`));
     });
 
     req.write(data);
@@ -105,7 +147,6 @@ function normalizeISendBaseUrl(value) {
   let baseUrl = trimTrailingSlash(value);
   const endpointSuffixes = [
     '/Json/Public/login',
-    '/api/login',
   ];
 
   let changed = true;
@@ -138,13 +179,12 @@ function buildISendUrlFromRoot(rootUrl, path) {
 
 function getLoginUrls(baseUrl) {
   const normalizedBaseUrl = normalizeISendBaseUrl(baseUrl);
+  if (normalizedBaseUrl.toLowerCase().endsWith('/api/login')) {
+    return [normalizedBaseUrl];
+  }
   const urls = [buildISendUrlFromRoot(normalizedBaseUrl, '/Json/Public/login/')];
   if (!hasISendContextRoot(normalizedBaseUrl)) {
     urls.push(buildISendUrlFromRoot(`${normalizedBaseUrl}${ISEND_CONTEXT_ROOT}`, '/Json/Public/login/'));
-  }
-  const configuredUrl = trimTrailingSlash(baseUrl);
-  if (configuredUrl.toLowerCase().endsWith('/api/login')) {
-    urls.push(configuredUrl);
   }
   return urls.filter((url, index, list) => list.indexOf(url) === index);
 }
@@ -187,9 +227,17 @@ function isAuthenticatedLoginResponse(response) {
   return evidence.hasSessionFields || evidence.hasSessionCookie;
 }
 
-async function checkLogin(baseUrl, user, pass, timeout) {
+async function checkLogin(baseUrl, user, pass, timeout, environment = 'staging') {
+  const validation = validateDirectISendRoot(baseUrl, environment);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      attempts: [{ err: new Error(validation.reason) }],
+    };
+  }
+
   const attempts = [];
-  for (const url of getLoginUrls(baseUrl)) {
+  for (const url of getLoginUrls(validation.baseUrl)) {
     try {
       const res = await postJson(url, { userNo: user, userPassword: pass }, timeout);
       if (isAuthenticatedLoginResponse(res)) {
@@ -243,7 +291,7 @@ async function main() {
 
   for (const c of checks) {
     console.log(`Checking ${c.name} iSend login...`);
-    const result = await checkLogin(c.url, user, pass, timeout);
+    const result = await checkLogin(c.url, user, pass, timeout, c.name);
     if (result.ok) {
       console.log(`  ${c.name} OK (session returned).`);
     } else {

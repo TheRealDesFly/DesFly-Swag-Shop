@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 const require = createRequire(import.meta.url);
 const {
+  checkLogin,
   getAuthenticatedSessionEvidence,
   isAuthenticatedLoginResponse,
 } = require('../scripts/check-isend.js');
@@ -48,6 +49,23 @@ describe('legacy iSend CLI authenticated-session evidence', () => {
     }, { 'set-cookie': 'JSESSIONID=secret-cookie; Path=/' })).toEqual({
       hasSessionFields: true,
       hasSessionCookie: true,
+    });
+  });
+
+  it('rejects an unsafe endpoint before attempting login', async () => {
+    await expect(checkLogin(
+      'http://staging.istoreisend-wms.com:5191/IsisWMS-War',
+      'user',
+      'password',
+      1000,
+      'staging',
+    )).resolves.toMatchObject({
+      ok: false,
+      attempts: [{
+        err: expect.objectContaining({
+          message: expect.stringContaining('must use HTTPS'),
+        }),
+      }],
     });
   });
 });

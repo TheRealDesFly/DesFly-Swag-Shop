@@ -1,8 +1,8 @@
 # Production Readiness Audit
 
-Date: 2026-07-17
+Date: 2026-07-26
 
-Verdict: The previously merged hardening is on `main`, while the additional outbound-validation and scheduled-reconciliation safeguards described below are pending review on the current pull-request branch. Direct plus published-Wix staging authentication is proven only for the previously published site. Do not enable production order submission until this pull request is merged, the Wix collections/secrets are created, the merged code is published, one end-to-end staging order is reconciled, and the iSend multi-parcel line-item allocation contract is confirmed.
+Verdict: The backend remediation is ready for pull-request review, not deployment. Lifecycle/refund/cancellation races, single-parcel fulfillment safety, endpoint pinning, mapping ambiguity, claim retention, operational health, capacity evidence, and CI isolation are implemented locally with fail-closed controls. The Wix site still lacks required secrets, collections, fields, indexes, permissions, and the audited deployment. Direct staging connectivity currently times out from this runner, no current-SHA staging order-to-delivery evidence exists, alert delivery and capacity have not been measured, and partner cancellation/single-parcel contracts remain unresolved. Do not deploy to Wix, enable production submission, or run a canary until every gate in `WIX_OWNER_HANDOFF.md` passes.
 
 ## Stabilized Source Baseline And Current Pull Request
 
@@ -38,38 +38,38 @@ Verdict: The previously merged hardening is on `main`, while the additional outb
 
 ## Current Validation Evidence
 
-- `npm run check`: the unit test suite and ESLint pass on Node 22.22.3.
-- `npm ci`, script syntax, workflow YAML parsing, `jobs.config` parsing, and `git diff --check` pass locally.
-- `npm audit --omit=dev`: zero production dependency vulnerabilities.
-- GitHub repository iSend URL/user/password secrets were reconciled with the locally verified staging configuration without printing their values.
-- GitHub Actions run [29557031940](https://github.com/TheRealDesFly/DesFly-Swag-Shop/actions/runs/29557031940) returned authenticated-session evidence from both direct iSend (HTTP 200) and the published Wix staging endpoint (HTTP 200).
-- Post-merge GitHub Actions run [29562409367](https://github.com/TheRealDesFly/DesFly-Swag-Shop/actions/runs/29562409367) passed the hardened offline checks on `main`; push-triggered runs intentionally do not perform live probes.
-- The earlier dual-probe run exercised the previously published Wix site. The merged protected endpoint still requires Wix publication and a fresh default-branch live run.
+- Focused lifecycle/refund/split-shipment suites pass 80/80, endpoint/configuration suites pass 66/66, retention/health/capacity suites pass 20/20, and workflow-policy tests pass 3/3. ESLint passed after each implementation stream.
+- The previous full local suite passed 349/349 before the final endpoint, lifecycle, health, and documentation changes. A fresh full-suite, lint, syntax, manifest, secret-scan, and diff validation is therefore still required immediately before the pull-request commit.
+- Strict offline direct configuration validation passed without printing secret values. A live direct staging login/inventory probe during the MYT service window timed out after ten seconds; redacted TCP checks could not reach the configured host on ports 443, 80, 8080, or 8443.
+- The currently published Wix diagnostic route returned 500 without the poller trigger secret and the webhook routes returned 404. Those results describe the old hosted backend, not this local remediation.
+- Wix inspection found seven of twelve required backend secret names. The missing names are `ISTORE_ISEND_WEBHOOK_SECRET`, `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED`, `ISEND_POLLER_TRIGGER_SECRET`, `ISEND_FULFILLMENT_TRIGGER_SECRET`, and `ISEND_RECOVERY_TRIGGER_SECRET`.
+- Wix inspection found only two of nine required integration collections: `ISendOrderOutbox` and `ISendOrderOutboxClaims`. Both are empty, expose content to Everyone, and have no custom indexes. Required fields, permissions, migrations, and indexes are not verified.
+- Repository Actions secret names and current hosted alert recipients could not be verified with the available repository/site access. No secret value was read into source, logs, screenshots, or this report.
+- Historical GitHub Action runs and prior published Wix probes are useful provenance only. They do not validate this uncommitted diff or establish current-SHA staging evidence.
 
-## Required Before Go-Live
+## Required Before Backend Staging Acceptance
 
 Use `WIX_OWNER_HANDOFF.md` as the evidence-based owner-machine execution checklist for these gates.
 
-1. Authenticate the Wix CLI or use the Wix dashboard, then set/verify every backend-only secret in `STAGING_SETUP.md`. Current CLI access is unauthenticated. Live probes showed the first three endpoint secrets are not configured, and this branch adds the fourth operator-only recovery secret:
-   - `ISTORE_ISEND_WEBHOOK_SECRET`
-   - `ISEND_POLLER_TRIGGER_SECRET`
-   - `ISEND_FULFILLMENT_TRIGGER_SECRET`
-   - `ISEND_RECOVERY_TRIGGER_SECRET`
-2. Create all seven Admin-only integration collections and every required field type/index in `STAGING_SETUP.md`. Before publishing, complete its mandatory claim and environment migrations: independently reconcile both mapping identity dimensions, convert only a single proven completed per-tracking fulfillment claim to the order-level key, environment-scope proven raw-webhook claims, and prove/backfill environments on legacy outbox, mapping, webhook-audit, inventory, and pending-email rows. Quarantine every ambiguity.
-3. Publish the site so the modern event handler, protected endpoints, hourly `runISendOrderOutboxJob`, and staggered hourly `runISendPollerJob` schedules become active.
-4. Run the hardened workflow on the default branch and retain a fresh strict dual-probe pass.
-5. Place one staging Wix order and verify: environment-bound event enqueue, one iSend submit, `custOrderNo` extraction, environment-bound mapping, signed tracking webhook, scheduled poller identity check, Wix fulfillment, delivered transition, and email queue record.
-6. Confirm with a real create-order response that `custOrderNo` is present and is the correct key for `/Json/WhseOrder/doQueryOrderPage`, and confirm tracking/status webhooks include that same customer-order identity. The worker quarantines responses containing only internal `orderNo`/`orderId` rather than saving a mapping the poller cannot query.
-7. Obtain and test the iSend multi-parcel contract that allocates each tracking number to explicit Wix line-item IDs and quantities. Until that contract exists, any order update with multiple unique tracking numbers is intentionally rejected and must not be fulfilled manually without reconciliation.
-8. Exercise the fulfillment reconciliation runbook in `STAGING_SETUP.md`: prove completed claims replay safely, and prove `processing`/`unknown_outcome` claims alert and stop until the Wix outcome is confirmed.
-9. Load-test capacity. The bounded outbox drains at most five orders per hour, or 60 during the 12-hour service window; the reconciliation poller separately queries at most five active mappings per hour and currently logs in per mapping.
-10. Configure alerts for scheduled-job failure, outbox or fulfillment `unknown_outcome`, stale fulfillment `processing`, retry exhaustion, queue age/backlog, invalid-signature spikes, fulfillment failure, and poller failure.
-11. Before production selection, stop staging intake and webhook delivery, resolve every staging outbox attention state, require no staging row in a submit-capable state, and require every staging mapping to have `reconciliationActive=false`. After switching, both jobs must report zero environment-binding conflicts before the canary.
+1. Review and merge only the backend pull request after its final checks pass. Record the exact resulting source SHA; do not infer Wix deployment from a repository merge.
+2. Verify all twelve Wix backend secret names in `STAGING_SETUP.md` and the five repository Actions secret names without exporting their values. Provision the five currently missing Wix names. Keep `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset or non-`true` until the named iSend approver confirms the complete single-parcel contract.
+3. Create or repair all nine Admin-only integration collections, every required field type, and every required index in `STAGING_SETUP.md`. Complete its claim, fulfillment-key, and environment migrations from backups; quarantine every ambiguous row. Retain target-site query-plan evidence where the Wix plan constrains custom indexes.
+4. Obtain owner-authorized network access and iSend partner confirmation for the staging origin. Prove DNS/TCP/TLS/login/inventory reachability from both the test runner and the Wix backend without recording credentials or sessions.
+5. In a separate, explicitly authorized change window, publish only the exact reviewed backend SHA to Wix staging. Verify the seven lifecycle handlers, protected routes, and all four schedules. No frontend content or editor action is part of this gate.
+6. Run the hardened default-branch workflow and retain a fresh strict direct-plus-Wix authenticated-session pass tied to the same SHA and environment.
+7. Execute controlled staging order-to-delivery cases for normal delivery, duplicate events, pre-submit cancellation, full refund, partial-refund attention, cancellation/update races during submission and mapping persistence, contradictory parcel data, second tracking number, split/partial shipment, webhook/poller races, and fulfillment replay/recovery. No unsupported case may create an iSend order or Wix fulfillment.
+8. Confirm with real partner responses that `custOrderNo` is the authoritative query/webhook identity. Obtain a reviewed post-submit cancellation/void/update contract; until then, post-submit lifecycle changes remain durable operator attention and must not be represented as canceled upstream.
+9. Prove alert delivery and accountable escalation for job failure, lifecycle attention, submit/fulfillment ambiguity, retry exhaustion, queue age/backlog, signature spikes, poller failure, retention failure, capacity failure, and stale/missing sensitive-data-policy evidence.
+10. Capture measured provider/Wix request budgets, nonzero runtimes, queue/backlog behavior, claim-generation growth, lifecycle-intent growth, storage limits, and runway. Run `npm run check:isend-capacity` against attested evidence bound to the exact clean SHA.
+11. Record owner-approved webhook-payload and sent-email retention periods, enforcement, approver, policy revision, and recent evidence in `ISendMaintenanceState`. Prove operational health stays red when attestation is absent, stale, or unenforced.
+12. Treat production authorization as a later decision. Stop staging intake, resolve every attention/ambiguous state, deactivate staging reconciliation, prove zero environment-binding conflicts, and obtain explicit canary approval before any production selection or traffic.
 
 ## Known Follow-Up Risks
 
 - Current elevated Wix eCommerce order reads and fulfillment writes are implemented, but the migrated tracking and delivered-email paths still need one published staging order to prove site permissions and real response shapes.
 - Webhook side effects and the final processed marker are not transactional. Canonical fulfillment keys prevent the highest-impact duplicate, but audit/inventory/status writes should eventually move to a durable inbox or delivery-ID state machine.
 - Before publishing, complete both `ISendProcessedEvents` migrations in `STAGING_SETUP.md`: convert only one proven completed legacy per-tracking claim per order to the new single-parcel key, and scope only proven raw-webhook claims as `<environment>:<old-key>`. Quarantine ambiguous rows; non-webhook recovery keys must not be prefixed.
+- Append-only lifecycle intents have no deletion path. Their measured growth, collection limit, storage runway, and any future owner-approved retention design remain release evidence; do not delete lifecycle evidence merely to make health green.
+- Split and partial shipment remain intentionally unsupported. Multiple tracking numbers, partial quantities, contradictory parcel metadata, and already-fulfilled authoritative orders fail closed until the partner and Wix allocation contract is implemented and separately reviewed.
 - Inventory polling remains disabled until the partner contract is confirmed, and delivery email still depends on a Wix Automation consuming `ISendPendingEmails`.
 - Full `npm audit` reports development-only advisories inherited through the current `@wix/cli` dependency; the production dependency audit is clean. Recheck when Wix publishes an updated dependency chain.

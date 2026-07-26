@@ -3,6 +3,7 @@ import { elevate } from 'wix-auth';
 import { orderFulfillments, orders } from 'wix-ecom-backend';
 import { claimProcessed, updateProcessed } from 'backend/isendIdempotency';
 import { getByISendOrderNo } from 'backend/isendMappings';
+import { isISendSingleParcelContractConfirmed } from 'backend/isendFulfillmentContract';
 import {
   assertMappingMutationLock,
   MAX_MAPPING_MUTATION_LEASE_MS,
@@ -29,6 +30,10 @@ export class FulfillmentReconciliationRequiredError extends Error {
     this.orderId = orderId;
     this.idempotencyKey = idempotencyKey;
     this.idempotencyStatus = idempotencyStatus;
+    // Replaying the same request cannot repair an unknown/completed-mismatch
+    // fulfillment claim. Surface it as a durable operator action, not a retry
+    // storm from webhook providers.
+    this.retryable = false;
     if (cause) this.cause = cause;
   }
 }
@@ -81,6 +86,175 @@ function lineItemsMismatchError(orderId, cause) {
   error.retryable = false;
   if (cause) error.cause = cause;
   return error;
+}
+
+function unsupportedSplitShipmentError(detail) {
+  const error = new Error(
+    `Split-shipment fulfillment is not supported by the iSend/Wix integration${detail ? `: ${detail}` : ''}`,
+  );
+  error.code = 'unsupported-isend-split-shipment';
+  error.retryable = false;
+  return error;
+}
+
+function unconfirmedSingleParcelContractError() {
+  const error = new Error(
+    'Wix fulfillment is disabled until the iSend single-parcel contract is explicitly confirmed',
+  );
+  error.code = 'isend-single-parcel-contract-unconfirmed';
+  error.retryable = false;
+  return error;
+}
+
+function hasParcelAllocationMetadata(parcel) {
+  return Boolean(parcel && typeof parcel === 'object' && [
+    'lineItemAllocations',
+    'lineItems',
+    'items',
+    'allocations',
+  ].some((field) => parcel[field] !== undefined));
+}
+
+function normalizeDeclaredParcelCount(value, label) {
+  if (value === undefined) return null;
+  const normalized = Number(value);
+  if (!Number.isSafeInteger(normalized) || normalized <= 0) {
+    throw unsupportedSplitShipmentError(`${label} must be the integer 1`);
+  }
+  return normalized;
+}
+
+/**
+ * Preserve known parcel-contract fields across transport adapters. iSend has
+ * exposed them at both the row root and under shipment/tracking wrappers.
+ */
+export function extractISendParcelContractMetadata(source, discoveredTrackingNumbers = []) {
+  const root = source && typeof source === 'object' ? source : {};
+  const sources = [
+    root,
+    root.order,
+    root.shipment,
+    root.tracking,
+    root.fulfillment,
+    root.delivery,
+  ].filter((value) => value && typeof value === 'object' && !Array.isArray(value));
+  const firstDefined = (field) => {
+    const match = sources.find((value) => value[field] !== undefined);
+    return match ? match[field] : undefined;
+  };
+  const declaredTrackingNumbers = firstDefined('trackingNumbers');
+
+  return {
+    trackingNumbers: declaredTrackingNumbers === undefined
+      ? discoveredTrackingNumbers
+      : declaredTrackingNumbers,
+    parcels: firstDefined('parcels'),
+    parcelCount: firstDefined('parcelCount'),
+    totalParcels: firstDefined('totalParcels'),
+    lineItemAllocations: firstDefined('lineItemAllocations'),
+  };
+}
+
+/**
+ * Validate the complete parcel evidence before any mapping/status/Wix side
+ * effect. Callers must forward parcel/count/allocation metadata instead of
+ * flattening it to the first tracking number.
+ */
+export function validateISendSingleParcelEvidence(options = {}) {
+  const trackingCandidates = [];
+  const addTracking = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(addTracking);
+      return;
+    }
+    if (value !== undefined && value !== null
+      && !['string', 'number'].includes(typeof value)) {
+      throw unsupportedSplitShipmentError('tracking values must be scalar');
+    }
+    const normalized = String(value || '').trim();
+    if (normalized && !trackingCandidates.includes(normalized)) {
+      trackingCandidates.push(normalized);
+    }
+  };
+
+  if (Array.isArray(options.trackingNumber)) {
+    throw unsupportedSplitShipmentError('the primary tracking field must be scalar');
+  }
+  addTracking(options.trackingNumber);
+  if (options.trackingNumbers !== undefined) {
+    if (Array.isArray(options.trackingNumbers)) {
+      if (options.trackingNumbers.length > 1) {
+        throw unsupportedSplitShipmentError('multiple declared tracking values are not supported');
+      }
+      if (options.trackingNumbers.length === 0 && trackingCandidates.length > 0) {
+        throw unsupportedSplitShipmentError(
+          'an empty trackingNumbers declaration contradicts the primary tracking value',
+        );
+      }
+    }
+    addTracking(options.trackingNumbers);
+  }
+  if (options.parcels !== undefined && !Array.isArray(options.parcels)) {
+    throw unsupportedSplitShipmentError('parcel metadata must be an array');
+  }
+  if (Array.isArray(options.parcels)) {
+    options.parcels.forEach((parcel) => {
+      addTracking(parcel && (parcel.trackingNumber || parcel.trackingNo));
+    });
+  }
+
+  const parcelCount = normalizeDeclaredParcelCount(options.parcelCount, 'parcelCount');
+  const totalParcels = normalizeDeclaredParcelCount(options.totalParcels, 'totalParcels');
+  if (parcelCount !== null
+    && totalParcels !== null
+    && parcelCount !== totalParcels) {
+    throw unsupportedSplitShipmentError('parcelCount and totalParcels contradict each other');
+  }
+  const declaredCount = parcelCount ?? totalParcels;
+  if (Array.isArray(options.parcels)) {
+    if (options.parcels.length === 0) {
+      throw unsupportedSplitShipmentError('explicit parcel metadata must contain one parcel');
+    }
+    if (declaredCount !== null && options.parcels.length !== declaredCount) {
+      throw unsupportedSplitShipmentError(
+        'declared parcel count contradicts the parcel metadata length',
+      );
+    }
+  }
+  if ((declaredCount !== null && declaredCount !== 1)
+    || (Array.isArray(options.parcels) && options.parcels.length > 1)
+    || trackingCandidates.length > 1
+    || options.lineItemAllocations !== undefined
+    || (Array.isArray(options.parcels)
+      && options.parcels.some(hasParcelAllocationMetadata))) {
+    throw unsupportedSplitShipmentError(
+      'one authoritative line-item allocation and one tracking number are required',
+    );
+  }
+
+  if (trackingCandidates.length === 0) {
+    const error = new Error('Single-parcel fulfillment requires one tracking number');
+    error.code = 'missing-isend-tracking-number';
+    error.retryable = false;
+    throw error;
+  }
+  return trackingCandidates[0];
+}
+
+function hasAnyWixFulfillment(order) {
+  const status = String(order && order.fulfillmentStatus || '').trim().toUpperCase();
+  if (['PARTIALLY_FULFILLED', 'FULFILLED'].includes(status)) return true;
+
+  const lineItems = Array.isArray(order && order.lineItems) ? order.lineItems : [];
+  return lineItems.some((lineItem) => {
+    const fulfilledQuantity = Number(lineItem && (
+      lineItem.fulfilledQuantity
+      ?? lineItem.quantityFulfilled
+      ?? (lineItem.fulfillment && lineItem.fulfillment.quantity)
+      ?? 0
+    ));
+    return Number.isFinite(fulfilledQuantity) && fulfilledQuantity > 0;
+  });
 }
 
 function fulfillmentRequestFingerprint(orderId, fulfillment) {
@@ -206,10 +380,14 @@ export async function createFulfillment(orderId, options = {}) {
   return result;
 }
 
-export function getSingleParcelFulfillmentKey(iSendOrderNo) {
+export function getSingleParcelFulfillmentKey(iSendOrderNo, environment) {
   const normalized = String(iSendOrderNo || '').trim();
   if (!normalized) throw new Error('Single-parcel fulfillment requires an iSend order number');
-  return `isend:${normalized}:single-parcel-fulfillment`;
+  const normalizedEnvironment = String(environment || '').trim().toLowerCase();
+  if (!['staging', 'production'].includes(normalizedEnvironment)) {
+    throw new Error('Single-parcel fulfillment key requires an explicit iSend environment');
+  }
+  return `isend:${normalizedEnvironment}:${normalized}:single-parcel-fulfillment`;
 }
 
 /**
@@ -229,12 +407,9 @@ export async function createISendSingleParcelFulfillment(
   }
   const expectedOrderId = String(orderId || '').trim();
   if (!expectedOrderId) throw new Error('Single-parcel fulfillment requires a Wix order ID');
-  const trackingNumber = String(options.trackingNumber || '').trim();
-  if (!trackingNumber) {
-    const error = new Error('Single-parcel fulfillment requires one tracking number');
-    error.code = 'missing-isend-tracking-number';
-    error.retryable = false;
-    throw error;
+  const trackingNumber = validateISendSingleParcelEvidence(options);
+  if (!await isISendSingleParcelContractConfirmed()) {
+    throw unconfirmedSingleParcelContractError();
   }
 
   return withMappingMutationLock(iSendOrderNo, async (lock) => {
@@ -267,6 +442,47 @@ export async function createISendSingleParcelFulfillment(
     if (!wixOrder) {
       throw new Error(`Wix order lookup returned no order for ${expectedOrderId}`);
     }
+    if (String(wixOrder._id || wixOrder.id || '') !== expectedOrderId) {
+      const error = new Error(`Wix order lookup returned a different order for ${expectedOrderId}`);
+      error.code = 'isend-fulfillment-order-id-mismatch';
+      error.retryable = false;
+      throw error;
+    }
+    const wixOrderStatus = String(wixOrder.status || wixOrder.orderStatus || '')
+      .trim()
+      .toUpperCase();
+    if (wixOrderStatus !== 'APPROVED') {
+      const error = new Error(
+        `Wix order ${expectedOrderId} is not fulfillable (${wixOrderStatus || 'missing status'})`,
+      );
+      error.code = 'isend-wix-order-not-fulfillable';
+      error.retryable = false;
+      throw error;
+    }
+    const wixPaymentStatus = String(wixOrder.paymentStatus || '').trim().toUpperCase();
+    if (['FULLY_REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELED', 'CANCELLED', 'DECLINED']
+      .includes(wixPaymentStatus)) {
+      const error = new Error(
+        `Wix order ${expectedOrderId} requires payment/refund review (${wixPaymentStatus})`,
+      );
+      error.code = 'isend-wix-order-refund-review-required';
+      error.retryable = false;
+      throw error;
+    }
+    const wixFulfillmentStatus = String(wixOrder.fulfillmentStatus || '')
+      .trim()
+      .toUpperCase();
+    if (wixFulfillmentStatus === 'FULFILLED') {
+      const error = new Error(`Wix order ${expectedOrderId} is already fulfilled`);
+      error.code = 'isend-wix-order-already-fulfilled';
+      error.retryable = false;
+      throw error;
+    }
+    if (hasAnyWixFulfillment(wixOrder)) {
+      throw unsupportedSplitShipmentError(
+        `Wix order ${expectedOrderId} already contains fulfilled quantities`,
+      );
+    }
     const authoritativeLineItems = canonicalLineItems(wixOrder.lineItems);
     if (options.lineItems !== undefined) {
       let matchesAuthoritativeOrder = false;
@@ -285,22 +501,44 @@ export async function createISendSingleParcelFulfillment(
       environment: omittedEnvironment,
       idempotencyKey: omittedKey,
       lineItems: omittedLineItems,
+      trackingNumbers: omittedTrackingNumbers,
+      parcels: omittedParcels,
+      parcelCount: omittedParcelCount,
+      totalParcels: omittedTotalParcels,
+      lineItemAllocations: omittedAllocations,
       ...fulfillmentOptions
     } = options;
     void omittedEnvironment;
     void omittedKey;
     void omittedLineItems;
-    return createFulfillment(expectedOrderId, {
-      ...fulfillmentOptions,
-      lineItems: authoritativeLineItems,
-      trackingNumber,
-      idempotencyKey: getSingleParcelFulfillmentKey(iSendOrderNo),
-    });
+    void omittedTrackingNumbers;
+    void omittedParcels;
+    void omittedParcelCount;
+    void omittedTotalParcels;
+    void omittedAllocations;
+    try {
+      return await createFulfillment(expectedOrderId, {
+        ...fulfillmentOptions,
+        lineItems: authoritativeLineItems,
+        trackingNumber,
+        idempotencyKey: getSingleParcelFulfillmentKey(iSendOrderNo, environment),
+      });
+    } catch (error) {
+      if (error instanceof FulfillmentReconciliationRequiredError
+        && error.idempotencyStatus === 'completed-key-mismatch') {
+        throw unsupportedSplitShipmentError(
+          'a different tracking number was received after the single parcel completed',
+        );
+      }
+      throw error;
+    }
   }, { leaseMs: MAX_MAPPING_MUTATION_LEASE_MS });
 }
 
 export default {
   createFulfillment,
   createISendSingleParcelFulfillment,
+  extractISendParcelContractMetadata,
   getSingleParcelFulfillmentKey,
+  validateISendSingleParcelEvidence,
 };
