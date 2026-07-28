@@ -4,7 +4,7 @@ Local staging smoke test for the Wix + iStore iSend integration.
 
 Checks supported:
   1. Direct iSend staging login with local env/args.
-  2. Published Wix endpoint `/_functions/testISendLoginFromWix?env=staging`.
+  2. Published Wix endpoint `/_functions/testISendLoginFromWix`.
   3. Optional direct iSend inventory query with `--inventory`.
 
 No secret values are printed.
@@ -359,12 +359,46 @@ function summarizeResults(results) {
   };
 }
 
-function sanitizeError(error) {
-  return String(error && error.message ? error.message : error)
-    .replace(/https?:\/\/[^\s/$.?#].[^\s]*/gi, '[url]')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b/g, '[address]')
-    .replace(/userPassword["']?\s*:\s*["'][^"']+["']/gi, 'userPassword:"[redacted]"')
-    .replace(/password["']?\s*:\s*["'][^"']+["']/gi, 'password:"[redacted]"');
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getNetworkRedactionTokens(values) {
+  const tokens = new Set();
+  for (const value of values || []) {
+    if (!String(value || '').trim()) continue;
+    try {
+      const parsed = new URL(value);
+      if (parsed.host) tokens.add(parsed.host);
+      if (parsed.hostname) tokens.add(parsed.hostname);
+    } catch (error) {
+      // Invalid configured URLs are rejected before a live request. Do not
+      // preserve their raw value in diagnostics.
+    }
+  }
+  return Array.from(tokens).sort((left, right) => right.length - left.length);
+}
+
+function sanitizeError(error, sensitiveUrls = []) {
+  let message = String(error && error.message ? error.message : error || 'Request failed');
+  message = message
+    .replace(/\bhttps?:\/\/[^\s"'<>]+/gi, '[url]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '[address]')
+    .replace(/\[[0-9a-f:]+\](?::\d+)?/gi, '[address]');
+
+  for (const token of getNetworkRedactionTokens(sensitiveUrls)) {
+    message = message.replace(new RegExp(escapeRegExp(token), 'gi'), '[host]');
+  }
+
+  message = message.replace(
+    /\b(userPassword|password|sessionPassword|sessionId|authorization|cookie|x-isend-[a-z0-9-]*secret)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,}\]]+)/gi,
+    '$1=[redacted]',
+  );
+
+  const rawCode = String(error && error.code || '').trim();
+  const safeCode = /^[A-Za-z0-9_-]{1,64}$/.test(rawCode) ? rawCode : '';
+  const formatted = safeCode ? `${safeCode}: ${message}` : message;
+  return formatted.slice(0, 500);
 }
 
 function trimTrailingSlash(value) {
@@ -469,8 +503,9 @@ function getServiceWindowStatus(now) {
   };
 }
 
-function skippedOutsideServiceWindow(name, options) {
-  if (options.force || options.serviceWindow.withinServiceWindow) return null;
+function skippedOutsideServiceWindow(name, options, settings = {}) {
+  const allowForce = settings.allowForce !== false;
+  if ((allowForce && options.force) || options.serviceWindow.withinServiceWindow) return null;
 
   return {
     name,
@@ -658,7 +693,11 @@ function requestStatus(urlString, timeout) {
       res.on('end', () => resolve({ status: res.statusCode }));
     });
 
-    req.on('error', (error) => resolve({ status: 'error', code: error.code || error.message }));
+    req.on('error', (error) => {
+      const rawCode = String(error && error.code || '');
+      const code = /^[A-Za-z0-9_-]{1,64}$/.test(rawCode) ? rawCode : 'request-error';
+      resolve({ status: 'error', code });
+    });
     req.on('timeout', () => {
       req.destroy();
       resolve({ status: 'timeout' });
@@ -688,8 +727,6 @@ async function diagnose(options) {
   if (options.wixSiteUrl) {
     const base = trimTrailingSlash(options.wixSiteUrl);
     const wixPaths = [
-      '/_functions/testISendLoginFromWix?env=staging',
-      '/_functions-dev/testISendLoginFromWix?env=staging',
       '/_functions/testISendLoginFromWix',
       '/_functions-dev/testISendLoginFromWix',
       '/_functions/isendWebhook',
@@ -856,11 +893,14 @@ async function checkDirectInventory(options) {
 }
 
 async function checkWixEndpoint(options) {
-  const skipped = skippedOutsideServiceWindow('wix-isend-staging', options);
+  const skipped = skippedOutsideServiceWindow(
+    'wix-isend-staging',
+    options,
+    { allowForce: false },
+  );
   if (skipped) return skipped;
 
-  const forceParam = options.force ? '&force=true' : '';
-  const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix?env=staging${forceParam}`;
+  const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix`;
   const result = await requestJson('GET', url, null, options.timeout, {
     'X-ISEND-POLLER-SECRET': options.pollerSecret,
   });
@@ -980,7 +1020,7 @@ async function main() {
         name: check.name,
         ok: false,
         status: 'failed',
-        error: sanitizeError(error),
+        error: sanitizeError(error, [options.stagingUrl, options.wixSiteUrl]),
       });
     }
   }
@@ -994,8 +1034,8 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
-    console.error(error.message);
+  main().catch(() => {
+    console.error('Staging check failed unexpectedly');
     process.exit(1);
   });
 }
@@ -1006,6 +1046,7 @@ module.exports = {
   setupMeetsRequirements,
   summarizeResults,
   sanitizeSetupForOutput,
+  sanitizeError,
   validateDirectISendRoot,
   validateSetup,
   validateWixSiteRoot,

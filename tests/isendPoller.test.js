@@ -565,6 +565,55 @@ describe('iSend poller Wix order reads', () => {
     }, 'staging');
   });
 
+  it('keeps a delivered mapping active when the delivery email is missing', async () => {
+    mocks.getTrackingInfo.mockResolvedValue({
+      success: true,
+      returnObject: {
+        totalRecord: 1,
+        currentPageData: [{
+          custOrderNo: 'ISEND-1',
+          orderStatus: 'DELIVERED',
+          trackingNo: 'TRACK123',
+        }],
+      },
+    });
+    mocks.updateMappingStatus.mockResolvedValue({ _id: 'mapping-1' });
+    mocks.handleDelivered.mockRejectedValue(Object.assign(
+      new Error('Wix order has no resolvable email'),
+      {
+        code: 'isend-delivery-email-missing',
+        retryable: true,
+      },
+    ));
+
+    let error;
+    try {
+      await runISendPollerJob();
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      pollerResult: {
+        success: false,
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            stage: 'fulfillment',
+            code: 'isend-delivery-email-missing',
+          }),
+        ]),
+      },
+    });
+    expect(mocks.updateMappingReconciliation).toHaveBeenCalledWith('ISEND-1', {
+      lastReconciledAt: expect.any(Date),
+    }, 'staging');
+    expect(mocks.updateMappingReconciliation).not.toHaveBeenCalledWith(
+      'ISEND-1',
+      expect.objectContaining({ reconciliationActive: false }),
+      'staging',
+    );
+  });
+
   it('keeps a delivered mapping active and fails visibly when tracking is absent', async () => {
     mocks.getTrackingInfo.mockResolvedValue({
       success: true,

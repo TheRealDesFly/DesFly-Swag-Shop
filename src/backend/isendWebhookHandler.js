@@ -302,6 +302,27 @@ export async function handleWebhook(request) {
       || (isTrackingEvent && !possibleStatus);
     const isOrderEvent = isTrackingEvent || isStatusEvent || !hasRecognizedEventType;
     const parcelContract = extractISendParcelContractMetadata(payload, trackingCandidates);
+
+    const deliveryId = getSignedDeliveryId(payload);
+    const payloadHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
+    const environment = await getConfiguredISendEnvironment();
+    const deliveryKey = deliveryId || `${eventType || 'isend'}:${payloadHash}`;
+    // Delivery IDs are partner-controlled and may be reused by separate iSend
+    // environments. Scope both the raw audit and processed-event claim before
+    // any business side effect runs.
+    const idKey = `${environment}:${deliveryKey}`;
+
+    if (await hasProcessed(idKey)) {
+      return { success: true, status: 200, skipped: true, reason: 'idempotency', idempotencyKey: idKey };
+    }
+
+    // Every authenticated, parsed delivery is retained under the same
+    // deterministic environment-scoped identity, including payloads that are
+    // subsequently rejected by a permanent contract validation. A retry after
+    // a partial failure reuses this audit row and does not suppress business
+    // processing until markProcessed succeeds.
+    await insertWebhookAuditOnce(idKey, environment, eventType, payload);
+
     if (isOrderEvent && trackingCandidates.length > 1) {
       return {
         success: false,
@@ -323,18 +344,6 @@ export async function handleWebhook(request) {
         ...parcelContract,
         trackingNumber: trackingCandidates[0],
       });
-    }
-
-    const deliveryId = getSignedDeliveryId(payload);
-    const payloadHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
-    const environment = await getConfiguredISendEnvironment();
-    const deliveryKey = deliveryId || `${eventType || 'isend'}:${payloadHash}`;
-    // Delivery IDs are partner-controlled and may be reused by separate iSend
-    // environments. Scope the event claim before any side effect runs.
-    const idKey = `${environment}:${deliveryKey}`;
-
-    if (await hasProcessed(idKey)) {
-      return { success: true, status: 200, skipped: true, reason: 'idempotency', idempotencyKey: idKey };
     }
 
     if (shouldHandleTracking) {
@@ -499,7 +508,6 @@ export async function handleWebhook(request) {
         throw new Error(`Failed to update order status for ${iSendOrderNo}`);
       }
 
-      await insertWebhookAuditOnce(idKey, environment, eventType, payload);
       await markProcessed(idKey, { environment, eventType });
       return { success: true, status: 200, processed: true };
     }
@@ -508,13 +516,18 @@ export async function handleWebhook(request) {
       return { success: false, status: 400, code: 'missing-event-type', message: 'Missing event type' };
     }
 
-    // other event types: store raw payload
-    await insertWebhookAuditOnce(idKey, environment, eventType, payload);
+    // Other event types retain their authenticated raw audit above and then
+    // complete the same processed-event claim as recognized event families.
     await markProcessed(idKey, { environment, eventType });
     return { success: true, status: 200, processed: true };
   } catch (err) {
     if (err instanceof RequestBodyError) {
-      return { success: false, status: 400, code: err.code, message: err.message };
+      return {
+        success: false,
+        status: err.status || 400,
+        code: err.code,
+        message: err.message,
+      };
     }
     const permanentResponse = permanentWebhookErrorResponse(err);
     if (permanentResponse) return permanentResponse;

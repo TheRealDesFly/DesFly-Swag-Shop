@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   responses: new Map(),
   getConfiguredISendEnvironment: vi.fn(),
+  getSecret: vi.fn(),
 }));
 
 function responseKey(collection, filters) {
@@ -47,6 +48,10 @@ vi.mock('wix-data', () => ({
 
 vi.mock('backend/isendConfig', () => ({
   getConfiguredISendEnvironment: mocks.getConfiguredISendEnvironment,
+}));
+
+vi.mock('wix-secrets-backend', () => ({
+  getSecret: mocks.getSecret,
 }));
 
 import {
@@ -93,8 +98,12 @@ function setRetentionState(overrides = {}) {
       sensitiveDataRetentionPolicyRevision: 'owner-policy-2026-07',
       webhookPayloadRetentionDays: 30,
       sentEmailRetentionDays: 30,
+      terminalOutboxSnapshotRetentionDays: 30,
+      fulfillmentClaimResultRetentionDays: 30,
       webhookPayloadRetentionEnforcedExternally: true,
       sentEmailRetentionEnforcedExternally: true,
+      terminalOutboxSnapshotScrubEnforcedExternally: true,
+      fulfillmentClaimResultScrubEnforcedExternally: true,
       sensitiveDataRetentionLastVerifiedAt: '2026-07-25T12:00:00.000Z',
       sensitiveDataRetentionPolicyProvenance: {
         source: 'owner-approved policy',
@@ -129,6 +138,7 @@ describe('iSend operational health', () => {
   beforeEach(() => {
     mocks.responses.clear();
     mocks.getConfiguredISendEnvironment.mockResolvedValue('staging');
+    mocks.getSecret.mockResolvedValue(REVISION);
     seedHealthyRetention();
   });
 
@@ -156,7 +166,65 @@ describe('iSend operational health', () => {
     });
     expect(report.metrics.claimRunwayDays).toBe(790);
     expect(report.metrics.lifecycleIntentRunwayDays).toBe(390);
+    expect(mocks.getSecret).toHaveBeenCalledWith('ISTORE_ISEND_DEPLOYED_REVISION');
     expect(JSON.stringify(report)).not.toMatch(/email@|orderSnapshot|payload/);
+  });
+
+  it('fails closed when capacity evidence is bound to a different deployment SHA', async () => {
+    mocks.getSecret.mockResolvedValue('b'.repeat(40));
+
+    const report = await getISendOperationalHealth({ now: NOW });
+    const alertNames = report.alerts.map((entry) => entry.name);
+
+    expect(report.healthy).toBe(false);
+    expect(alertNames).toEqual(expect.arrayContaining([
+      'capacity-evidence-revision-mismatch',
+      'claim-capacity-evidence-invalid',
+      'lifecycle-intent-capacity-evidence-invalid',
+    ]));
+    expect(report.metrics.capacityEvidenceRevision).toBeNull();
+  });
+
+  it('fails closed when the deployed revision secret is unavailable', async () => {
+    mocks.getSecret.mockRejectedValue(new Error('secret unavailable'));
+
+    const report = await getISendOperationalHealth({ now: NOW });
+
+    expect(report.healthy).toBe(false);
+    expect(report.alerts.map((entry) => entry.name)).toContain(
+      'capacity-evidence-deployed-revision-invalid',
+    );
+  });
+
+  it('fails closed when the deployed revision secret is malformed', async () => {
+    mocks.getSecret.mockResolvedValue('not-a-commit-sha');
+
+    const report = await getISendOperationalHealth({ now: NOW });
+
+    expect(report.healthy).toBe(false);
+    expect(report.alerts.map((entry) => entry.name)).toContain(
+      'capacity-evidence-deployed-revision-invalid',
+    );
+  });
+
+  it('requires outbox-snapshot and fulfillment-result scrub attestations', async () => {
+    setRetentionState({
+      terminalOutboxSnapshotScrubEnforcedExternally: false,
+      fulfillmentClaimResultScrubEnforcedExternally: false,
+    });
+
+    const report = await getISendOperationalHealth({ now: NOW });
+    const policyAlert = report.alerts.find(
+      (entry) => entry.name === 'sensitive-data-retention-policy-unverified',
+    );
+
+    expect(report.healthy).toBe(false);
+    expect(policyAlert).toMatchObject({
+      terminalOutboxSnapshotRetentionConfigured: true,
+      fulfillmentClaimResultRetentionConfigured: true,
+      terminalOutboxSnapshotScrubEnforcementVerified: false,
+      fulfillmentClaimResultScrubEnforcementVerified: false,
+    });
   });
 
   it('surfaces backlog, queue age, terminal attention, mapping, and environment-scoped email alerts', async () => {

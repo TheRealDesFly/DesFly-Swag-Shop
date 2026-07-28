@@ -74,6 +74,43 @@ function endpointConfigurationErrorResponse() {
   });
 }
 
+function safeCount(value) {
+  const normalized = Number(value);
+  return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : 0;
+}
+
+const SAFE_POLLER_FAILURE_STAGES = new Set([
+  'business-response',
+  'environment-binding',
+  'fulfillment',
+  'getOrder',
+  'query-identity',
+  'reconciliation-state',
+  'status',
+  'tracking',
+  'tracking-allocation',
+]);
+
+function pollerFailureResponse(result) {
+  const failureDetails = Array.isArray(result && result.details)
+    ? result.details.filter((detail) => detail && detail.success === false)
+    : [];
+  const failedStages = Array.from(new Set(failureDetails
+    .map((detail) => String(detail.stage || '').trim())
+    .filter((stage) => SAFE_POLLER_FAILURE_STAGES.has(stage))))
+    .sort();
+
+  return {
+    success: false,
+    code: 'isend-poller-failed',
+    message: 'iSend poller reported one or more failures',
+    processedMappings: safeCount(result && result.processedMappings),
+    processed: safeCount(result && result.processed),
+    failureCount: Math.max(failureDetails.length, 1),
+    failedStages,
+  };
+}
+
 /**
  * A simple HTTP GET endpoint to validate iSend credentials from Wix.
  * This function is called from the frontend or a webhook tester.
@@ -88,8 +125,24 @@ export async function get_testISendLoginFromWix(request) {
       return jsonResponse(401, { success: false, message: 'Unauthorized' });
     }
 
-    const force = request && request.query && request.query.force === 'true';
-    const result = await testISendLogin({ force, environment: 'staging' });
+    let environment;
+    try {
+      environment = await getConfiguredISendEnvironment();
+    } catch (error) {
+      throw new SecretConfigurationError('Missing or invalid configured iSend environment');
+    }
+    if (environment !== 'staging') {
+      return jsonResponse(409, {
+        success: false,
+        code: 'staging-diagnostic-disabled',
+        message: 'Staging diagnostic is disabled for this site environment',
+      });
+    }
+
+    // The configured site environment and the service-window check inside
+    // testISendLogin are authoritative. Query parameters cannot override
+    // either release boundary.
+    const result = await testISendLogin({ environment });
     return ok({
       headers: {
         'Content-Type': 'application/json',
@@ -141,7 +194,10 @@ export async function post_isendWebhook(request) {
       : !result || result.success === false ? 500 : 200;
     return jsonResponse(status, result || { success: false, message: 'Webhook handler returned no result' });
   } catch (error) {
-    return serverError({ headers: { 'Content-Type': 'application/json' }, body: { success: false, message: error.message } });
+    return serverError({
+      headers: { 'Content-Type': 'application/json' },
+      body: { success: false, message: 'Webhook processing failed' },
+    });
   }
 }
 
@@ -166,10 +222,7 @@ export async function post_runISendPoller(request) {
       reconciliationOnly: true,
     });
     if (!result || result.success !== true) {
-      return jsonResponse(500, result || {
-        success: false,
-        message: 'iSend poller returned no result',
-      });
+      return jsonResponse(500, pollerFailureResponse(result));
     }
     return ok({ headers: { 'Content-Type': 'application/json' }, body: result });
   } catch (error) {
@@ -179,7 +232,10 @@ export async function post_runISendPoller(request) {
     if (error instanceof RequestBodyError) {
       return requestBodyErrorResponse(error);
     }
-    return serverError({ headers: { 'Content-Type': 'application/json' }, body: { success: false, message: error.message } });
+    return serverError({
+      headers: { 'Content-Type': 'application/json' },
+      body: { success: false, message: 'iSend poller failed' },
+    });
   }
 }
 
@@ -361,7 +417,7 @@ export async function post_createFulfillmentFromWix(request) {
     }
     return serverError({
       headers: { 'Content-Type': 'application/json' },
-      body: { success: false, message: error.message },
+      body: { success: false, message: 'Fulfillment request failed' },
     });
   }
 }

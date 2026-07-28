@@ -150,6 +150,17 @@ export async function handleDelivered(iSendOrderNo, options = {}) {
     const email = wixOrder.buyerInfo?.email
       || wixOrder.billingInfo?.contactDetails?.email
       || null;
+    if (!email) {
+      const error = new Error(
+        `Wix order ${wixOrderId} has no resolvable email for the delivered notification`,
+      );
+      error.code = 'isend-delivery-email-missing';
+      error.retryable = true;
+      error.wixOrderId = wixOrderId;
+      error.iSendOrderNo = normalizedISendOrderNo;
+      throw error;
+    }
+
     const eventId = deliveryItemId('audit', normalizedISendOrderNo);
     const emailId = deliveryItemId('email', normalizedISendOrderNo);
 
@@ -168,36 +179,32 @@ export async function handleDelivered(iSendOrderNo, options = {}) {
     const subject = options.subject || 'Your DesFly Order Has Been Delivered';
     const body = options.body || `Hello,\n\nYour order from DesFly Swag Shop has been marked as delivered.\n\nIf you have any questions regarding your shipment, please contact our support team.\n\nThank you for supporting DesFly.\n\nDesFly Swag Shop`;
 
-    if (email) {
-      await assertMappingMutationLock(lock);
-      await insertOnce(
-        EMAIL_COLLECTION,
-        {
-          _id: emailId,
-          to: String(email),
-          subject,
-          body,
-          wixOrderId,
-          iSendOrderNo: normalizedISendOrderNo,
-          environment,
-          createdAt: new Date(),
-          sent: false,
-          source: 'isend-delivered',
-        },
-      );
-    } else {
-      console.warn('handleDelivered: no customer email found for order', wixOrderId, normalizedISendOrderNo);
-    }
+    await assertMappingMutationLock(lock);
+    await insertOnce(
+      EMAIL_COLLECTION,
+      {
+        _id: emailId,
+        to: String(email),
+        subject,
+        body,
+        wixOrderId,
+        iSendOrderNo: normalizedISendOrderNo,
+        environment,
+        createdAt: new Date(),
+        sent: false,
+        source: 'isend-delivered',
+      },
+    );
 
     return {
       success: true,
       wixOrderId,
       iSendOrderNo: normalizedISendOrderNo,
-      emailFound: Boolean(email),
-      emailQueued: Boolean(email),
-      emailOutcome: email ? 'queued' : 'not-queued-missing-email',
+      emailFound: true,
+      emailQueued: true,
+      emailOutcome: 'queued',
       eventId,
-      emailId: email ? emailId : null,
+      emailId,
     };
   }, { leaseMs: MAX_MAPPING_MUTATION_LEASE_MS });
 }

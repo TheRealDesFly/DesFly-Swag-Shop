@@ -269,13 +269,13 @@ This module receives and processes incoming iSend webhook events.
 
 Key behavior:
 
-1. Verify the exact raw body bytes using the signature secret `ISTORE_ISEND_WEBHOOK_SECRET`.
+1. Reject a declared or observed body larger than 1 MiB with HTTP 413, then verify the exact raw body bytes using the signature secret `ISTORE_ISEND_WEBHOOK_SECRET`.
 2. Parse only the authenticated body and determine the event type from signed `eventType`/`type`; unsigned event headers do not control routing.
 3. Scope signed-body `deliveryId`/`eventId` to the configured iSend environment, falling back to the signed body hash; unsigned delivery-ID headers do not control dedupe.
 4. Handle tracking events by creating Wix fulfillments, while refusing delayed tracking after a final status.
 5. Handle inventory events through a deterministic environment/SKU row identity.
 6. Handle order status events by updating mapping status.
-7. Persist raw webhook events with deterministic environment-scoped IDs to `ISendWebhookEvents` for replay-safe auditing.
+7. Before contract validation or business effects, persist each authenticated, parsed, not-yet-processed delivery with a deterministic environment-scoped ID in `ISendWebhookEvents`; retries reuse that raw-audit identity.
 
 Functions:
 
@@ -336,6 +336,7 @@ Functions:
   - Records a `DELIVERED` event in `ISendWebhookEvents` using a deterministic ID.
   - Uses the elevated current Wix eCommerce Orders API to find the buyer email.
   - Creates one deterministic pending email record in `ISendPendingEmails` so an email can be sent later.
+  - Throws retryable `isend-delivery-email-missing` before completing delivery effects when neither buyer nor billing email resolves, leaving the webhook unprocessed and poller mapping active.
   - Treats duplicate deterministic IDs as successful replay and propagates every other write/read failure for retry.
 
 This helper is triggered automatically when status sync detects a delivery event.
@@ -375,16 +376,17 @@ Functions:
 
 - `get_testISendLoginFromWix(request)`
   - HTTP GET endpoint used to validate iSend login from the site.
-  - Requires `X-ISEND-POLLER-SECRET`, always selects staging, and redacts upstream/session values.
+  - Requires `X-ISEND-POLLER-SECRET`, runs only when the site's authoritative environment is staging, ignores query environment/force overrides, and redacts upstream/session values.
 
 - `post_isendWebhook(request)`
   - HTTP POST endpoint for receiving iSend webhooks.
+  - Propagates controlled 413 responses for bodies above the 1 MiB request limit.
 
 - `post_runISendPoller(request)`
   - HTTP POST endpoint to trigger the poller.
   - Protected by header `X-ISEND-POLLER-SECRET` and the Wix secret `ISEND_POLLER_TRIGGER_SECRET`.
   - Uses the site's configured `ISTORE_ISEND_ENV`; request bodies cannot redirect the site to another environment or change the fixed tracking/status, five-mapping, one-page, reconciliation-only safety bounds.
-  - Returns a failing HTTP status when the poller reports any selected sync failure.
+  - Returns a failing HTTP status with only bounded counts and failure-stage codes when the poller reports any selected sync failure; raw upstream errors and order identifiers remain server-side.
 
 - `post_requeueISendOrder(request)`
   - Re-enables only a retry-exhausted record whose failure was conclusively before submit.
@@ -447,9 +449,9 @@ The manual protected poll endpoint retains bounded stable pagination for operato
 
 ## src/backend/isendOperationalHealth.js
 
-`runISendOperationalHealthJob` runs hourly at minute 45 and throws whenever durable state is unhealthy. Its bounded, environment-scoped snapshot covers outbox backlog/age, unknown outcomes, retry exhaustion, stale processing, lifecycle attention, active mappings, stale unsent email, fulfillment claims in `processing`/`unknown_outcome`/invalid states, claim-retention cycle/runtime/verification failures, claim and lifecycle-intent occupancy/runway, exact-SHA capacity evidence, and owner-approved external retention enforcement for raw webhook payloads and sent emails. A fulfillment-key scan over 1,000 rows fails red instead of silently sampling.
+`runISendOperationalHealthJob` runs hourly at minute 45 and throws whenever durable state is unhealthy. Its bounded, environment-scoped snapshot covers outbox backlog/age, unknown outcomes, retry exhaustion, stale processing, lifecycle attention, active mappings, stale unsent email, fulfillment claims in `processing`/`unknown_outcome`/invalid states, claim-retention cycle/runtime/verification failures, claim and lifecycle-intent occupancy/runway, capacity evidence whose revision exactly matches backend secret `ISTORE_ISEND_DEPLOYED_REVISION`, and owner-approved external retention/scrubbing enforcement for raw webhook payloads, sent emails, resolved terminal outbox snapshots, and completed fulfillment-claim results. A fulfillment-key scan over 1,000 rows fails red instead of silently sampling.
 
-`scripts/check-isend-capacity.js` binds schedule and batch assumptions to `jobs.config` and source constants. It rejects plan overrides, template/unattested/stale evidence, zero runtime samples, a dirty worktree, a non-HEAD 40-character SHA, mismatched environment, insufficient provider/Wix request budgets, retention backlog, or insufficient claim/lifecycle-intent runway.
+`scripts/check-isend-capacity.js` binds schedule and batch assumptions to `jobs.config` and source constants. It rejects plan overrides, template/unattested/stale evidence, zero P95/maximum runtime samples, maximum runtime beyond the Wix job limit, a dirty worktree, a non-HEAD 40-character SHA, mismatched environment, insufficient provider request budget, unsafe observed aggregate Wix Data peak rates, retention backlog, or insufficient claim/lifecycle-intent runway. Its accepted `maintenanceStateConfiguration` output must be applied to the deterministic maintenance row before operational health can accept the same deployed revision.
 
 ---
 

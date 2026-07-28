@@ -71,6 +71,7 @@ vi.mock('backend/orderStateTransitions', () => ({
 }));
 
 import { handleWebhook } from '../src/backend/isendWebhookHandler';
+import { MAX_REQUEST_BODY_BYTES } from '../src/backend/requestBody';
 
 const secret = 'test-webhook-secret';
 
@@ -160,6 +161,19 @@ describe('iSend webhook handling', () => {
         iSendOrderNo: 'ORDER123',
       }),
     );
+    expect(mocks.insert).toHaveBeenCalledWith(
+      'ISendWebhookEvents',
+      expect.objectContaining({
+        deliveryId: 'staging:delivery-1',
+        environment: 'staging',
+        eventType: 'tracking.updated',
+        payload: expect.objectContaining({
+          custOrderNo: 'ORDER123',
+          tracking: { trackingNo: 'TRACK123' },
+        }),
+      }),
+      { suppressAuth: true },
+    );
   });
 
   it('rejects an invalid signature without processing the event', async () => {
@@ -173,6 +187,30 @@ describe('iSend webhook handling', () => {
     expect(warnSpy).toHaveBeenCalledWith('iSend webhook signature rejected', {
       reason: 'signature-mismatch',
     });
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(mocks.createFulfillment).not.toHaveBeenCalled();
+    expect(mocks.markProcessed).not.toHaveBeenCalled();
+  });
+
+  it('rejects an oversized signed request with 413 before consuming its body', async () => {
+    const text = vi.fn();
+    const result = await handleWebhook({
+      body: { text },
+      headers: {
+        'content-length': String(MAX_REQUEST_BODY_BYTES + 1),
+        'x-isend-signature': 'sha256=deadbeef',
+      },
+    });
+
+    expect(result).toEqual({
+      success: false,
+      status: 413,
+      code: 'request-body-too-large',
+      message: `Request body exceeds the ${MAX_REQUEST_BODY_BYTES}-byte limit`,
+    });
+    expect(text).not.toHaveBeenCalled();
+    expect(mocks.hasProcessed).not.toHaveBeenCalled();
+    expect(mocks.insert).not.toHaveBeenCalled();
     expect(mocks.createFulfillment).not.toHaveBeenCalled();
     expect(mocks.markProcessed).not.toHaveBeenCalled();
   });
@@ -351,8 +389,13 @@ describe('iSend webhook handling', () => {
 
     expect(first).toMatchObject({ success: true, processed: true });
     expect(second).toMatchObject({ success: true, processed: true });
-    expect(mocks.insert).toHaveBeenCalledTimes(1);
-    expect(mocks.insert).toHaveBeenCalledWith(
+    const inventoryInserts = mocks.insert.mock.calls
+      .filter(([collectionName]) => collectionName === 'ISendInventory');
+    const auditInserts = mocks.insert.mock.calls
+      .filter(([collectionName]) => collectionName === 'ISendWebhookEvents');
+    expect(inventoryInserts).toHaveLength(1);
+    expect(auditInserts).toHaveLength(2);
+    expect(inventoryInserts[0]).toEqual([
       'ISendInventory',
       expect.objectContaining({
         _id: itemId,
@@ -361,7 +404,8 @@ describe('iSend webhook handling', () => {
         lastKnownQty: 4,
       }),
       { suppressAuth: true },
-    );
+    ]);
+    expect(auditInserts.map(([, item]) => item.payload.availableQty)).toEqual([4, 3]);
     expect(mocks.update).toHaveBeenCalledWith(
       'ISendInventory',
       expect.objectContaining({
@@ -392,7 +436,22 @@ describe('iSend webhook handling', () => {
       code: 'unsupported-multi-tracking',
       trackingCount: 2,
     });
-    expect(mocks.hasProcessed).not.toHaveBeenCalled();
+    expect(mocks.hasProcessed).toHaveBeenCalledTimes(1);
+    expect(mocks.insert).toHaveBeenCalledWith(
+      'ISendWebhookEvents',
+      expect.objectContaining({
+        environment: 'staging',
+        eventType: 'tracking.updated',
+        payload: expect.objectContaining({
+          custOrderNo: 'ORDER123',
+          parcels: [
+            { trackingNo: 'TRACK123' },
+            { trackingNo: 'TRACK456' },
+          ],
+        }),
+      }),
+      { suppressAuth: true },
+    );
     expect(mocks.getByISendOrderNo).not.toHaveBeenCalled();
     expect(mocks.getOrder).not.toHaveBeenCalled();
     expect(mocks.createFulfillment).not.toHaveBeenCalled();
@@ -492,6 +551,15 @@ describe('iSend webhook handling', () => {
       environment: 'staging',
       deferDeliveryEffects: true,
     });
+    expect(mocks.insert).toHaveBeenCalledWith(
+      'ISendWebhookEvents',
+      expect.objectContaining({
+        environment: 'staging',
+        eventType: 'order.status.updated',
+        payload: expect.objectContaining({ custOrderNo: 'ORDER123' }),
+      }),
+      { suppressAuth: true },
+    );
     expect(mocks.markProcessed).toHaveBeenCalledTimes(1);
     expect(mocks.handleDelivered).not.toHaveBeenCalled();
   });
@@ -582,6 +650,9 @@ describe('iSend webhook handling', () => {
       eventType: 'partner.custom',
       value: 'same-signed-body',
     };
+    mocks.hasProcessed
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
 
     await handleWebhook(signedRequest(payload, {
       'x-isend-delivery-id': 'unsigned-first-id',
@@ -596,6 +667,15 @@ describe('iSend webhook handling', () => {
     expect(firstKey).toMatch(/^staging:partner\.custom:[a-f0-9]{64}$/);
     expect(firstKey).not.toContain('unsigned-first-id');
     expect(firstKey).not.toContain('unsigned-second-id');
+    const auditInserts = mocks.insert.mock.calls
+      .filter(([collectionName]) => collectionName === 'ISendWebhookEvents');
+    expect(auditInserts).toHaveLength(1);
+    expect(auditInserts[0][1]).toMatchObject({
+      deliveryId: firstKey,
+      environment: 'staging',
+      eventType: 'partner.custom',
+      payload,
+    });
   });
 
   it('returns explicit permanent fulfillment contract errors as nonretryable 4xx', async () => {
@@ -765,5 +845,48 @@ describe('iSend webhook handling', () => {
     });
     expect(mocks.createFulfillment.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.handleDelivered.mock.invocationCallOrder[0]);
+  });
+
+  it('keeps a delivered tracking event retryable and unprocessed when email is missing', async () => {
+    mocks.updateMappingStatus.mockResolvedValue({
+      _id: 'mapping-1',
+      statusTransition: {
+        applied: true,
+        effectiveStatus: 'DELIVERED',
+      },
+    });
+    mocks.handleDelivered.mockRejectedValue(Object.assign(
+      new Error('Wix order has no resolvable email'),
+      {
+        code: 'isend-delivery-email-missing',
+        retryable: true,
+      },
+    ));
+    const { request } = signedRequest({
+      eventType: 'shipment.updated',
+      deliveryId: 'delivered-missing-email',
+      custOrderNo: 'ORDER123',
+      tracking: { trackingNo: 'TRACK123', status: 'delivered' },
+    });
+
+    const result = await handleWebhook(request);
+
+    expect(result).toMatchObject({
+      success: false,
+      status: 500,
+      retryable: true,
+      code: 'webhook-processing-failed',
+    });
+    expect(mocks.createFulfillment).toHaveBeenCalledTimes(1);
+    expect(mocks.handleDelivered).toHaveBeenCalledTimes(1);
+    expect(mocks.markProcessed).not.toHaveBeenCalled();
+    expect(mocks.insert).toHaveBeenCalledWith(
+      'ISendWebhookEvents',
+      expect.objectContaining({
+        deliveryId: 'staging:delivered-missing-email',
+        eventType: 'shipment.updated',
+      }),
+      { suppressAuth: true },
+    );
   });
 });

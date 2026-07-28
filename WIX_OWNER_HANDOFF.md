@@ -25,13 +25,13 @@ Do not put secret values in this document, chat, tickets, screenshots, or retain
 | Owner/partner action | Why it is required | Engineering verification after delivery |
 | --- | --- | --- |
 | Owner explicitly authorizes Admin-only read/write permissions and creation/repair of all nine Wix integration collections, fields, and indexes. | The two existing collections currently expose content to Everyone; required lifecycle, mapping, idempotency, audit, inventory, email, maintenance, and index state is incomplete. | Compare every hosted collection ID, field type, permission, item count/migration, and active index to this manifest. |
-| Owner securely provisions all twelve Wix secret names and keeps `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset/non-`true` until partner approval. | Webhook authentication, protected poll/fulfillment/recovery routes, environment selection, and single-parcel fulfillment fail closed without them. | Verify names and selected staging environment only; test authorized/unauthorized route behavior without displaying values. |
-| Repository owner verifies the five GitHub Actions secret names used by the live probe. | Local GitHub CLI credentials cannot establish repository-secret state. | Run the pinned default-branch workflow during the MYT window and retain redacted direct/Wix authenticated-session evidence. |
+| Owner securely provisions all thirteen Wix secret names, binds `ISTORE_ISEND_DEPLOYED_REVISION` to the exact source SHA being published, and keeps `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset/non-`true` until partner approval. | Webhook authentication, protected poll/fulfillment/recovery routes, environment selection, capacity-evidence binding, and single-parcel fulfillment fail closed without them. | Verify names, selected staging environment, and deployed-revision equality without displaying credential values; test authorized/unauthorized route behavior. |
+| Repository owner preserves the five verified GitHub Actions secret names and confirms their staging-scoped values through the strict live probe. | Read-only repository inspection proves the names exist but cannot read values or establish that they target the reviewed staging environment. | Run the pinned default-branch workflow during the MYT window and retain redacted direct/Wix authenticated-session evidence. |
 | Network/iSend owner makes the reviewed staging endpoint reachable from the approved runner, including any source-IP/firewall allowlist. | Direct login and inventory currently time out from this runner. | Repeat redacted reachability, login, and inventory checks inside the service window. |
 | Partner confirms `custOrderNo` create/query/webhook semantics, uniqueness scope, signed-body fields/HMAC rules, event ordering, and request/concurrency limits. | Mapping, dedupe, monotonic status, and capacity must use authoritative identities and limits rather than inference. | Validate real redacted create/query/webhook shapes, identity-mismatch rejection, replay, delayed-event handling, and capacity headroom. |
 | Partner approves the one-complete-parcel contract or supplies an allocation contract mapping every tracking number to Wix line-item IDs/quantities. | Fulfillment is deliberately disabled until this is proven; multi/contradictory parcel evidence fails closed. | Prove one-parcel success/idempotent replay and rejection of multiple, contradictory, partial, or sequential second tracking cases without a second fulfillment. |
 | Partner defines the post-submit cancel/void/update API, idempotency/reconciliation semantics, and operator SLA. | A Wix cancellation after a successful or ambiguous iSend submit cannot safely be translated today. | Prove pre-submit cancellation/refund makes no iSend request and post-submit changes remain durable attention until the reviewed contract exists. |
-| Owner approves webhook-payload and sent-email retention periods, external enforcement, accountable approver, policy revision, and evidence location. | These collections may contain sensitive data; engineering will not guess deletion periods or delete active evidence. | Record the attestation in `ISendMaintenanceState`, verify enforcement and evidence age, and prove operational health stays red when it is absent/stale. |
+| Owner approves retention periods and external enforcement for webhook payloads, sent emails, terminal outbox snapshots/diagnostics, and completed fulfillment-claim results, with an accountable approver, policy revision, and evidence location. | These records may contain sensitive data; engineering will not guess retention periods, delete idempotency claims, or scrub active/ambiguous evidence. | Record all four attestations in `ISendMaintenanceState`, verify enforcement and evidence age, and prove operational health stays red when any attestation is absent/stale. |
 | Owner configures Wix Monitoring recipients and escalation ownership. | A failed job is not an alert until an accountable person receives it. | Trigger controlled staging lifecycle, fulfillment, retry, retention, capacity, and policy failures and retain delivery/recovery proof. |
 | Owner authorizes publishing one exact reviewed commit to the Wix staging backend only after every prerequisite above passes. | Current hosted routes/jobs do not contain this audited backend. | Verify Wix build SHA, routes, seven lifecycle handlers, four schedules, schema, secrets, alerts, and strict staging scenarios. No frontend content is in scope. |
 
@@ -40,6 +40,7 @@ Do not put secret values in this document, chat, tickets, screenshots, or retain
 Create or verify these exact names in Wix Secrets Manager as backend-only secrets. Values must be supplied through the owner-approved secret channel and must not be added to this repository, a ticket, or a deployment log.
 
 - `ISTORE_ISEND_ENV`
+- `ISTORE_ISEND_DEPLOYED_REVISION`
 - `ISTORE_ISEND_STORAGE_CLIENT_NO`
 - `ISTORE_ISEND_API_USER_ID`
 - `ISTORE_ISEND_API_PASSWORD`
@@ -52,7 +53,7 @@ Create or verify these exact names in Wix Secrets Manager as backend-only secret
 - `ISEND_FULFILLMENT_TRIGGER_SECRET`
 - `ISEND_RECOVERY_TRIGGER_SECRET`
 
-Keep the environment selector on the staging environment through staging acceptance. The poller credential may be shared with the staging monitor, but the fulfillment and recovery credentials are separate operator credentials. In particular, never give `ISEND_RECOVERY_TRIGGER_SECRET` to an automated poller or monitor.
+Keep the environment selector on the staging environment through staging acceptance. Set `ISTORE_ISEND_DEPLOYED_REVISION` to the exact reviewed 40-character source SHA being published; operational health rejects a missing, malformed, or capacity-evidence-mismatched value. The poller credential may be shared with the staging monitor, but the fulfillment and recovery credentials are separate operator credentials. In particular, never give `ISEND_RECOVERY_TRIGGER_SECRET` to an automated poller or monitor.
 
 The protected fulfillment endpoint is not a split-shipment escape hatch. It requires the mapped `iSendOrderNo` and one tracking number, reads the full authoritative Wix order inside the single-parcel coordinator, and rejects partial line-item assertions or caller-selected keys. Leave `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset or non-`true` until the named approver records partner confirmation that every order has one complete parcel; missing, unreadable, or other values fail closed. Set it to exactly `true` only with that evidence.
 
@@ -66,7 +67,7 @@ The GitHub Actions live probe has its own repository-secret configuration. It re
 
 Acceptance:
 
-- Wix reports all twelve backend secret names present.
+- Wix reports all thirteen backend secret names present.
 - The staging environment is selected.
 - The GitHub repository reports all five workflow secret names present.
 - No secret value appears in source, command output retained as evidence, or screenshots.
@@ -117,23 +118,23 @@ Index:
 
 Indexes:
 
-- Compound index on `claimKey`, then `generation`, in that order.
+- Compound index on `claimKey` ascending, then numeric `generation` descending, in that order.
 - Regular index on `leaseExpiresAt`.
 - Regular index on `releasedAt`.
 
-`generation` must be Number, never Text. Claim generations are append-only during normal processing. In addition to outbox worker leases, this collection stores namespaced `isend-mapping:<iSendOrderNo>` leases that serialize webhook and poller mapping updates. Daily retention removes only explicitly released, expired, nonlatest generations older than the configured interval; the highest generation for every `claimKey`, every unexpired claim, and every unreleased claim is preserved.
+`generation` must be Number, never Text. Claim generations are append-only during normal processing. In addition to outbox worker leases, this collection stores namespaced `isend-mapping:<iSendOrderNo>` leases that serialize webhook and poller mapping updates. Daily retention removes only explicitly released, expired, nonlatest generations older than the configured interval; the highest generation for every `claimKey`, every unexpired claim, and every unreleased claim is preserved. Before enabling deletion, retain target-site query-plan evidence for `releasedAt <= cutoff` with an `_id` keyset cursor/order and for empty `releasedAt` with `leaseExpiresAt <= cutoff`. If the Wix plan cannot serve either mixed predicate safely, add a supported compound index or redesign the cursor under separate review; keep retention and release blocked.
 
 ### `ISendMaintenanceState`
 
 | Type | Field keys |
 | --- | --- |
 | Text | `cursorId`, `lastRunErrorCode`, `capacityEvidenceRevision`, `capacityEvidenceEnvironment`, `sensitiveDataRetentionPolicyRevision` |
-| Number | `lastRunDurationMs`, `lastRunScanned`, `lastRunDeleted`, `lastRunPreservedInvalid`, `lastRunPreservedUnverified`, `lastRunStaleUnreleased`, `lastRunEligibleDeferred`, `claimItemLimit`, `measuredUniqueClaimKeysPerDay`, `lifecycleIntentItemLimit`, `measuredLifecycleIntentRowsPerDay`, `webhookPayloadRetentionDays`, `sentEmailRetentionDays` |
-| Boolean | `lastRunAttentionRequired`, `lastRunThrottled`, `lastRunRuntimeLimited`, `lastRunScanTruncated`, `sensitiveDataRetentionPolicyApproved`, `webhookPayloadRetentionEnforcedExternally`, `sentEmailRetentionEnforcedExternally` |
-| Object | `lastRunAttentionReasons`, `capacityEvidenceProvenance`, `sensitiveDataRetentionPolicyProvenance` |
+| Number | `lastRunDurationMs`, `lastRunScanned`, `lastRunDeleted`, `lastRunPreservedInvalid`, `lastRunPreservedUnverified`, `lastRunStaleUnreleased`, `lastRunEligibleDeferred`, `lastRunVerificationFailures`, `claimItemLimit`, `measuredUniqueClaimKeysPerDay`, `lifecycleIntentItemLimit`, `measuredLifecycleIntentRowsPerDay`, `webhookPayloadRetentionDays`, `sentEmailRetentionDays`, `terminalOutboxSnapshotRetentionDays`, `fulfillmentClaimResultRetentionDays` |
+| Boolean | `lastRunAttentionRequired`, `lastRunThrottled`, `lastRunRuntimeLimited`, `lastRunScanTruncated`, `sensitiveDataRetentionPolicyApproved`, `webhookPayloadRetentionEnforcedExternally`, `sentEmailRetentionEnforcedExternally`, `terminalOutboxSnapshotScrubEnforcedExternally`, `fulfillmentClaimResultScrubEnforcedExternally` |
+| Object | `lastRunAttentionReasons`, `cycleAttentionReasons`, `capacityEvidenceProvenance`, `sensitiveDataRetentionPolicyProvenance` |
 | Date and Time | `cycleStartedAt`, `lastCycleCompletedAt`, `lastRunAt`, `lastCutoff`, `capacityEvidenceMeasuredAt`, `sensitiveDataRetentionLastVerifiedAt`, `updatedAt` |
 
-No custom index is required. The retention and health jobs read and update the deterministic `_id` `isend-claim-retention-cursor-v1`. The keyset cursor must remain Admin-only; it advances bounded scans past preserved latest rows and resets to empty after a complete cycle. Capacity and sensitive-data-retention fields must come from retained, owner-approved evidence; never populate them with estimates merely to clear health.
+No custom index is required. The retention and health jobs read and update the deterministic `_id` `isend-claim-retention-cursor-v1`. The keyset cursor must remain Admin-only; it advances bounded scans past preserved latest rows and resets to empty after a complete cycle. Capacity and sensitive-data-retention fields must come from retained, owner-approved evidence; never populate them with estimates merely to clear health. Terminal outbox scrubbing must preserve queue identifiers, state, fingerprints, and timestamps and must exclude active, retryable, ambiguous, or lifecycle-attention rows. Completed fulfillment-claim result scrubbing must preserve the idempotency key, `meta.status`, request fingerprint, and reconciliation evidence; never delete the claim itself.
 
 ### `ISendOrderMap`
 
@@ -321,15 +322,18 @@ Use one controlled, single-parcel Wix order. Before placing it, verify it has a 
 5. A signed webhook supplies one tracking number and drives the normal update path.
 6. Wix contains exactly one fulfillment with the expected line-item IDs, quantities, and tracking number.
 7. The corresponding `ISendProcessedEvents` fulfillment claim has `meta.status=completed`.
-8. After the one fulfillment is confirmed, a delivered tracking update changes mapping metadata, creates exactly one deterministic `ISendWebhookEvents` delivered-side-effect audit row, and creates exactly one `ISendPendingEmails` row. A status-only delivered event may create its raw webhook audit but must not queue the delivered email until tracking has safely produced or confirmed the fulfillment.
+8. After the one fulfillment is confirmed, a delivered tracking update changes mapping metadata, retains exactly one raw-delivery audit plus one distinct deterministic delivered-side-effect audit in `ISendWebhookEvents`, and creates exactly one `ISendPendingEmails` row. A status-only delivered event creates its raw audit but must not queue the delivered email until tracking has safely produced or confirmed the fulfillment.
 9. The automation sends the controlled email and changes `sent` to `true`.
-10. Replaying the webhook update does not duplicate the iSend submission, Wix fulfillment, audit row, or email.
+10. Replaying the webhook update does not duplicate the iSend submission, Wix fulfillment, either audit identity, or email.
 11. Independently observe a scheduled `runISendPollerJob` execution. Retain evidence that it selects no more than five active mappings, advances `lastReconciledAt` after a real query, and sets `reconciliationActive=false` only after a terminal status and all required effects complete. The protected manual poller is diagnostic evidence, not a substitute for this scheduled-job check.
 12. Retain the iSend query response showing authoritative `returnObject.totalRecord=1`, exactly one page row, and that row's exact `custOrderNo` equal to the selected mapping. Prove that a missing/non-unit total or empty, extra, or mismatched page response fails without a Wix order read, status update, or fulfillment.
 13. After `DELIVERED`, replay an earlier signed nonterminal status/tracking delivery and prove the mapping does not regress and no extra fulfillment, audit row, or email is created. For a separate controlled record, prove `RETURNED` is accepted after `DELIVERED` and remains final against later replays.
 14. On separate controlled orders, prove cancellation, full refund, and authoritative order changes before submit produce no iSend order. Prove a partial-refund state fails closed with durable attention.
 15. Inject a cancellation/update while submission or mapping persistence is in progress. Prove the durable lifecycle intent is not lost and the resulting sent/ambiguous row requires operator attention; do not claim iSend cancellation without the partner contract.
 16. Submit multi-tracking, contradictory parcel-count, empty-parcel, partial-line-item, and sequential second-tracking cases. Prove each fails nonretryably without a second Wix fulfillment.
+17. On stable already-submitted orders, exercise cancellation, full refund, partial refund, and material order update. Prove each remains durable operator attention and no uncontracted iSend cancel/update is claimed.
+18. Seed an authoritative Wix order with any already-fulfilled quantity and submit one tracking, then prove the coordinator rejects it without another fulfillment.
+19. Remove the buyer/billing email on a controlled delivered order and prove delivery email processing fails retryably with `isend-delivery-email-missing`, the webhook remains unprocessed, the poller mapping stays active, and the configured alert is delivered.
 
 Do not use a multiple-tracking order for this first acceptance test.
 
@@ -352,7 +356,7 @@ Configure alerts for:
 - claim-retention invalid/unverified rows, stale unreleased claims, throttling, partial bulk deletion, runtime limit, or incomplete cycle;
 - claim and lifecycle-intent collection occupancy/runway;
 - missing, stale, or mismatched exact-SHA capacity evidence;
-- missing or stale owner-approved webhook/sent-email retention-policy enforcement; and
+- missing or stale owner-approved webhook/email enforcement or terminal-outbox/fulfillment-result scrub-policy enforcement; and
 - unsent `ISendPendingEmails` older than the email objective.
 
 Operator rules:
@@ -380,7 +384,7 @@ Before production, measure staging runtime and agree on all of the following:
 - lifecycle-intent rows/day, current occupancy, Wix collection limit, and storage runway;
 - nonzero P95 and maximum runtime for outbox, poller, retention, and operational health;
 - iSend request-rate and concurrency limits; and
-- Wix scheduled-job, data-read, data-write, and collection limits.
+- aggregate observed peak Wix Data read/write requests per minute across all integration jobs, plus Wix scheduled-job and collection limits.
 
 Copy `capacity-evidence.example.json` to a controlled evidence artifact, replace every placeholder with measured staging evidence, set its attestation fields only after independent review, commit the exact audited source, and run:
 
@@ -388,7 +392,7 @@ Copy `capacity-evidence.example.json` to a controlled evidence artifact, replace
 npm run check:capacity -- --evidence <retained-evidence.json> --environment staging
 ```
 
-The checker rejects a dirty worktree, a non-HEAD revision, stale/unattested evidence, evidence-supplied schedule/batch overrides, zero runtime samples, insufficient provider/Wix request budgets, retention backlog, and less than the required claim or lifecycle-intent storage runway. Retain the accepted input and generated report against the exact commit SHA. A green outbox result alone does not establish poller, retention, health, or storage capacity.
+The checker rejects a dirty worktree, a non-HEAD revision, stale/unattested evidence, evidence-supplied schedule/batch overrides, zero P95/maximum runtime samples, maximum runtime above the Wix job limit, insufficient provider request budget, unsafe aggregate peak Wix Data read/write rates, retention backlog, and less than the required claim or lifecycle-intent storage runway. Retain the accepted input and generated report against the exact commit SHA. Apply the accepted report's `maintenanceStateConfiguration` fields to deterministic row `ISendMaintenanceState/isend-claim-retention-cursor-v1`, then retain an operational-health result proving its capacity revision equals `ISTORE_ISEND_DEPLOYED_REVISION`. A green outbox result alone does not establish poller, retention, health, or storage capacity.
 
 Production capacity is accepted only when peak volume plus retry headroom remains below measured throughput and the backlog drains within the agreed objective. Otherwise redesign or increase the worker capacity in a separate reviewed change.
 

@@ -54,11 +54,12 @@ This file defines [permissions](https://support.wix.com/en/article/velo-about-we
 This repo includes an iStore/iSend integration with webhook receiver and a poller.
 
 - Webhook endpoint: `POST /_functions/isendWebhook` — expects HMAC-SHA256 signature header `X-ISEND-Signature` using secret `ISTORE_ISEND_WEBHOOK_SECRET`. Routing uses only signed body `eventType`/`type`, and dedupe uses signed body `deliveryId`/`eventId` or the body hash; unsigned event/delivery-ID headers are ignored.
-- Staging diagnostic: `GET /_functions/testISendLoginFromWix` — protected by `X-ISEND-POLLER-SECRET`; it always selects staging and returns session-presence evidence without the iSend root or session values.
+- Staging diagnostic: `GET /_functions/testISendLoginFromWix` — protected by `X-ISEND-POLLER-SECRET`; it runs only when the site's authoritative `ISTORE_ISEND_ENV` is staging, ignores caller environment/force overrides, and returns session-presence evidence without the iSend root or session values.
 - Manual poll trigger: `POST /_functions/runISendPoller` — protected by header `X-ISEND-POLLER-SECRET` matching Wix secret `ISEND_POLLER_TRIGGER_SECRET`; it always uses the site's configured iSend environment and the fixed scheduled-safety-net bounds of five active mappings, one page, and reconciliation-only tracking/status work.
 - Manual outbox recovery: `POST /_functions/requeueISendOrder` — protected by the separate operator-only `X-ISEND-RECOVERY-SECRET` and limited to conclusively pre-submit, retry-exhausted records.
 - Protected fulfillment endpoint: `POST /_functions/createFulfillmentFromWix` — protected by header `X-ISEND-FULFILLMENT-SECRET`, requires `orderId`, mapped `iSendOrderNo`, and one tracking number, uses the configured environment, and routes through the same order-level single-parcel coordinator as webhooks/polling. The coordinator fetches the authoritative Wix order and always fulfills its complete line-item/quantity set; any supplied line-item list must match exactly. A supplied `idempotencyKey` is accepted only when it equals `isend:<environment>:<iSendOrderNo>:single-parcel-fulfillment`; callers cannot choose a second key. Fulfillment also requires backend secret `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` to equal `true`; absent, unreadable, or other values fail closed until the partner contract is approved.
 - Environment selection: set Wix secret `ISTORE_ISEND_ENV` to `staging` or `production`. Production uses only `ISTORE_ISEND_PRODUCTION_URL`; staging uses `ISTORE_ISEND_SANDBOX_URL`. New outbox rows and mappings persist the normalized environment, and workers refuse missing or mismatched bindings so changing the selector cannot redirect old work.
+- Deployment binding: set backend secret `ISTORE_ISEND_DEPLOYED_REVISION` to the exact reviewed 40-character source SHA being published. Operational health rejects missing/malformed values and capacity evidence from a different revision.
 - iStore/iSend base URLs must use HTTPS and may be either an approved host root or its `/IsisWMS-War` context root. One owner-approved private origin may use `/api/login` only in staging and only when its reviewed SHA-256 origin fingerprint matches. Public staging and all production origins reject that path. URL credentials, query strings, fragments, other paths, unapproved hosts/ports, and redirects fail closed before credentials or order data are sent.
 - Login captures the `JSESSIONID` cookie returned by `/Json/Public/login/` and sends it with authenticated order, tracking, and inventory requests.
 - The configured service window is 10:00 AM-10:00 PM Malaysia Time.
@@ -94,11 +95,11 @@ Recommended indexes:
 - `ISendProcessedEvents.idempotencyKey` unique; deterministic IDs plus a legacy-row pre-read protect upgraded code, and the index closes old/new deployment races.
 - `ISendOrderOutbox.(status, environment, nextAttemptAt)`, `(status, environment, retryExhausted)`, and `(status, environment, leaseExpiresAt)`; add `lifecycleRequiresAttention` and validate whether the target plan can also support `(environment, lifecycleRequiresAttention)`.
 - `ISendOrderLifecycleIntents.(orderKey, environment, recordedAt descending)`.
-- `ISendOrderOutboxClaims.(claimKey, generation)` compound; `leaseExpiresAt` and `releasedAt` regular.
+- `ISendOrderOutboxClaims.(claimKey ascending, generation descending)` compound; `leaseExpiresAt` and `releasedAt` regular. Retention also requires target-site query-plan proof for `releasedAt` plus `_id` cursor/order and empty `releasedAt` plus `leaseExpiresAt`; block deletion if the plan needs a different compound-index/cursor design.
 - `ISendInventory.(environment, sku)` compound regular; a deterministic environment/SKU `_id` is the concurrency identity boundary.
 - `ISendPendingEmails.(environment, sent, createdAt)` compound regular for health monitoring.
 
-Keep all integration collections Admin-only. Deterministic `_id` values provide the outbox, lifecycle-intent, mapping, and side-effect claim concurrency boundary; monotonic claim generations fence stale workers without deleting and reusing a claim ID. Namespaced mapping-mutation claims serialize full-item Wix Data updates from webhooks and the poller. The hourly outbox and poller each have at most 60 productive service-window slots/day before backlog/retries. The poller requires authoritative `returnObject.totalRecord=1`, exactly one page row, and an exact `custOrderNo` match before it applies status or tracking data. Daily retention uses grouped latest-generation verification and bounded bulk deletion, always preserves the latest/active/unreleased claim generation, and persists incomplete/runtime/partial-delete state. Hourly operational health fails on unresolved outbox lifecycle, fulfillment, retention, storage, capacity-evidence, or owner-retention-policy state.
+Keep all integration collections Admin-only. Deterministic `_id` values provide the outbox, lifecycle-intent, mapping, and side-effect claim concurrency boundary; monotonic claim generations fence stale workers without deleting and reusing a claim ID. Namespaced mapping-mutation claims serialize full-item Wix Data updates from webhooks and the poller. The hourly outbox and poller each have at most 60 productive service-window slots/day before backlog/retries. The poller requires authoritative `returnObject.totalRecord=1`, exactly one page row, and an exact `custOrderNo` match before it applies status or tracking data. Daily retention uses grouped latest-generation verification and bounded bulk deletion, always preserves the latest/active/unreleased claim generation, and persists incomplete/runtime/partial-delete state. Hourly operational health fails on unresolved outbox lifecycle, fulfillment, retention, storage, deployed-revision/capacity-evidence mismatch, or owner retention/scrubbing-policy state.
 
 Configure every field type and index exactly as listed in `STAGING_SETUP.md`, the authoritative nine-collection schema. In particular, outbox/lifecycle environments and fingerprints are Text; counters/limits are Number; attention/status flags are Boolean; all lifecycle/lease/audit timestamps are Date and Time; and snapshots/diagnostics/provenance are Object. `ISendOrderOutboxClaims.generation` is Number, never Text. Preserve the newest claim generation for every claim key; the retention job removes only old released nonlatest generations. Lifecycle intents are monitored append-only records and require measured storage runway.
 
@@ -107,7 +108,7 @@ Before the first publication, follow the mandatory legacy migration in `STAGING_
 ### Webhook secret
 
 - Set a Backend-only Wix Secret named `ISTORE_ISEND_WEBHOOK_SECRET`. Do NOT commit the secret value to source control.
-- The webhook endpoint `POST /_functions/isendWebhook` expects an `X-ISEND-Signature` header with value `sha256=<hex>` where `<hex>` is the HMAC-SHA256 of the raw request body using the secret above.
+- The webhook endpoint `POST /_functions/isendWebhook` expects an `X-ISEND-Signature` header with value `sha256=<hex>` where `<hex>` is the HMAC-SHA256 of the raw request body using the secret above. Request bodies are limited to 1 MiB and oversized requests fail with HTTP 413 before parsing or side effects.
 
 Example (generate signature in Node):
 
@@ -141,6 +142,7 @@ When the iStore/iSend status maps to `DELIVERED` the integration will:
 - Update the mapping record in `ISendOrderMap.meta` with `deliveryTimestamp`, `lastKnownISendStatus`, and `lastStatusUpdatedAt`.
 - Persist a `DELIVERED` audit event in `ISendWebhookEvents`.
 - Create a pending email record in the `ISendPendingEmails` collection with the default delivery email subject and body.
+- Fail retryably with `isend-delivery-email-missing`, leave the webhook unprocessed, and keep poll reconciliation active if neither buyer nor billing email resolves.
 
 To send the email automatically, create a Wix Automation that triggers on new items in `ISendPendingEmails` and sends the contained `subject`/`body` to the `to` email. Alternatively, replace the pending-email step with a direct call to your transactional email provider by editing `backend/orderStateTransitions.js`.
 
@@ -157,7 +159,7 @@ To run the staging smoke-tests workflow you must add the following **repository*
 Once the secrets are added and you've pushed these workflow files to `main` (or your default branch), go to the Actions tab and run the `iSend Staging Smoke Tests` workflow (or trigger it via the `Run workflow` button). The workflow will:
 
 - Run `npm ci`, lint, unit tests, and secret-free smoke configuration checks on every pull request and push.
-- On scheduled or manual default-branch runs inside 10:00-22:00 MYT, require both direct iSend staging login and the protected `/_functions/testISendLoginFromWix?env=staging` probe to complete with authenticated-session evidence. Outside-window manual requests and non-default-branch live requests fail explicitly.
+- On scheduled or manual default-branch runs inside 10:00-22:00 MYT, require both direct iSend staging login and the protected `/_functions/testISendLoginFromWix` probe to complete with authenticated-session evidence. Outside-window manual requests and non-default-branch live requests fail explicitly.
 
 Make sure the Wix site is published and the Backend Secrets are set (Backend-only) before running the workflow.
 

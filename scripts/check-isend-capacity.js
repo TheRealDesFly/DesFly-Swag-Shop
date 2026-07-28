@@ -240,6 +240,20 @@ function calculateCapacityEvidence(input, options = {}) {
     'operationalHealthP95RuntimeMs',
     { min: Number.EPSILON },
   );
+  const outboxMaxRuntimeMs = requireFiniteNumber(input, 'outboxMaxRuntimeMs', {
+    min: Number.EPSILON,
+  });
+  const pollerMaxRuntimeMs = requireFiniteNumber(input, 'pollerMaxRuntimeMs', {
+    min: Number.EPSILON,
+  });
+  const retentionMaxRuntimeMs = requireFiniteNumber(input, 'retentionMaxRuntimeMs', {
+    min: Number.EPSILON,
+  });
+  const operationalHealthMaxRuntimeMs = requireFiniteNumber(
+    input,
+    'operationalHealthMaxRuntimeMs',
+    { min: Number.EPSILON },
+  );
   const wixJobRuntimeLimitMs = requireFiniteNumber(input, 'wixJobRuntimeLimitMs', { min: 1 });
   const providerRequestLimitPerServiceDay = requireFiniteNumber(
     input,
@@ -255,6 +269,16 @@ function calculateCapacityEvidence(input, options = {}) {
     input,
     'wixDataWriteRequestLimitPerMinute',
     { min: 1 },
+  );
+  const observedPeakWixDataReadRequestsPerMinute = requireFiniteNumber(
+    input,
+    'observedPeakWixDataReadRequestsPerMinute',
+    { min: Number.EPSILON },
+  );
+  const observedPeakWixDataWriteRequestsPerMinute = requireFiniteNumber(
+    input,
+    'observedPeakWixDataWriteRequestsPerMinute',
+    { min: Number.EPSILON },
   );
 
   const claimRowsGeneratedPerPeakDay = requireFiniteNumber(
@@ -343,6 +367,17 @@ function calculateCapacityEvidence(input, options = {}) {
     throw new Error(
       'currentLifecycleIntentCollectionItems cannot exceed wixLifecycleIntentCollectionItemLimit',
     );
+  }
+  const runtimePairs = [
+    ['outbox', outboxP95RuntimeMs, outboxMaxRuntimeMs],
+    ['poller', pollerP95RuntimeMs, pollerMaxRuntimeMs],
+    ['retention', retentionP95RuntimeMs, retentionMaxRuntimeMs],
+    ['operationalHealth', operationalHealthP95RuntimeMs, operationalHealthMaxRuntimeMs],
+  ];
+  for (const [name, p95RuntimeMs, maxRuntimeMs] of runtimePairs) {
+    if (maxRuntimeMs < p95RuntimeMs) {
+      throw new Error(`${name}MaxRuntimeMs cannot be less than ${name}P95RuntimeMs`);
+    }
   }
 
   const nominalOutboxOrdersPerProductiveDay = (
@@ -523,6 +558,34 @@ function calculateCapacityEvidence(input, options = {}) {
       'milliseconds',
     ),
     check(
+      'outbox-max-runtime',
+      outboxMaxRuntimeMs <= wixJobRuntimeLimitMs,
+      outboxMaxRuntimeMs,
+      wixJobRuntimeLimitMs,
+      'milliseconds',
+    ),
+    check(
+      'poller-max-runtime',
+      pollerMaxRuntimeMs <= wixJobRuntimeLimitMs,
+      pollerMaxRuntimeMs,
+      wixJobRuntimeLimitMs,
+      'milliseconds',
+    ),
+    check(
+      'retention-max-runtime',
+      retentionMaxRuntimeMs <= wixJobRuntimeLimitMs,
+      retentionMaxRuntimeMs,
+      wixJobRuntimeLimitMs,
+      'milliseconds',
+    ),
+    check(
+      'operational-health-max-runtime',
+      operationalHealthMaxRuntimeMs <= wixJobRuntimeLimitMs,
+      operationalHealthMaxRuntimeMs,
+      wixJobRuntimeLimitMs,
+      'milliseconds',
+    ),
+    check(
       'provider-request-budget',
       estimatedProviderRequestsPerServiceDay <= providerRequestLimitPerServiceDay,
       estimatedProviderRequestsPerServiceDay,
@@ -589,6 +652,20 @@ function calculateCapacityEvidence(input, options = {}) {
       'retention-write-rpm',
       retentionObservedWriteRequestsPerMinute <= safeWriteRequestsPerMinute,
       retentionObservedWriteRequestsPerMinute,
+      safeWriteRequestsPerMinute,
+      'requests/minute',
+    ),
+    check(
+      'wix-data-observed-peak-read-rpm',
+      observedPeakWixDataReadRequestsPerMinute <= safeReadRequestsPerMinute,
+      observedPeakWixDataReadRequestsPerMinute,
+      safeReadRequestsPerMinute,
+      'requests/minute',
+    ),
+    check(
+      'wix-data-observed-peak-write-rpm',
+      observedPeakWixDataWriteRequestsPerMinute <= safeWriteRequestsPerMinute,
+      observedPeakWixDataWriteRequestsPerMinute,
       safeWriteRequestsPerMinute,
       'requests/minute',
     ),
@@ -716,10 +793,16 @@ function calculateCapacityEvidence(input, options = {}) {
       pollerP95RuntimeMs,
       retentionP95RuntimeMs,
       operationalHealthP95RuntimeMs,
+      outboxMaxRuntimeMs,
+      pollerMaxRuntimeMs,
+      retentionMaxRuntimeMs,
+      operationalHealthMaxRuntimeMs,
       wixJobRuntimeLimitMs,
       providerRequestLimitPerServiceDay,
       wixDataReadRequestLimitPerMinute,
       wixDataWriteRequestLimitPerMinute,
+      observedPeakWixDataReadRequestsPerMinute,
+      observedPeakWixDataWriteRequestsPerMinute,
       maxQueueAgeHours,
       maxReconciliationAgeHours,
       currentClaimCollectionItems,

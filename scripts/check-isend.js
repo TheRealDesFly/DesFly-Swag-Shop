@@ -14,7 +14,10 @@ Environment variables supported (used as defaults):
 */
 
 const https = require('https');
-const { validateDirectISendRoot } = require('./check-staging-connection');
+const {
+  sanitizeError,
+  validateDirectISendRoot,
+} = require('./check-staging-connection');
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
@@ -257,6 +260,23 @@ async function checkLogin(baseUrl, user, pass, timeout, environment = 'staging')
   return { ok: false, attempts };
 }
 
+function formatLoginAttemptsForOutput(attempts, sensitiveUrls = []) {
+  return (attempts || []).map((attempt) => {
+    let requestPath;
+    try {
+      requestPath = attempt.url ? new URL(attempt.url).pathname : undefined;
+    } catch (error) {
+      requestPath = undefined;
+    }
+    return {
+      path: requestPath,
+      statusCode: Number.isInteger(attempt.statusCode) ? attempt.statusCode : undefined,
+      reason: attempt.reason,
+      error: attempt.err ? sanitizeError(attempt.err, sensitiveUrls) : undefined,
+    };
+  });
+}
+
 /**
  * Main CLI entrypoint.
  * It reads command-line flags, validates required credentials, and checks staging/production login endpoints.
@@ -295,11 +315,10 @@ async function main() {
     if (result.ok) {
       console.log(`  ${c.name} OK (session returned).`);
     } else {
-      console.error(`  ${c.name} FAILED`, JSON.stringify(result.attempts.map((attempt) => ({
-        path: attempt.url ? new URL(attempt.url).pathname : undefined,
-        statusCode: attempt.statusCode,
-        error: attempt.err && attempt.err.message,
-      }))));
+      console.error(
+        `  ${c.name} FAILED`,
+        JSON.stringify(formatLoginAttemptsForOutput(result.attempts, [c.url])),
+      );
       process.exit(1);
     }
   }
@@ -309,14 +328,15 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
-    console.error(error.message);
+  main().catch(() => {
+    console.error('iSend login check failed unexpectedly');
     process.exit(1);
   });
 }
 
 module.exports = {
   checkLogin,
+  formatLoginAttemptsForOutput,
   getAuthenticatedSessionEvidence,
   isAuthenticatedLoginResponse,
 };

@@ -37,6 +37,7 @@ vi.mock('backend/isendOrderOutbox', () => ({ requeueISendOrder: mocks.requeueISe
 import {
   get_testISendLoginFromWix,
   post_createFulfillmentFromWix,
+  post_isendWebhook,
   post_requeueISendOrder,
   post_runISendPoller,
 } from '../src/backend/http-functions';
@@ -77,17 +78,19 @@ describe('Wix HTTP functions', () => {
 
     expect(response).toMatchObject({ status: 401, body: { success: false } });
     expect(mocks.getSecret).not.toHaveBeenCalled();
+    expect(mocks.getConfiguredISendEnvironment).not.toHaveBeenCalled();
     expect(mocks.testISendLogin).not.toHaveBeenCalled();
   });
 
-  it('forces the protected diagnostic to staging and redacts the upstream root', async () => {
+  it('uses the authoritative staging environment and ignores caller overrides', async () => {
     const response = await get_testISendLoginFromWix({
       headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
       query: { environment: 'production', force: 'true' },
     });
 
     expect(response.status).toBe(200);
-    expect(mocks.testISendLogin).toHaveBeenCalledWith({ force: true, environment: 'staging' });
+    expect(mocks.getConfiguredISendEnvironment).toHaveBeenCalledTimes(1);
+    expect(mocks.testISendLogin).toHaveBeenCalledWith({ environment: 'staging' });
     expect(response.body).toMatchObject({
       success: true,
       environment: 'staging',
@@ -96,6 +99,49 @@ describe('Wix HTTP functions', () => {
       hasSessionCookie: true,
     });
     expect(response.body).not.toHaveProperty('baseUrl');
+  });
+
+  it('disables the staging diagnostic on a production-configured site', async () => {
+    mocks.getConfiguredISendEnvironment.mockResolvedValueOnce('production');
+
+    const response = await get_testISendLoginFromWix({
+      headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
+      query: { environment: 'staging', force: 'true' },
+    });
+
+    expect(response).toEqual({
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        code: 'staging-diagnostic-disabled',
+        message: 'Staging diagnostic is disabled for this site environment',
+      },
+    });
+    expect(mocks.testISendLogin).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the authoritative site environment is unavailable', async () => {
+    mocks.getConfiguredISendEnvironment.mockRejectedValueOnce(
+      new Error('internal secret-provider details'),
+    );
+
+    const response = await get_testISendLoginFromWix({
+      headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
+      query: { force: 'true' },
+    });
+
+    expect(response).toEqual({
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        code: 'endpoint-not-configured',
+        message: 'Endpoint is not configured',
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain('secret-provider');
+    expect(mocks.testISendLogin).not.toHaveBeenCalled();
   });
 
   it('returns a controlled unavailable response when the endpoint secret is missing', async () => {
@@ -141,11 +187,62 @@ describe('Wix HTTP functions', () => {
     });
   });
 
+  it('does not expose an unexpected webhook-handler error', async () => {
+    mocks.handleWebhook.mockRejectedValueOnce(new Error('internal provider and secret details'));
+
+    const response = await post_isendWebhook({ headers: {}, body: {} });
+
+    expect(response).toEqual({
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        message: 'Webhook processing failed',
+      },
+    });
+  });
+
+  it('preserves a controlled webhook-handler 413 response', async () => {
+    mocks.handleWebhook.mockResolvedValueOnce({
+      success: false,
+      status: 413,
+      code: 'request-body-too-large',
+      message: 'Request body exceeds the configured limit',
+    });
+
+    const response = await post_isendWebhook({ headers: {}, body: {} });
+
+    expect(response).toEqual({
+      status: 413,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        status: 413,
+        code: 'request-body-too-large',
+        message: 'Request body exceeds the configured limit',
+      },
+    });
+  });
+
   it('returns a failing HTTP status when the poller reports partial failures', async () => {
     mocks.runPoller.mockResolvedValueOnce({
       success: false,
       processedMappings: 1,
-      details: [{ stage: 'tracking', success: false }],
+      processed: 2,
+      details: [
+        {
+          stage: 'tracking',
+          success: false,
+          iSendNo: 'private-isend-order',
+          wixOrderId: 'private-wix-order',
+          error: 'upstream session and credential details',
+        },
+        {
+          stage: 'credential-secret-value',
+          success: false,
+          error: 'must not be reflected',
+        },
+      ],
     });
 
     const response = await post_runISendPoller({
@@ -153,11 +250,38 @@ describe('Wix HTTP functions', () => {
       body: { text: vi.fn().mockResolvedValue('{}') },
     });
 
-    expect(response).toMatchObject({
+    expect(response).toEqual({
       status: 500,
+      headers: { 'Content-Type': 'application/json' },
       body: {
         success: false,
-        details: [{ stage: 'tracking', success: false }],
+        code: 'isend-poller-failed',
+        message: 'iSend poller reported one or more failures',
+        processedMappings: 1,
+        processed: 2,
+        failureCount: 2,
+        failedStages: ['tracking'],
+      },
+    });
+    expect(JSON.stringify(response)).not.toMatch(
+      /private-isend-order|private-wix-order|session|credential|must not be reflected/,
+    );
+  });
+
+  it('does not expose an unexpected poller error', async () => {
+    mocks.runPoller.mockRejectedValueOnce(new Error('internal upstream and session details'));
+
+    const response = await post_runISendPoller({
+      headers: { 'x-isend-poller-secret': 'trigger-secret' },
+      body: { text: vi.fn().mockResolvedValue('{}') },
+    });
+
+    expect(response).toEqual({
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        message: 'iSend poller failed',
       },
     });
   });
@@ -380,6 +504,30 @@ describe('Wix HTTP functions', () => {
         code: 'fulfillment-reconciliation-required',
         message: 'Fulfillment outcome requires operator reconciliation',
         idempotencyStatus: 'unknown_outcome',
+      },
+    });
+  });
+
+  it('does not expose an unexpected fulfillment error', async () => {
+    mocks.createFulfillment.mockRejectedValueOnce(new Error('internal Wix response details'));
+
+    const response = await post_createFulfillmentFromWix({
+      headers: { 'x-isend-fulfillment-secret': 'fulfillment-secret' },
+      body: {
+        text: vi.fn().mockResolvedValue(JSON.stringify({
+          orderId: 'wix-order-1',
+          iSendOrderNo: 'ISEND-1',
+          trackingNumber: 'TRACK123',
+        })),
+      },
+    });
+
+    expect(response).toEqual({
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        message: 'Fulfillment request failed',
       },
     });
   });

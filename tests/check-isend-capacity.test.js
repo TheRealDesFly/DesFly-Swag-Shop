@@ -48,10 +48,16 @@ function acceptedEvidence(overrides = {}) {
     pollerP95RuntimeMs: 25_000,
     retentionP95RuntimeMs: 60_000,
     operationalHealthP95RuntimeMs: 10_000,
+    outboxMaxRuntimeMs: 40_000,
+    pollerMaxRuntimeMs: 50_000,
+    retentionMaxRuntimeMs: 90_000,
+    operationalHealthMaxRuntimeMs: 20_000,
     wixJobRuntimeLimitMs: 14 * 60 * 1000,
     providerRequestLimitPerServiceDay: 500,
     wixDataReadRequestLimitPerMinute: 1000,
     wixDataWriteRequestLimitPerMinute: 500,
+    observedPeakWixDataReadRequestsPerMinute: 120,
+    observedPeakWixDataWriteRequestsPerMinute: 60,
     claimRowsGeneratedPerPeakDay: 180,
     uniqueClaimKeysGeneratedPerPeakDay: 20,
     eligibleClaimRowsPerDay: 160,
@@ -156,6 +162,31 @@ describe('iSend capacity evidence', () => {
     expect(() => calculateCapacityEvidence(incomplete, OPTIONS)).toThrow(
       'operationalHealthP95RuntimeMs',
     );
+  });
+
+  it('requires measured maximum runtimes and aggregate Wix Data peak rates', () => {
+    expect(() => calculateCapacityEvidence(acceptedEvidence({
+      outboxMaxRuntimeMs: 0,
+    }), OPTIONS)).toThrow('outboxMaxRuntimeMs must be at least');
+
+    expect(() => calculateCapacityEvidence(acceptedEvidence({
+      pollerMaxRuntimeMs: 10_000,
+    }), OPTIONS)).toThrow(
+      'pollerMaxRuntimeMs cannot be less than pollerP95RuntimeMs',
+    );
+
+    const report = calculateCapacityEvidence(acceptedEvidence({
+      retentionMaxRuntimeMs: 15 * 60 * 1000,
+      observedPeakWixDataReadRequestsPerMinute: 900,
+      observedPeakWixDataWriteRequestsPerMinute: 450,
+    }), OPTIONS);
+    const failed = report.checks.filter((entry) => !entry.passed).map((entry) => entry.name);
+
+    expect(failed).toEqual(expect.arrayContaining([
+      'retention-max-runtime',
+      'wix-data-observed-peak-read-rpm',
+      'wix-data-observed-peak-write-rpm',
+    ]));
   });
 
   it('makes retention generation, scan, delete, cycle, and storage shortfalls fail release', () => {

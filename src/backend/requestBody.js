@@ -2,13 +2,15 @@
  * Error raised when an HTTP request body cannot be consumed as JSON.
  */
 export class RequestBodyError extends Error {
-  constructor(message, code = 'invalid-request-body') {
+  constructor(message, code = 'invalid-request-body', status = 400) {
     super(message);
     this.name = 'RequestBodyError';
     this.code = code;
-    this.status = 400;
+    this.status = status;
   }
 }
+
+export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
 function bodyToBytes(body) {
   if (Buffer.isBuffer(body)) {
@@ -26,11 +28,54 @@ function bodyToBytes(body) {
   return null;
 }
 
+function getHeader(request, name) {
+  const headers = request && request.headers ? request.headers : {};
+  const normalizedName = String(name || '').toLowerCase();
+  for (const [headerName, value] of Object.entries(headers)) {
+    if (String(headerName).toLowerCase() === normalizedName) return value;
+  }
+  return undefined;
+}
+
+function normalizeMaxBytes(value) {
+  const normalized = Number(value ?? MAX_REQUEST_BODY_BYTES);
+  if (!Number.isSafeInteger(normalized) || normalized <= 0) {
+    throw new TypeError('maxBytes must be a positive safe integer');
+  }
+  return normalized;
+}
+
+function requestBodyTooLarge(maxBytes) {
+  return new RequestBodyError(
+    `Request body exceeds the ${maxBytes}-byte limit`,
+    'request-body-too-large',
+    413,
+  );
+}
+
+function assertWithinLimit(rawBytes, maxBytes) {
+  if (rawBytes.length > maxBytes) throw requestBodyTooLarge(maxBytes);
+  return rawBytes;
+}
+
+function assertDeclaredLengthWithinLimit(request, maxBytes) {
+  const rawValue = getHeader(request, 'content-length');
+  if (rawValue === undefined || rawValue === null || rawValue === '') return;
+  const normalized = String(rawValue).trim();
+  if (!/^\d+$/.test(normalized)) return;
+  const declaredLength = Number(normalized);
+  if (!Number.isSafeInteger(declaredLength) || declaredLength > maxBytes) {
+    throw requestBodyTooLarge(maxBytes);
+  }
+}
+
 /**
  * Consume a Wix HTTP request body once and retain the bytes used for signing.
  * String and object bodies are supported for local fixtures and older callers.
  */
-export async function consumeRequestBody(request) {
+export async function consumeRequestBody(request, options = {}) {
+  const maxBytes = normalizeMaxBytes(options.maxBytes);
+  assertDeclaredLengthWithinLimit(request, maxBytes);
   const body = request && request.body;
 
   if (body === undefined || body === null) {
@@ -39,11 +84,13 @@ export async function consumeRequestBody(request) {
 
   const existingBytes = bodyToBytes(body);
   if (existingBytes) {
+    assertWithinLimit(existingBytes, maxBytes);
     return { rawBody: existingBytes.toString('utf8'), rawBytes: existingBytes };
   }
 
   if (typeof body === 'string') {
-    return { rawBody: body, rawBytes: Buffer.from(body, 'utf8') };
+    const rawBytes = assertWithinLimit(Buffer.from(body, 'utf8'), maxBytes);
+    return { rawBody: body, rawBytes };
   }
 
   // Wix exposes the untouched request payload through `body.buffer()`. Prefer
@@ -61,6 +108,7 @@ export async function consumeRequestBody(request) {
     if (!rawBytes) {
       throw new RequestBodyError('Unable to read request body', 'request-body-read-failed');
     }
+    assertWithinLimit(rawBytes, maxBytes);
     return { rawBody: rawBytes.toString('utf8'), rawBytes };
   }
 
@@ -73,7 +121,8 @@ export async function consumeRequestBody(request) {
     }
 
     const normalizedBody = rawBody === undefined || rawBody === null ? '' : String(rawBody);
-    return { rawBody: normalizedBody, rawBytes: Buffer.from(normalizedBody, 'utf8') };
+    const rawBytes = assertWithinLimit(Buffer.from(normalizedBody, 'utf8'), maxBytes);
+    return { rawBody: normalizedBody, rawBytes };
   }
 
   try {
@@ -81,8 +130,10 @@ export async function consumeRequestBody(request) {
     if (rawBody === undefined) {
       throw new Error('Body is not JSON serializable');
     }
-    return { rawBody, rawBytes: Buffer.from(rawBody, 'utf8') };
+    const rawBytes = assertWithinLimit(Buffer.from(rawBody, 'utf8'), maxBytes);
+    return { rawBody, rawBytes };
   } catch (error) {
+    if (error instanceof RequestBodyError) throw error;
     throw new RequestBodyError('Request body must be valid JSON', 'invalid-json');
   }
 }
@@ -116,7 +167,7 @@ export function parseJsonBody(rawBody, options = {}) {
  * Convenience helper for endpoints that do not need to verify a raw signature.
  */
 export async function consumeJsonRequestBody(request, options = {}) {
-  const consumed = await consumeRequestBody(request);
+  const consumed = await consumeRequestBody(request, options);
   return Object.assign({}, consumed, { payload: parseJsonBody(consumed.rawBody, options) });
 }
 

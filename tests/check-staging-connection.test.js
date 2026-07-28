@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const {
   getAuthenticatedSessionEvidence,
   isApprovedISendPath,
+  sanitizeError,
   sanitizeSetupForOutput,
   setupMeetsRequirements,
   summarizeResults,
@@ -231,6 +232,30 @@ describe('staging smoke result semantics', () => {
     expect(sanitized.stagingUrl).not.toHaveProperty('port');
     expect(sanitized.stagingUrl).not.toHaveProperty('baseUrl');
     expect(JSON.stringify(sanitized)).not.toContain('staging.istoreisend-wms.com');
+  });
+
+  it('bounds and redacts configured hosts and credentials from network errors', () => {
+    const privateWixUrl = 'https://private-wix.example';
+    const privateISendUrl = 'https://private-isend.example:5191/api/login';
+    const error = Object.assign(
+      new Error(
+        `getaddrinfo ENOTFOUND private-wix.example; `
+        + `connect ECONNREFUSED private-isend.example:5191; `
+        + `request https://user:top-secret@private-isend.example:5191/api/login; `
+        + `sessionPassword=hidden ${'x'.repeat(600)}`,
+      ),
+      { code: 'ENOTFOUND' },
+    );
+
+    const sanitized = sanitizeError(error, [privateWixUrl, privateISendUrl]);
+
+    expect(sanitized).toContain('ENOTFOUND');
+    expect(sanitized).toContain('[host]');
+    expect(sanitized).toContain('[url]');
+    expect(sanitized).not.toMatch(
+      /private-wix|private-isend|top-secret|hidden|sessionPassword=hidden/,
+    );
+    expect(sanitized.length).toBeLessThanOrEqual(500);
   });
 
   it('rejects contradictory require and skip flags', () => {

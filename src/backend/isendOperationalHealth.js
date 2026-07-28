@@ -1,4 +1,5 @@
 import wixData from 'wix-data';
+import { getSecret } from 'wix-secrets-backend';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import {
   CLAIM_RETENTION_STATE_COLLECTION,
@@ -13,6 +14,7 @@ const LIFECYCLE_INTENT_COLLECTION = 'ISendOrderLifecycleIntents';
 const PROCESSED_EVENT_COLLECTION = 'ISendProcessedEvents';
 const FULFILLMENT_CLAIM_SCAN_LIMIT = 1000;
 const MINUTES_PER_DAY = 24 * 60;
+export const ISEND_DEPLOYED_REVISION_SECRET = 'ISTORE_ISEND_DEPLOYED_REVISION';
 const TRUSTED_READ_OPTIONS = {
   suppressAuth: true,
   suppressHooks: true,
@@ -104,8 +106,21 @@ function resolveThresholds(options = {}) {
   );
 }
 
+function normalizeRevision(value) {
+  const revision = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return /^[a-f0-9]{40}$/.test(revision) ? revision : null;
+}
+
 function validCapacityRevision(value) {
-  return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
+  return Boolean(normalizeRevision(value));
+}
+
+async function resolveDeployedRevision() {
+  try {
+    return normalizeRevision(await getSecret(ISEND_DEPLOYED_REVISION_SECRET));
+  } catch {
+    return null;
+  }
 }
 
 function validProvenance(value) {
@@ -120,6 +135,12 @@ function evaluateSensitiveDataRetentionPolicy(capacityState, now, thresholds, al
     capacityState?.webhookPayloadRetentionDays,
   );
   const sentEmailRetentionDays = positiveNumber(capacityState?.sentEmailRetentionDays);
+  const terminalOutboxSnapshotRetentionDays = positiveNumber(
+    capacityState?.terminalOutboxSnapshotRetentionDays,
+  );
+  const fulfillmentClaimResultRetentionDays = positiveNumber(
+    capacityState?.fulfillmentClaimResultRetentionDays,
+  );
   const lastVerifiedAt = asDate(capacityState?.sensitiveDataRetentionLastVerifiedAt);
   const lastVerifiedAgeMinutes = ageMinutes(now, lastVerifiedAt);
   const valid = (
@@ -128,8 +149,12 @@ function evaluateSensitiveDataRetentionPolicy(capacityState, now, thresholds, al
     && Boolean(capacityState.sensitiveDataRetentionPolicyRevision.trim())
     && Boolean(webhookPayloadRetentionDays)
     && Boolean(sentEmailRetentionDays)
+    && Boolean(terminalOutboxSnapshotRetentionDays)
+    && Boolean(fulfillmentClaimResultRetentionDays)
     && capacityState?.webhookPayloadRetentionEnforcedExternally === true
     && capacityState?.sentEmailRetentionEnforcedExternally === true
+    && capacityState?.terminalOutboxSnapshotScrubEnforcedExternally === true
+    && capacityState?.fulfillmentClaimResultScrubEnforcedExternally === true
     && Boolean(lastVerifiedAt)
     && validProvenance(capacityState?.sensitiveDataRetentionPolicyProvenance)
   );
@@ -138,10 +163,18 @@ function evaluateSensitiveDataRetentionPolicy(capacityState, now, thresholds, al
       approved: capacityState?.sensitiveDataRetentionPolicyApproved === true,
       webhookRetentionConfigured: Boolean(webhookPayloadRetentionDays),
       sentEmailRetentionConfigured: Boolean(sentEmailRetentionDays),
+      terminalOutboxSnapshotRetentionConfigured:
+        Boolean(terminalOutboxSnapshotRetentionDays),
+      fulfillmentClaimResultRetentionConfigured:
+        Boolean(fulfillmentClaimResultRetentionDays),
       webhookEnforcementVerified:
         capacityState?.webhookPayloadRetentionEnforcedExternally === true,
       sentEmailEnforcementVerified:
         capacityState?.sentEmailRetentionEnforcedExternally === true,
+      terminalOutboxSnapshotScrubEnforcementVerified:
+        capacityState?.terminalOutboxSnapshotScrubEnforcedExternally === true,
+      fulfillmentClaimResultScrubEnforcementVerified:
+        capacityState?.fulfillmentClaimResultScrubEnforcedExternally === true,
       lastVerifiedAtValid: Boolean(lastVerifiedAt),
       provenanceValid: validProvenance(capacityState?.sensitiveDataRetentionPolicyProvenance),
     }));
@@ -156,10 +189,16 @@ function evaluateSensitiveDataRetentionPolicy(capacityState, now, thresholds, al
       capacityState?.sensitiveDataRetentionPolicyApproved === true,
     webhookPayloadRetentionDays,
     sentEmailRetentionDays,
+    terminalOutboxSnapshotRetentionDays,
+    fulfillmentClaimResultRetentionDays,
     webhookPayloadRetentionEnforcedExternally:
       capacityState?.webhookPayloadRetentionEnforcedExternally === true,
     sentEmailRetentionEnforcedExternally:
       capacityState?.sentEmailRetentionEnforcedExternally === true,
+    terminalOutboxSnapshotScrubEnforcedExternally:
+      capacityState?.terminalOutboxSnapshotScrubEnforcedExternally === true,
+    fulfillmentClaimResultScrubEnforcedExternally:
+      capacityState?.fulfillmentClaimResultScrubEnforcedExternally === true,
     sensitiveDataRetentionLastVerifiedAt: lastVerifiedAt
       ? lastVerifiedAt.toISOString()
       : null,
@@ -218,6 +257,7 @@ function addRetentionAlerts({
   lifecycleIntentCount,
   staleUnreleasedCount,
   environment,
+  deployedRevision,
   now,
   thresholds,
 }) {
@@ -287,8 +327,23 @@ function addRetentionAlerts({
   );
   const capacityMeasuredAt = asDate(capacityState?.capacityEvidenceMeasuredAt);
   const capacityEvidenceAgeMinutes = ageMinutes(now, capacityMeasuredAt);
+  const capacityEvidenceRevision = normalizeRevision(
+    capacityState?.capacityEvidenceRevision,
+  );
+  const revisionMatches = Boolean(
+    capacityEvidenceRevision
+    && deployedRevision
+    && capacityEvidenceRevision === deployedRevision,
+  );
+  if (!deployedRevision) {
+    alerts.push(alert('capacity-evidence-deployed-revision-invalid', 1));
+  } else if (capacityEvidenceRevision && !revisionMatches) {
+    alerts.push(alert('capacity-evidence-revision-mismatch', 1));
+  }
   const capacityMetadataValid = (
-    validCapacityRevision(capacityState?.capacityEvidenceRevision)
+    Boolean(capacityEvidenceRevision)
+    && Boolean(deployedRevision)
+    && revisionMatches
     && capacityState?.capacityEvidenceEnvironment === environment
     && Boolean(capacityMeasuredAt)
     && validProvenance(capacityState?.capacityEvidenceProvenance)
@@ -298,6 +353,8 @@ function addRetentionAlerts({
       itemLimitConfigured: Boolean(claimItemLimit),
       uniqueKeyRateConfigured: Boolean(measuredUniqueClaimKeysPerDay),
       revisionValid: validCapacityRevision(capacityState?.capacityEvidenceRevision),
+      deployedRevisionValid: Boolean(deployedRevision),
+      revisionMatches,
       environmentMatches: capacityState?.capacityEvidenceEnvironment === environment,
       measuredAtValid: Boolean(capacityMeasuredAt),
       provenanceValid: Boolean(validProvenance(capacityState?.capacityEvidenceProvenance)),
@@ -414,7 +471,7 @@ function addRetentionAlerts({
     lifecycleIntentRunwayDays,
     ...sensitiveDataRetentionMetrics,
     capacityEvidenceRevision: capacityMetadataValid
-      ? capacityState.capacityEvidenceRevision
+      ? capacityEvidenceRevision
       : null,
     capacityEvidenceMeasuredAt: capacityMeasuredAt
       ? capacityMeasuredAt.toISOString()
@@ -435,6 +492,7 @@ export async function getISendOperationalHealth(options = {}) {
   const environment = await getConfiguredISendEnvironment({
     environment: options.environment,
   });
+  const deployedRevision = await resolveDeployedRevision();
   const thresholds = resolveThresholds(options);
   const staleProcessingBefore = new Date(
     now.getTime() - (thresholds.staleProcessingMinutes * 60000),
@@ -607,6 +665,7 @@ export async function getISendOperationalHealth(options = {}) {
     lifecycleIntentCount: resultCount(lifecycleIntentCountResult),
     staleUnreleasedCount: resultCount(staleUnreleased),
     environment,
+    deployedRevision,
     now,
     thresholds,
   });
