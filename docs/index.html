@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DesFly — Weather Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>DesFly Weather Dashboard</h1>
+
+    <p>This is a small, self-contained weather dashboard you can use on the DesFly site. The site root for the Wix content will remain the Wix homepage; this dashboard lives in the GitHub Pages docs/ folder and can be published together with the rest of the mirrored site.</p>
+
+    <form id="search-form" class="search">
+      <input id="search-input" name="q" type="search" placeholder="Search city or place (e.g., London, New York)" aria-label="Search city" required />
+      <button type="submit">Search</button>
+      <button id="use-loc" type="button" title="Use my location">Use my location</button>
+    </form>
+
+    <section id="status" class="status" aria-live="polite"></section>
+
+    <section id="current" class="card hidden" aria-labelledby="current-title">
+      <div class="card-header">
+        <h2 id="current-title">Current weather</h2>
+        <div id="place" class="place"></div>
+      </div>
+      <div class="current-body">
+        <div class="temp" id="temperature">--°</div>
+        <div class="details">
+          <div id="condition" class="condition">--</div>
+          <div id="extras" class="extras"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="daily" class="hidden">
+      <h3>7-day forecast</h3>
+      <div id="forecast" class="forecast-grid"></div>
+    </section>
+
+    <footer class="footer">
+      <small>Data from <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a> and <a href="https://nominatim.openstreetmap.org" target="_blank" rel="noopener">Nominatim (OpenStreetMap)</a>. No API key required.</small>
+    </footer>
+
+    <hr />
+    <p>Wix homepage (brand): <a href="https://therealdesfly.wixsite.com/desflyfuturebrand" target="_blank" rel="noopener">therealdesfly.wixsite.com/desflyfuturebrand</a></p>
+  </main>
+
+  <script src="script.js" type="module"></script>
+</body>
+</html>
