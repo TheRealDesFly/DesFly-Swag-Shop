@@ -2,6 +2,8 @@
 
 Use this checklist before publishing or running the staging smoke test.
 
+For workstation prerequisites, private `.env` setup, offline mock tests, and the direct read-only development login gate, complete [DEVELOPMENT_SETUP.md](DEVELOPMENT_SETUP.md) first.
+
 ## Wix Backend Secrets
 
 Set these in Wix as backend-only secrets:

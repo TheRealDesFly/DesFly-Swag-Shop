@@ -4,6 +4,8 @@ This repo is part of Git Integration & Wix CLI, a set of tools that allows you t
 
 Connect your site to GitHub, develop in your favorite IDE, test your code in real time, and publish your site from the command line.
 
+For the governed local iStore/iSend workflow, follow [DEVELOPMENT_SETUP.md](DEVELOPMENT_SETUP.md) before creating a Wix preview or publishing code.
+
 ## Set up this repository in your IDE
 This repo is connected to a Wix site. That site tracks this repo's default branch. Any code committed and pushed to that branch from your local IDE appears on the site.
 
@@ -18,10 +20,9 @@ To set up your local environment and start coding locally, do the following:
 1. Open your terminal and navigate to where you want to store the repo.
 1. Clone the repo by running `git clone <your-repository-url>`.
 1. Navigate to the repo's directory by running `cd <directory-name>`.
-1. Install the repo's dependencies by running `npm install` or `yarn install`.
+1. Install the locked repo dependencies by running `npm ci`.
 1. If you need refreshed Wix type definitions, run `npm run sync-types` from an interactive terminal.
-1. Install the Wix CLI by running `npm install -g @wix/cli` or `yarn global add @wix/cli`.  
-   Once you've installed the CLI globally, you can use it with any Wix site's repo.
+1. Use the project-local Wix CLI through `npm exec wix --`; a global installation is optional.
 
 For more information, see [Setting up Git Integration & Wix CLI](https://support.wix.com/en/article/velo-setting-up-git-integration-wix-cli-beta).
 
