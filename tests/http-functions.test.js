@@ -21,7 +21,17 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('wix-secrets-backend', () => ({ getSecret: mocks.getSecret }));
-vi.mock('backend/isendService', () => ({ testISendLogin: mocks.testISendLogin }));
+vi.mock('backend/isendService', () => ({
+  ISEND_LOGIN_DIAGNOSTIC_BUILD: 'isend-login-diagnostic-v2',
+  classifyISendDiagnosticError: (error) => ({
+    diagnosticBuild: 'isend-login-diagnostic-v2',
+    phase: error.phase || 'unknown',
+    failureClass: error.failureClass || 'indeterminate',
+    attemptCount: error.attemptCount || 0,
+    hasUpstreamResponse: Boolean(error.hasUpstreamResponse),
+  }),
+  testISendLogin: mocks.testISendLogin,
+}));
 vi.mock('backend/orderFulfillment', () => ({
   createISendSingleParcelFulfillment: mocks.createFulfillment,
   extractISendParcelContractMetadata: mocks.extractParcelContract,
@@ -93,12 +103,54 @@ describe('Wix HTTP functions', () => {
     expect(mocks.testISendLogin).toHaveBeenCalledWith({ environment: 'staging' });
     expect(response.body).toMatchObject({
       success: true,
+      diagnosticBuild: 'isend-login-diagnostic-v2',
       environment: 'staging',
       hasSessionId: true,
       hasSessionPassword: true,
       hasSessionCookie: true,
     });
     expect(response.body).not.toHaveProperty('baseUrl');
+    expect(response.body).not.toHaveProperty('loginPath');
+    expect(response.body).not.toHaveProperty('checkedAt');
+    expect(response.body).not.toHaveProperty('serviceWindow');
+  });
+
+  it('returns and logs only allowlisted diagnostic metadata on failure', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const secretSentinels = [
+      'https://private.example/secret-path',
+      'sentinel-user',
+      'sentinel-password',
+      'JSESSIONID=sentinel-cookie',
+      'sentinel-session-id',
+    ];
+    const failure = Object.assign(new Error(secretSentinels.join(' ')), {
+      failureClass: 'outbound-network',
+      phase: 'outbound-request',
+      attemptCount: 1,
+      hasUpstreamResponse: false,
+      requestPath: '/secret-path',
+      responseBody: secretSentinels,
+    });
+    mocks.testISendLogin.mockRejectedValueOnce(failure);
+
+    const response = await get_testISendLoginFromWix({
+      headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
+      query: {},
+    });
+
+    expect(response.status).toBe(500);
+    expect(response.body.diagnostics).toEqual({
+      diagnosticBuild: 'isend-login-diagnostic-v2',
+      phase: 'outbound-request',
+      failureClass: 'outbound-network',
+      attemptCount: 1,
+      hasUpstreamResponse: false,
+    });
+    const emitted = JSON.stringify({ response, calls: consoleError.mock.calls });
+    secretSentinels.forEach((sentinel) => expect(emitted).not.toContain(sentinel));
+    expect(emitted).not.toContain('/secret-path');
+    consoleError.mockRestore();
   });
 
   it('disables the staging diagnostic on a production-configured site', async () => {

@@ -1,6 +1,10 @@
 import { ok, serverError } from 'wix-http-functions';
 import crypto from 'crypto';
-import { testISendLogin } from 'backend/isendService';
+import {
+  classifyISendDiagnosticError,
+  ISEND_LOGIN_DIAGNOSTIC_BUILD,
+  testISendLogin,
+} from 'backend/isendService';
 import {
   createISendSingleParcelFulfillment,
   extractISendParcelContractMetadata,
@@ -149,21 +153,21 @@ export async function get_testISendLoginFromWix(request) {
       },
       body: {
         success: result.success,
+        diagnosticBuild: ISEND_LOGIN_DIAGNOSTIC_BUILD,
         skipped: result.skipped,
         reason: result.reason,
         environment: result.environment,
-        loginPath: result.loginPath,
         hasSessionId: result.hasSessionId,
         hasSessionPassword: result.hasSessionPassword,
         hasSessionCookie: result.hasSessionCookie,
-        checkedAt: result.checkedAt,
-        serviceWindow: result.serviceWindow,
       },
     });
   } catch (error) {
     if (error instanceof SecretConfigurationError) {
       return endpointConfigurationErrorResponse();
     }
+    const diagnostics = classifyISendDiagnosticError(error);
+    console.error('iSend staging diagnostic failed', diagnostics);
     return serverError({
       headers: {
         'Content-Type': 'application/json',
@@ -171,12 +175,7 @@ export async function get_testISendLoginFromWix(request) {
       body: {
         success: false,
         message: 'iSend staging diagnostic failed',
-        diagnostics: {
-          requestPath: error.requestPath,
-          upstreamStatus: error.upstreamStatus,
-          upstreamContentType: error.upstreamContentType,
-          attemptedPaths: error.attemptedPaths,
-        },
+        diagnostics,
       },
     });
   }

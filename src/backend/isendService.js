@@ -15,6 +15,83 @@ const SERVICE_START_HOUR_MYT = 10;
 const SERVICE_END_HOUR_MYT = 22;
 const REQUEST_TIMEOUT_MS = 20000;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
+export const ISEND_LOGIN_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v2';
+
+const SAFE_DIAGNOSTIC_FAILURE_CLASSES = new Set([
+  'configuration',
+  'url-validation',
+  'outbound-network',
+  'outbound-timeout',
+  'upstream-redirect',
+  'upstream-http',
+  'invalid-response',
+  'authentication-rejected',
+  'authenticated-session-missing',
+  'indeterminate',
+]);
+
+function safeUpstreamStatus(value) {
+  const status = Number(value);
+  return Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : undefined;
+}
+
+function failureClassForError(error) {
+  const source = error && typeof error === 'object' ? error : {};
+  if (SAFE_DIAGNOSTIC_FAILURE_CLASSES.has(source.failureClass)) {
+    return source.failureClass;
+  }
+  if (source.code === 'invalid-isend-url') return 'url-validation';
+  if (source.code === 'isend-request-timeout') return 'outbound-timeout';
+  if (source.code === 'isend-redirect-rejected') return 'upstream-redirect';
+  if (source.code === 'isend-invalid-json-response') return 'invalid-response';
+  if (source.code === 'isend-http-error') return 'upstream-http';
+  if (safeUpstreamStatus(source.upstreamStatus)) return 'upstream-http';
+
+  const message = String(source.message || '');
+  if (/missing wix secret|missing isend url|invalid isend environment/i.test(message)) {
+    return 'configuration';
+  }
+  if (source.name === 'TypeError' || source.name === 'AbortError') {
+    return 'outbound-network';
+  }
+  return 'indeterminate';
+}
+
+export function classifyISendDiagnosticError(error) {
+  const source = error && typeof error === 'object' ? error : {};
+  const failureClass = failureClassForError(source);
+  const attemptedPaths = Array.isArray(source.attemptedPaths) ? source.attemptedPaths : [];
+  const attemptCount = Number.isSafeInteger(source.attemptCount) && source.attemptCount >= 0
+    ? source.attemptCount
+    : attemptedPaths.length;
+  const upstreamStatus = safeUpstreamStatus(source.upstreamStatus);
+  const hasUpstreamResponse = Boolean(
+    source.hasUpstreamResponse
+    || upstreamStatus
+    || attemptedPaths.some((attempt) => Boolean(
+      attempt && (attempt.hasUpstreamResponse || safeUpstreamStatus(attempt.upstreamStatus)),
+    )),
+  );
+  const phase = failureClass === 'configuration' || failureClass === 'url-validation'
+    ? 'configuration'
+    : failureClass === 'outbound-network' || failureClass === 'outbound-timeout'
+      ? 'outbound-request'
+      : failureClass === 'authentication-rejected'
+        || failureClass === 'authenticated-session-missing'
+        ? 'authentication'
+        : failureClass === 'indeterminate' ? 'unknown' : 'upstream-response';
+
+  return {
+    diagnosticBuild: ISEND_LOGIN_DIAGNOSTIC_BUILD,
+    phase,
+    failureClass,
+    attemptCount,
+    hasUpstreamResponse,
+    ...(upstreamStatus ? { upstreamStatus } : {}),
+  };
+}
 
 
 /**
@@ -304,6 +381,9 @@ async function postJson(url, body, headers = {}, options = {}) {
     data = text ? JSON.parse(text) : {};
   } catch (error) {
     const responseError = new Error(`iStore iSend returned non-JSON response (${response.status}): ${text.slice(0, 300)}`);
+    responseError.code = 'isend-invalid-json-response';
+    responseError.failureClass = 'invalid-response';
+    responseError.hasUpstreamResponse = true;
     responseError.upstreamStatus = response.status;
     responseError.upstreamContentType = response.headers && response.headers.get
       ? response.headers.get('content-type')
@@ -314,6 +394,9 @@ async function postJson(url, body, headers = {}, options = {}) {
 
   if (!response.ok) {
     const responseError = new Error(`iStore iSend HTTP ${response.status}: ${JSON.stringify(data)}`);
+    responseError.code = 'isend-http-error';
+    responseError.failureClass = 'upstream-http';
+    responseError.hasUpstreamResponse = true;
     responseError.upstreamStatus = response.status;
     responseError.upstreamContentType = response.headers && response.headers.get
       ? response.headers.get('content-type')
@@ -375,6 +458,10 @@ export async function loginToISend(options = {}) {
 
       attempts.push({
         requestPath: getUrlPath(url),
+        failureClass: data.success
+          ? 'authenticated-session-missing'
+          : 'authentication-rejected',
+        hasUpstreamResponse: true,
         message: `iStore iSend login failed: ${JSON.stringify(data.msgList || data)}`,
       });
     } catch (error) {
@@ -382,6 +469,10 @@ export async function loginToISend(options = {}) {
         requestPath: error.requestPath || getUrlPath(url),
         upstreamStatus: error.upstreamStatus,
         upstreamContentType: error.upstreamContentType,
+        failureClass: failureClassForError(error),
+        hasUpstreamResponse: Boolean(
+          error.hasUpstreamResponse || safeUpstreamStatus(error.upstreamStatus),
+        ),
         message: error.message,
       });
     }
@@ -392,8 +483,13 @@ export async function loginToISend(options = {}) {
     requestPath: attempt.requestPath,
     upstreamStatus: attempt.upstreamStatus,
     upstreamContentType: attempt.upstreamContentType,
+    failureClass: attempt.failureClass,
+    hasUpstreamResponse: attempt.hasUpstreamResponse,
   }));
   const lastAttempt = attempts[attempts.length - 1] || {};
+  loginError.failureClass = lastAttempt.failureClass || 'indeterminate';
+  loginError.attemptCount = attempts.length;
+  loginError.hasUpstreamResponse = attempts.some((attempt) => attempt.hasUpstreamResponse);
   loginError.requestPath = lastAttempt.requestPath;
   loginError.upstreamStatus = lastAttempt.upstreamStatus;
   loginError.upstreamContentType = lastAttempt.upstreamContentType;

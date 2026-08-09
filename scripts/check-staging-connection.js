@@ -23,6 +23,7 @@ const SERVICE_END_HOUR_MYT = 22;
 const DEFAULT_TIMEOUT_MS = 20000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
+const EXPECTED_WIX_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v2';
 const OWNER_APPROVED_STAGING_LOGIN_ORIGIN_FINGERPRINT =
   '36dc1cea96d6bb7e9e448ebe63e4511488c3fc9c04f91adb4535a6d0e90a36cb';
 const ISEND_ENDPOINT_ALLOWLIST = Object.freeze({
@@ -909,10 +910,12 @@ async function checkWixEndpoint(options) {
   const hasSessionPassword = Boolean(result.body) && result.body.hasSessionPassword === true;
   const hasSessionCookie = Boolean(result.body) && result.body.hasSessionCookie === true;
   const hasAuthenticatedSession = (hasSessionId && hasSessionPassword) || hasSessionCookie;
+  const diagnosticBuild = result.body && result.body.diagnosticBuild;
   if (!result.ok
     || !result.body
     || (!result.body.success && !result.body.skipped)
-    || (result.body.success && !hasAuthenticatedSession)) {
+    || (result.body.success && !hasAuthenticatedSession)
+    || (result.body.success && diagnosticBuild !== EXPECTED_WIX_DIAGNOSTIC_BUILD)) {
     const message = result.body && (result.body.message || result.body.reason)
       ? `: ${result.body.message || result.body.reason}`
       : '';
@@ -921,7 +924,10 @@ async function checkWixEndpoint(options) {
       : '';
     const sessionMessage = result.body && result.body.success && !hasAuthenticatedSession
       ? ': login reported success without an authenticated session'
-      : message;
+      : result.body && result.body.success
+        && diagnosticBuild !== EXPECTED_WIX_DIAGNOSTIC_BUILD
+        ? ': diagnostic build marker does not match the reviewed candidate'
+        : message;
     throw new Error(`Wix staging iSend endpoint failed with status ${result.statusCode}${sessionMessage}${diagnostics}`);
   }
 
@@ -935,6 +941,7 @@ async function checkWixEndpoint(options) {
       : undefined,
     statusCode: result.statusCode,
     environment: result.body.environment || 'staging',
+    diagnosticBuild,
     hasSessionId,
     hasSessionPassword,
     hasSessionCookie,

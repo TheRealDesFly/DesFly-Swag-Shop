@@ -11,7 +11,12 @@ vi.mock('backend/isendConfig', async (importOriginal) => ({
   getISendConfig: mocks.getISendConfig,
 }));
 
-import { loginToISend, mapOrderToISend, sendOrderToISend } from '../src/backend/isendService';
+import {
+  classifyISendDiagnosticError,
+  loginToISend,
+  mapOrderToISend,
+  sendOrderToISend,
+} from '../src/backend/isendService';
 
 const config = {
   baseUrl: 'https://staging.istoreisend-wms.com:5191/IsisWMS-War',
@@ -202,6 +207,40 @@ describe('loginToISend authenticated-session validation', () => {
       code: 'invalid-isend-url',
     });
     expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('iSend diagnostic error classification', () => {
+  it.each([
+    ['configuration', { message: 'Missing Wix secret: sentinel' }, 'configuration', 'configuration'],
+    ['URL validation', { code: 'invalid-isend-url' }, 'url-validation', 'configuration'],
+    ['outbound network', { name: 'TypeError' }, 'outbound-network', 'outbound-request'],
+    ['outbound timeout', { code: 'isend-request-timeout' }, 'outbound-timeout', 'outbound-request'],
+    ['redirect', { code: 'isend-redirect-rejected', upstreamStatus: 302 }, 'upstream-redirect', 'upstream-response'],
+    ['non-JSON response', { code: 'isend-invalid-json-response', upstreamStatus: 200 }, 'invalid-response', 'upstream-response'],
+    ['upstream HTTP', { code: 'isend-http-error', upstreamStatus: 503 }, 'upstream-http', 'upstream-response'],
+    ['authentication rejection', { failureClass: 'authentication-rejected' }, 'authentication-rejected', 'authentication'],
+    ['missing session', { failureClass: 'authenticated-session-missing' }, 'authenticated-session-missing', 'authentication'],
+    ['unknown failure', { message: 'sentinel provider detail' }, 'indeterminate', 'unknown'],
+  ])('classifies %s without returning raw error data', (_label, error, failureClass, phase) => {
+    const diagnostics = classifyISendDiagnosticError({
+      ...error,
+      requestPath: '/secret-path',
+      responseBody: 'sentinel-response',
+      attemptCount: 1,
+      hasUpstreamResponse: Boolean(error.upstreamStatus),
+    });
+
+    expect(diagnostics).toMatchObject({
+      diagnosticBuild: 'isend-login-diagnostic-v2',
+      failureClass,
+      phase,
+      attemptCount: 1,
+    });
+    const serialized = JSON.stringify(diagnostics);
+    expect(serialized).not.toContain('secret-path');
+    expect(serialized).not.toContain('sentinel-response');
+    expect(serialized).not.toContain('provider detail');
   });
 });
 
