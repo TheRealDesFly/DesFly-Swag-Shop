@@ -1,3 +1,7 @@
+name: iSend Staging Smoke Tests (disabled)
+on: []
+jobs: {}
+
 # name: iSend Staging Smoke Tests
 
 # on:
@@ -5,7 +9,7 @@
 #   push:
 #   workflow_dispatch:
 #   schedule:
-#     # 11:23, 15:23, and 19:23 MYT; all are inside the 10:00-22:00 service window.
+#     # 11:23, 15:23, and 19:23 MYT; all are inside the 10:00-22:00 MYT service window.
 #     - cron: "23 3,7,11 * * *"
 
 # permissions:
