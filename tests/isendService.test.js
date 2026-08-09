@@ -6,12 +6,16 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('wix-fetch', () => ({ fetch: mocks.fetch }));
-vi.mock('backend/isendConfig', () => ({ getISendConfig: mocks.getISendConfig }));
+vi.mock('backend/isendConfig', async (importOriginal) => ({
+  ...(await importOriginal()),
+  getISendConfig: mocks.getISendConfig,
+}));
 
 import { loginToISend, mapOrderToISend, sendOrderToISend } from '../src/backend/isendService';
 
 const config = {
-  baseUrl: 'https://isend.example/IsisWMS-War',
+  baseUrl: 'https://staging.istoreisend-wms.com:5191/IsisWMS-War',
+  environment: 'staging',
   userNo: 'test-user',
   userPassword: 'test-password',
 };
@@ -22,6 +26,7 @@ const mappingConfig = {
   orderOrigin: 'WIX',
   userId: 'user-1',
   orderSource: 'Wix Store',
+  orderTimeZone: 'Asia/Kuala_Lumpur',
 };
 
 function validOrder(overrides = {}) {
@@ -126,19 +131,91 @@ describe('loginToISend authenticated-session validation', () => {
       attemptedPaths: [{ requestPath: '/IsisWMS-War/Json/Public/login/' }],
     });
   });
+
+  it('rejects a redirect before reading its response body', async () => {
+    const text = vi.fn();
+    mocks.fetch.mockResolvedValue({
+      ok: false,
+      status: 302,
+      redirected: false,
+      headers: { get: vi.fn() },
+      text,
+    });
+
+    await expect(loginToISend({ config })).rejects.toMatchObject({
+      message: 'iStore iSend login failed for all configured endpoint candidates',
+      attemptedPaths: [{
+        requestPath: '/IsisWMS-War/Json/Public/login/',
+        upstreamStatus: 302,
+      }],
+    });
+    expect(text).not.toHaveBeenCalled();
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      'https://staging.istoreisend-wms.com:5191/IsisWMS-War/Json/Public/login/',
+      expect.objectContaining({
+        redirect: 'manual',
+        signal: expect.any(Object),
+      }),
+    );
+  });
+
+  it('aborts and fails when response-body consumption exceeds the request deadline', async () => {
+    let requestSignal;
+    const text = vi.fn();
+    mocks.fetch.mockImplementation(async (_url, options) => {
+      requestSignal = options.signal;
+      text.mockImplementation(() => new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      }));
+      return {
+        ok: true,
+        status: 200,
+        redirected: false,
+        headers: { get: vi.fn() },
+        text,
+      };
+    });
+
+    const login = loginToISend({ config });
+    const rejected = expect(login).rejects.toMatchObject({
+      message: 'iStore iSend login failed for all configured endpoint candidates',
+      attemptedPaths: [{ requestPath: '/IsisWMS-War/Json/Public/login/' }],
+    });
+    await vi.advanceTimersByTimeAsync(20000);
+    await rejected;
+
+    expect(text).toHaveBeenCalledTimes(1);
+    expect(requestSignal.aborted).toBe(true);
+  });
+
+  it('rejects an unapproved direct config before fetch', async () => {
+    await expect(loginToISend({
+      config: {
+        ...config,
+        baseUrl: 'https://attacker.example/IsisWMS-War',
+      },
+    })).rejects.toMatchObject({
+      code: 'invalid-isend-url',
+    });
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe('Wix eCommerce order mapping', () => {
   it.each([
     ['_createdDate', '2026-07-15T01:02:03.000Z'],
-    ['purchasedDate', '2026-07-16T04:05:06.000Z'],
-  ])('uses the modern %s timestamp as the iSend order date', (field, value) => {
+    ['purchasedDate', '2026-07-16T20:05:06.000Z'],
+  ])('formats the modern %s timestamp deterministically in Malaysia time', (field, value) => {
     const payload = mapOrderToISend(validOrder({
       [field]: value,
     }), mappingConfig);
 
     expect(payload.orderDate).toBe(
-      field === '_createdDate' ? '15/7/2026 01:02:03' : '16/7/2026 04:05:06',
+      field === '_createdDate' ? '15/7/2026 09:02:03' : '17/7/2026 04:05:06',
     );
   });
 

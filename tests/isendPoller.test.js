@@ -9,6 +9,13 @@ const mocks = vi.hoisted(() => {
       return (...args) => method(...args);
     }),
     elevatedMethods,
+    extractParcelContract: vi.fn((source, discovered = []) => ({
+      trackingNumbers: source?.trackingNumbers ?? discovered,
+      parcels: source?.parcels,
+      parcelCount: source?.parcelCount,
+      totalParcels: source?.totalParcels,
+      lineItemAllocations: source?.lineItemAllocations,
+    })),
     findReconciliationEnvironmentConflicts: vi.fn(),
     findMappings: vi.fn(),
     findMappingsForReconciliation: vi.fn(),
@@ -19,6 +26,14 @@ const mocks = vi.hoisted(() => {
     handleDelivered: vi.fn(),
     updateMappingReconciliation: vi.fn(),
     updateMappingStatus: vi.fn(),
+    validateSingleParcelEvidence: vi.fn((options) => {
+      if (!options.trackingNumber) {
+        const error = new Error('missing tracking');
+        error.code = 'missing-isend-tracking-number';
+        throw error;
+      }
+      return options.trackingNumber;
+    }),
   };
 });
 
@@ -40,6 +55,8 @@ vi.mock('backend/isendConfig', () => ({
 vi.mock('backend/isendService', () => ({ getTrackingInfo: mocks.getTrackingInfo }));
 vi.mock('backend/orderFulfillment', () => ({
   createISendSingleParcelFulfillment: mocks.createFulfillment,
+  extractISendParcelContractMetadata: mocks.extractParcelContract,
+  validateISendSingleParcelEvidence: mocks.validateSingleParcelEvidence,
 }));
 vi.mock('backend/isendStatusMapping', () => ({
   mapISendStatus: vi.fn((status) => String(status).toUpperCase()),
@@ -77,7 +94,12 @@ describe('iSend poller Wix order reads', () => {
       success: true,
       returnObject: {
         totalRecord: 1,
-        currentPageData: [{ custOrderNo: 'ISEND-1', trackingNumber: 'TRACK123' }],
+        currentPageData: [{
+          custOrderNo: 'ISEND-1',
+          trackingNumber: 'TRACK123',
+          parcelCount: 1,
+          totalParcels: 1,
+        }],
       },
     });
     mocks.getOrder.mockResolvedValue({
@@ -94,11 +116,17 @@ describe('iSend poller Wix order reads', () => {
     expect(result).toMatchObject({ success: true, processedMappings: 1 });
     expect(mocks.elevatedMethods).toContain(mocks.getOrder);
     expect(mocks.getOrder).toHaveBeenCalledWith('wix-order-1');
-    expect(mocks.createFulfillment).toHaveBeenCalledWith('ISEND-1', 'wix-order-1', {
-      environment: 'staging',
-      lineItems: [{ _id: 'line-item-1', quantity: 2 }],
-      trackingNumber: 'TRACK123',
-    });
+    expect(mocks.createFulfillment).toHaveBeenCalledWith(
+      'ISEND-1',
+      'wix-order-1',
+      expect.objectContaining({
+        environment: 'staging',
+        lineItems: [{ _id: 'line-item-1', quantity: 2 }],
+        trackingNumber: 'TRACK123',
+        parcelCount: 1,
+        totalParcels: 1,
+      }),
+    );
   });
 
   it('returns a truthful failure when tracking retrieval fails', async () => {
@@ -398,6 +426,39 @@ describe('iSend poller Wix order reads', () => {
     expect(mocks.handleDelivered).not.toHaveBeenCalled();
   });
 
+  it('rejects declared split shipment metadata before status or Wix mutations', async () => {
+    mocks.getTrackingInfo.mockResolvedValue({
+      success: true,
+      returnObject: {
+        totalRecord: 1,
+        currentPageData: [{
+          custOrderNo: 'ISEND-1',
+          orderStatus: 'SHIPPED',
+          trackingNumber: 'TRACK123',
+          parcelCount: 2,
+        }],
+      },
+    });
+    mocks.validateSingleParcelEvidence.mockImplementationOnce(() => {
+      const error = new Error('declared split shipment');
+      error.code = 'unsupported-isend-split-shipment';
+      error.retryable = false;
+      throw error;
+    });
+
+    const result = await runPoller({ limit: 100, types: ['tracking', 'status'] });
+
+    expect(result).toMatchObject({ success: false, processedMappings: 1 });
+    expect(result.details).toContainEqual(expect.objectContaining({
+      stage: 'tracking-allocation',
+      code: 'unsupported-isend-split-shipment',
+      success: false,
+    }));
+    expect(mocks.updateMappingStatus).not.toHaveBeenCalled();
+    expect(mocks.getOrder).not.toHaveBeenCalled();
+    expect(mocks.createFulfillment).not.toHaveBeenCalled();
+  });
+
   it('ignores order numbers, statuses, and SKUs outside tracking fields', async () => {
     mocks.getTrackingInfo.mockResolvedValue({
       success: true,
@@ -502,6 +563,55 @@ describe('iSend poller Wix order reads', () => {
       lastReconciledAt: expect.any(Date),
       reconciliationActive: false,
     }, 'staging');
+  });
+
+  it('keeps a delivered mapping active when the delivery email is missing', async () => {
+    mocks.getTrackingInfo.mockResolvedValue({
+      success: true,
+      returnObject: {
+        totalRecord: 1,
+        currentPageData: [{
+          custOrderNo: 'ISEND-1',
+          orderStatus: 'DELIVERED',
+          trackingNo: 'TRACK123',
+        }],
+      },
+    });
+    mocks.updateMappingStatus.mockResolvedValue({ _id: 'mapping-1' });
+    mocks.handleDelivered.mockRejectedValue(Object.assign(
+      new Error('Wix order has no resolvable email'),
+      {
+        code: 'isend-delivery-email-missing',
+        retryable: true,
+      },
+    ));
+
+    let error;
+    try {
+      await runISendPollerJob();
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      pollerResult: {
+        success: false,
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            stage: 'fulfillment',
+            code: 'isend-delivery-email-missing',
+          }),
+        ]),
+      },
+    });
+    expect(mocks.updateMappingReconciliation).toHaveBeenCalledWith('ISEND-1', {
+      lastReconciledAt: expect.any(Date),
+    }, 'staging');
+    expect(mocks.updateMappingReconciliation).not.toHaveBeenCalledWith(
+      'ISEND-1',
+      expect.objectContaining({ reconciliationActive: false }),
+      'staging',
+    );
   });
 
   it('keeps a delivered mapping active and fails visibly when tracking is absent', async () => {

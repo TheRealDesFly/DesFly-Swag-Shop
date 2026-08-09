@@ -248,19 +248,16 @@ describe('delivered-order side effects', () => {
     expect(mocks.insert).not.toHaveBeenCalled();
   });
 
-  it('explicitly reports a successful no-email outcome', async () => {
+  it('fails retryably before delivery audit/email completion when no email is resolvable', async () => {
     mocks.getOrder.mockResolvedValue({ _id: 'wix-order-1', buyerInfo: {} });
 
-    const result = await handleDelivered('ISEND-1');
-
-    expect(result).toMatchObject({
-      success: true,
-      emailFound: false,
-      emailQueued: false,
-      emailOutcome: 'not-queued-missing-email',
-      emailId: null,
+    await expect(handleDelivered('ISEND-1')).rejects.toMatchObject({
+      code: 'isend-delivery-email-missing',
+      retryable: true,
+      wixOrderId: 'wix-order-1',
+      iSendOrderNo: 'ISEND-1',
     });
-    expect(mocks.insert).toHaveBeenCalledTimes(1);
-    expect(mocks.insert.mock.calls[0][0]).toBe('ISendWebhookEvents');
+    expect(mocks.update).toHaveBeenCalledTimes(1);
+    expect(mocks.insert).not.toHaveBeenCalled();
   });
 });

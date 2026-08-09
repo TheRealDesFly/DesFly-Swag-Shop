@@ -226,22 +226,21 @@ describe('iSend status mapping', () => {
     });
   });
 
-  it('surfaces a successful missing-email delivery outcome', async () => {
-    mocks.handleDelivered.mockResolvedValue({
-      success: true,
-      emailFound: false,
-      emailQueued: false,
-      emailOutcome: 'not-queued-missing-email',
-    });
+  it('propagates a retryable missing-email delivery failure after the status write', async () => {
+    mocks.handleDelivered.mockRejectedValue(Object.assign(
+      new Error('Wix order has no resolvable email'),
+      {
+        code: 'isend-delivery-email-missing',
+        retryable: true,
+      },
+    ));
 
-    const result = await updateMappingStatus('ISEND-1', 'DELIVERED');
-
-    expect(result.delivery).toMatchObject({
-      success: true,
-      emailFound: false,
-      emailQueued: false,
-      emailOutcome: 'not-queued-missing-email',
+    await expect(updateMappingStatus('ISEND-1', 'DELIVERED')).rejects.toMatchObject({
+      code: 'isend-delivery-email-missing',
+      retryable: true,
     });
+    expect(mocks.update).toHaveBeenCalledTimes(1);
+    expect(mocks.handleDelivered).toHaveBeenCalledTimes(1);
   });
 
   it('propagates delivery workflow failures after the status write', async () => {

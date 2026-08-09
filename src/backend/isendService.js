@@ -4,7 +4,11 @@
  * sends orders to iSend, and retrieves tracking/status information.
  */
 import { fetch } from 'wix-fetch';
-import { getISendConfig } from 'backend/isendConfig';
+import {
+  getISendConfig,
+  ISEND_ORDER_TIME_ZONE,
+  validateISendBaseUrl,
+} from 'backend/isendConfig';
 
 const MYT_OFFSET_MINUTES = 8 * 60;
 const SERVICE_START_HOUR_MYT = 10;
@@ -25,30 +29,7 @@ function trimTrailingSlash(value) {
  * Return the configured base URL for iSend API calls.
  */
 function getBaseUrl(config) {
-  let baseUrl = trimTrailingSlash(config.baseUrl);
-  const endpointSuffixes = [
-    '/Json/Public/login',
-    '/api/login',
-  ];
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const suffix of endpointSuffixes) {
-      if (baseUrl.toLowerCase().endsWith(suffix.toLowerCase())) {
-        baseUrl = trimTrailingSlash(baseUrl.slice(0, -suffix.length));
-        changed = true;
-      }
-    }
-  }
-
-  return baseUrl;
-}
-
-function buildISendUrl(config, path) {
-  const baseUrl = getBaseUrl(config);
-  const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path}`;
-  return `${baseUrl}${normalizedPath}`;
+  return validateISendBaseUrl(config && config.baseUrl, config && config.environment);
 }
 
 function hasISendContextRoot(url) {
@@ -67,13 +48,12 @@ function buildISendUrlFromRoot(rootUrl, path) {
 
 function getLoginUrls(config) {
   const baseUrl = getBaseUrl(config);
+  if (baseUrl.toLowerCase().endsWith('/api/login')) {
+    return [baseUrl];
+  }
   const urls = [buildISendUrlFromRoot(baseUrl, '/Json/Public/login/')];
   if (!hasISendContextRoot(baseUrl)) {
     urls.push(buildISendUrlFromRoot(`${baseUrl}${ISEND_CONTEXT_ROOT}`, '/Json/Public/login/'));
-  }
-  const configuredUrl = trimTrailingSlash(config.baseUrl);
-  if (configuredUrl.toLowerCase().endsWith('/api/login')) {
-    urls.push(configuredUrl);
   }
   return urls.filter((url, index, list) => list.indexOf(url) === index);
 }
@@ -101,7 +81,8 @@ function getApiRootFromLoginUrl(url) {
 
 function buildSessionUrl(config, session, path) {
   const rootUrl = session && session.apiRoot ? session.apiRoot : getBaseUrl(config);
-  return buildISendUrlFromRoot(rootUrl, path);
+  const validatedRoot = validateISendBaseUrl(rootUrl, config && config.environment);
+  return buildISendUrlFromRoot(validatedRoot, path);
 }
 
 function getUrlPath(url) {
@@ -221,16 +202,74 @@ function getServiceWindowStatus(now) {
   };
 }
 
+function requestTimeoutError(url, label, timeoutMs) {
+  const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+  error.code = 'isend-request-timeout';
+  error.requestPath = getUrlPath(url);
+  return error;
+}
+
+function redirectRejectedError(url, response) {
+  const status = Number(response && response.status);
+  const error = new Error('iStore iSend redirect response was rejected');
+  error.code = 'isend-redirect-rejected';
+  error.requestPath = getUrlPath(url);
+  error.upstreamStatus = Number.isInteger(status) ? status : undefined;
+  error.upstreamContentType = response && response.headers && response.headers.get
+    ? response.headers.get('content-type')
+    : undefined;
+  return error;
+}
+
+function responseWasRedirected(response, requestUrl) {
+  const status = Number(response && response.status);
+  if (Number.isInteger(status) && status >= 300 && status < 400) return true;
+  if (response && response.redirected === true) return true;
+  if (!response || !response.url) return false;
+
+  try {
+    return new URL(response.url).href !== new URL(requestUrl).href;
+  } catch (error) {
+    return true;
+  }
+}
+
 /**
- * Wrap a promise with a timeout so requests do not hang forever.
+ * Bound the complete fetch lifecycle, including response-body consumption.
+ * Abort is requested at the same deadline so a supporting runtime also closes
+ * the underlying request rather than merely abandoning its promise.
  */
-function withTimeout(promise, timeoutMs, label) {
-  return Promise.race([
-    promise,
-    new Promise((resolve, reject) => {
-      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
-    }),
-  ]);
+async function runBoundedRequest(url, operation, timeoutMs = REQUEST_TIMEOUT_MS) {
+  if (typeof AbortController !== 'function') {
+    const error = new Error('iStore iSend requests require AbortController support');
+    error.code = 'isend-abort-controller-unavailable';
+    error.requestPath = getUrlPath(url);
+    throw error;
+  }
+
+  const controller = new AbortController();
+  const timeoutError = requestTimeoutError(url, 'iStore iSend request', timeoutMs);
+  let timedOut = false;
+  let timeoutId;
+  const deadline = new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => operation(controller.signal, controller)),
+      deadline,
+    ]);
+  } catch (error) {
+    if (timedOut) throw timeoutError;
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -242,13 +281,24 @@ async function postJson(url, body, headers = {}, options = {}) {
     'Content-Type': 'application/json',
   }, headers);
 
-  const response = await withTimeout(fetch(url, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify(body),
-  }), REQUEST_TIMEOUT_MS, 'iStore iSend request');
-
-  const text = await response.text();
+  const { response, text } = await runBoundedRequest(
+    url,
+    async (signal, controller) => {
+      const fetched = await fetch(url, {
+        method: 'POST',
+        headers: requestHeaders,
+        body: JSON.stringify(body),
+        redirect: 'manual',
+        signal,
+      });
+      if (responseWasRedirected(fetched, url)) {
+        controller.abort();
+        throw redirectRejectedError(url, fetched);
+      }
+      const responseText = await fetched.text();
+      return { response: fetched, text: responseText };
+    },
+  );
   let data;
   try {
     data = text ? JSON.parse(text) : {};
@@ -426,15 +476,24 @@ function getCustomerName(shipping, order) {
   return fromShipping || buyerInfo.fullName || buyerInfo.name || '';
 }
 
-function formatISendDate(value) {
+function formatISendDate(value, timeZone = ISEND_ORDER_TIME_ZONE) {
   const date = value ? new Date(value) : new Date();
   const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
-  const pad = (number) => String(number).padStart(2, '0');
+  const formatter = new Intl.DateTimeFormat('en-GB-u-nu-latn', {
+    timeZone,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = formatter.formatToParts(safeDate)
+    .reduce((result, part) => Object.assign(result, { [part.type]: part.value }), {});
 
-  return [
-    `${safeDate.getDate()}/${safeDate.getMonth() + 1}/${safeDate.getFullYear()}`,
-    `${pad(safeDate.getHours())}:${pad(safeDate.getMinutes())}:${pad(safeDate.getSeconds())}`,
-  ].join(' ');
+  return `${Number(parts.day)}/${Number(parts.month)}/${parts.year}`
+    + ` ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
 function getOrderDate(order) {
@@ -588,7 +647,10 @@ export function mapOrderToISend(order, config) {
     orderId,
     orderNumber: order.number ? String(order.number) : String(orderId),
     orderSource: config.orderSource,
-    orderDate: formatISendDate(getOrderDate(order)),
+    orderDate: formatISendDate(
+      getOrderDate(order),
+      config.orderTimeZone || ISEND_ORDER_TIME_ZONE,
+    ),
     orderStatus: 'PROCESSING',
     buyerCustAddr: customerAddress,
     deliverToCustAddr: customerAddress,

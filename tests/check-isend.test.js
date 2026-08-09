@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 
 const require = createRequire(import.meta.url);
 const {
+  checkLogin,
+  formatLoginAttemptsForOutput,
   getAuthenticatedSessionEvidence,
   isAuthenticatedLoginResponse,
 } = require('../scripts/check-isend.js');
@@ -49,5 +51,41 @@ describe('legacy iSend CLI authenticated-session evidence', () => {
       hasSessionFields: true,
       hasSessionCookie: true,
     });
+  });
+
+  it('rejects an unsafe endpoint before attempting login', async () => {
+    await expect(checkLogin(
+      'http://staging.istoreisend-wms.com:5191/IsisWMS-War',
+      'user',
+      'password',
+      1000,
+      'staging',
+    )).resolves.toMatchObject({
+      ok: false,
+      attempts: [{
+        err: expect.objectContaining({
+          message: expect.stringContaining('must use HTTPS'),
+        }),
+      }],
+    });
+  });
+
+  it('redacts configured endpoint identity from failed login output', () => {
+    const privateUrl = 'https://private-isend.example:5191/api/login';
+    const output = formatLoginAttemptsForOutput([{
+      url: privateUrl,
+      err: Object.assign(
+        new Error('getaddrinfo ENOTFOUND private-isend.example'),
+        { code: 'ENOTFOUND' },
+      ),
+    }], [privateUrl]);
+
+    expect(output).toEqual([{
+      path: '/api/login',
+      statusCode: undefined,
+      reason: undefined,
+      error: 'ENOTFOUND: getaddrinfo ENOTFOUND [host]',
+    }]);
+    expect(JSON.stringify(output)).not.toContain('private-isend.example');
   });
 });

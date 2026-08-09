@@ -131,6 +131,8 @@ import {
   findMappingsForReconciliation,
   findUnclassifiedMappingsForReconciliation,
   findReconciliationEnvironmentConflicts,
+  getByISendOrderNo,
+  getByWixOrderId,
   saveMapping,
   updateMappingReconciliation,
 } from '../src/backend/isendMappings';
@@ -285,6 +287,62 @@ describe('deterministic Wix persistence keys', () => {
       retryable: false,
     });
     expect(mock.collections.ISendOrderMap).toHaveLength(1);
+  });
+
+  it('fails deterministically when an iSend-order lookup finds duplicate mappings', async () => {
+    mock.collections.ISendOrderMap.push(
+      {
+        _id: 'mapping-z',
+        wixOrderId: 'wix-order-z',
+        iSendOrderNo: 'ISEND-DUPLICATE',
+        environment: 'staging',
+      },
+      {
+        _id: 'mapping-a',
+        wixOrderId: 'wix-order-a',
+        iSendOrderNo: 'ISEND-DUPLICATE',
+        environment: 'staging',
+      },
+    );
+
+    await expect(getByISendOrderNo('ISEND-DUPLICATE', 'staging')).rejects.toMatchObject({
+      name: 'AmbiguousISendMappingError',
+      code: 'ambiguous-isend-mapping',
+      retryable: false,
+      identityAxis: 'iSendOrderNo',
+      identityValue: 'ISEND-DUPLICATE',
+      environment: 'staging',
+      mappingIds: ['mapping-a', 'mapping-z'],
+      detectedCount: 2,
+    });
+  });
+
+  it('fails deterministically when a Wix-order lookup finds duplicate mappings', async () => {
+    mock.collections.ISendOrderMap.push(
+      {
+        _id: 'mapping-2',
+        wixOrderId: 'WIX-DUPLICATE',
+        iSendOrderNo: 'ISEND-2',
+        environment: 'production',
+      },
+      {
+        _id: 'mapping-1',
+        wixOrderId: 'WIX-DUPLICATE',
+        iSendOrderNo: 'ISEND-1',
+        environment: 'production',
+      },
+    );
+
+    await expect(getByWixOrderId('WIX-DUPLICATE', 'production')).rejects.toMatchObject({
+      name: 'AmbiguousISendMappingError',
+      code: 'ambiguous-isend-mapping',
+      retryable: false,
+      identityAxis: 'wixOrderId',
+      identityValue: 'WIX-DUPLICATE',
+      environment: 'production',
+      mappingIds: ['mapping-1', 'mapping-2'],
+      detectedCount: 2,
+    });
   });
 
   it('selects only active mappings from oldest reconciliation attempt first', async () => {

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   consumeJsonRequestBody,
   consumeRequestBody,
+  MAX_REQUEST_BODY_BYTES,
   parseJsonBody,
   RequestBodyError,
 } from '../src/backend/requestBody';
@@ -34,6 +35,32 @@ describe('request body consumption', () => {
 
     expect(consumed.rawBody).toBe('{"orderId":"abc"}');
     expect(consumed.payload).toEqual({ orderId: 'abc' });
+  });
+
+  it('rejects an oversized declared body before consuming the Wix stream', async () => {
+    const buffer = vi.fn();
+
+    await expect(consumeRequestBody({
+      headers: { 'Content-Length': String(MAX_REQUEST_BODY_BYTES + 1) },
+      body: { buffer },
+    })).rejects.toMatchObject({
+      code: 'request-body-too-large',
+      status: 413,
+    });
+    expect(buffer).not.toHaveBeenCalled();
+  });
+
+  it('enforces the byte limit even when content-length is absent', async () => {
+    const text = vi.fn().mockResolvedValue('ééé');
+
+    await expect(consumeRequestBody(
+      { body: { text } },
+      { maxBytes: 5 },
+    )).rejects.toMatchObject({
+      code: 'request-body-too-large',
+      status: 413,
+    });
+    expect(text).toHaveBeenCalledTimes(1);
   });
 
   it('rejects malformed JSON with a controlled client error', () => {

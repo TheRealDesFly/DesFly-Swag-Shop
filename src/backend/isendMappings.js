@@ -13,6 +13,7 @@ const COLLECTION = 'ISendOrderMap';
 const DEFAULT_RECONCILIATION_LIMIT = 5;
 const MAX_RECONCILIATION_LIMIT = 25;
 const ENVIRONMENT_CONFLICT_SCAN_LIMIT = 1000;
+const AMBIGUITY_DETECTION_LIMIT = 2;
 
 function clampLimit(value, fallback = DEFAULT_RECONCILIATION_LIMIT) {
   const parsed = Number(value);
@@ -67,6 +68,45 @@ function assertExactMapping(mapping, wixOrderId, iSendOrderNo, environment) {
   error.code = 'isend-mapping-collision';
   error.retryable = false;
   throw error;
+}
+
+export class AmbiguousISendMappingError extends Error {
+  constructor(identityAxis, identityValue, environment, mappings = [], totalCount) {
+    const normalizedValue = String(identityValue);
+    const normalizedEnvironment = environment
+      ? String(environment).trim().toLowerCase()
+      : null;
+    const scope = normalizedEnvironment ? ` in ${normalizedEnvironment}` : '';
+    super(`Ambiguous iSend mapping for ${identityAxis}=${normalizedValue}${scope}`);
+    this.name = 'AmbiguousISendMappingError';
+    this.code = 'ambiguous-isend-mapping';
+    this.retryable = false;
+    this.identityAxis = identityAxis;
+    this.identityValue = normalizedValue;
+    this.environment = normalizedEnvironment;
+    this.mappingIds = mappings
+      .map((mapping) => mapping && (mapping._id || mapping.wixOrderId || mapping.iSendOrderNo))
+      .filter(Boolean)
+      .map(String)
+      .sort();
+    this.detectedCount = Number.isSafeInteger(totalCount) && totalCount >= mappings.length
+      ? totalCount
+      : mappings.length;
+  }
+}
+
+function returnOneOrFailAmbiguous(result, identityAxis, identityValue, environment) {
+  const items = result && Array.isArray(result.items) ? result.items : [];
+  if (items.length > 1 || Number(result && result.totalCount) > 1) {
+    throw new AmbiguousISendMappingError(
+      identityAxis,
+      identityValue,
+      environment,
+      items,
+      result && result.totalCount,
+    );
+  }
+  return items.length ? items[0] : null;
 }
 
 function isDuplicateKeyError(error) {
@@ -152,15 +192,24 @@ export async function saveMapping(wixOrderId, iSendOrderNo, meta = {}, environme
  */
 export async function getByISendOrderNo(iSendOrderNo, environment) {
   if (!iSendOrderNo) return null;
+  const boundEnvironment = environment === undefined
+    ? undefined
+    : requireEnvironment(environment);
   let query = wixData.query(COLLECTION)
     .eq('iSendOrderNo', String(iSendOrderNo));
-  if (environment !== undefined) {
-    query = query.eq('environment', requireEnvironment(environment));
+  if (boundEnvironment !== undefined) {
+    query = query.eq('environment', boundEnvironment);
   }
   const res = await query
-    .limit(1)
+    .ascending('_id')
+    .limit(AMBIGUITY_DETECTION_LIMIT)
     .find({ consistentRead: true, suppressAuth: true });
-  return res.items && res.items.length ? res.items[0] : null;
+  return returnOneOrFailAmbiguous(
+    res,
+    'iSendOrderNo',
+    iSendOrderNo,
+    boundEnvironment,
+  );
 }
 
 /**
@@ -168,15 +217,24 @@ export async function getByISendOrderNo(iSendOrderNo, environment) {
  */
 export async function getByWixOrderId(wixOrderId, environment) {
   if (!wixOrderId) return null;
+  const boundEnvironment = environment === undefined
+    ? undefined
+    : requireEnvironment(environment);
   let query = wixData.query(COLLECTION)
     .eq('wixOrderId', String(wixOrderId));
-  if (environment !== undefined) {
-    query = query.eq('environment', requireEnvironment(environment));
+  if (boundEnvironment !== undefined) {
+    query = query.eq('environment', boundEnvironment);
   }
   const res = await query
-    .limit(1)
+    .ascending('_id')
+    .limit(AMBIGUITY_DETECTION_LIMIT)
     .find({ consistentRead: true, suppressAuth: true });
-  return res.items && res.items.length ? res.items[0] : null;
+  return returnOneOrFailAmbiguous(
+    res,
+    'wixOrderId',
+    wixOrderId,
+    boundEnvironment,
+  );
 }
 
 /**
@@ -297,6 +355,7 @@ export async function updateMappingReconciliation(iSendOrderNo, fields = {}, env
 }
 
 export default {
+  AmbiguousISendMappingError,
   saveMapping,
   getByISendOrderNo,
   getByWixOrderId,

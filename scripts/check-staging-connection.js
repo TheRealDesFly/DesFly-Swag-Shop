@@ -4,7 +4,7 @@ Local staging smoke test for the Wix + iStore iSend integration.
 
 Checks supported:
   1. Direct iSend staging login with local env/args.
-  2. Published Wix endpoint `/_functions/testISendLoginFromWix?env=staging`.
+  2. Published Wix endpoint `/_functions/testISendLoginFromWix`.
   3. Optional direct iSend inventory query with `--inventory`.
 
 No secret values are printed.
@@ -15,12 +15,47 @@ const https = require('https');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const MYT_OFFSET_MINUTES = 8 * 60;
 const SERVICE_START_HOUR_MYT = 10;
 const SERVICE_END_HOUR_MYT = 22;
 const DEFAULT_TIMEOUT_MS = 20000;
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
+const OWNER_APPROVED_STAGING_LOGIN_ORIGIN_FINGERPRINT =
+  '36dc1cea96d6bb7e9e448ebe63e4511488c3fc9c04f91adb4535a6d0e90a36cb';
+const ISEND_ENDPOINT_ALLOWLIST = Object.freeze({
+  staging: Object.freeze([
+    'c3b9dde2fc153108fb39fe0ade507088d2391f8a954527b07a3d0b0bd2e42ab4',
+    '5c0f2aa05cbe11a7bd41cc52e68fa08680318183c9422af3851b94c2219a2f28',
+    OWNER_APPROVED_STAGING_LOGIN_ORIGIN_FINGERPRINT,
+  ]),
+  production: Object.freeze([
+    'd0c995986dd80e0bec3577f67d42e94276d2385105739214f84a7ec9d642550a',
+  ]),
+});
+// SHA-256 of the owner-approved published Wix origin's lowercase
+// "<hostname>:<port>" value. Keep the hostname out of retained smoke output,
+// and require an explicit reviewed code change if the published origin moves.
+const WIX_SITE_ORIGIN_ALLOWLIST = Object.freeze([
+  '07ad46f2741774c4d3540c1b35872150dec7ec9cc8402b1cdecb7c0cb94fcd2d',
+]);
+
+function endpointOriginFingerprint(hostname, port) {
+  return crypto.createHash('sha256')
+    .update(`${String(hostname || '').toLowerCase()}:${port}`)
+    .digest('hex');
+}
+
+function isApprovedISendPath(environment, originFingerprint, normalizedPath) {
+  if (normalizedPath === '/' || normalizedPath === ISEND_CONTEXT_ROOT) {
+    return true;
+  }
+  return normalizedPath === '/api/login'
+    && environment === 'staging'
+    && originFingerprint === OWNER_APPROVED_STAGING_LOGIN_ORIGIN_FINGERPRINT;
+}
 
 function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -63,12 +98,24 @@ function parseArgs() {
   return opts;
 }
 
-function validateDirectISendRoot(value) {
+function validateDirectISendRoot(value, environment = 'staging') {
+  const normalizedEnvironment = String(environment || '').trim().toLowerCase();
+  const secretName = normalizedEnvironment === 'production'
+    ? 'ISTORE_ISEND_PRODUCTION_URL'
+    : 'ISTORE_ISEND_SANDBOX_URL';
+  if (!Object.hasOwn(ISEND_ENDPOINT_ALLOWLIST, normalizedEnvironment)) {
+    return {
+      configured: Boolean(String(value || '').trim()),
+      valid: false,
+      reason: 'iSend environment must be staging or production',
+    };
+  }
+
   if (!String(value || '').trim()) {
     return {
       configured: false,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL is missing',
+      reason: `${secretName} is missing`,
     };
   }
 
@@ -79,15 +126,15 @@ function validateDirectISendRoot(value) {
     return {
       configured: true,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL must be an absolute URL',
+      reason: `${secretName} must be an absolute HTTPS URL`,
     };
   }
 
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
+  if (parsed.protocol !== 'https:') {
     return {
       configured: true,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL must use http or https',
+      reason: `${secretName} must use HTTPS`,
     };
   }
 
@@ -95,7 +142,7 @@ function validateDirectISendRoot(value) {
     return {
       configured: true,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL must include a hostname',
+      reason: `${secretName} must include a hostname`,
     };
   }
 
@@ -103,7 +150,7 @@ function validateDirectISendRoot(value) {
     return {
       configured: true,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL must not contain credentials',
+      reason: `${secretName} must not contain URL credentials`,
     };
   }
 
@@ -111,35 +158,112 @@ function validateDirectISendRoot(value) {
     return {
       configured: true,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL must be a root URL without a query or fragment',
+      reason: `${secretName} must not contain a query string or fragment`,
     };
   }
 
-  let decodedPath;
-  try {
-    decodedPath = decodeURIComponent(parsed.pathname).toLowerCase();
-  } catch (error) {
-    decodedPath = parsed.pathname.toLowerCase();
-  }
-  const pathSegments = decodedPath.split('/').filter(Boolean);
-  if (pathSegments.includes('_functions') || pathSegments.includes('_functions-dev')) {
+  const hostname = parsed.hostname.toLowerCase();
+  const port = parsed.port ? Number(parsed.port) : 443;
+  const originFingerprint = endpointOriginFingerprint(hostname, port);
+  const endpointAllowed = ISEND_ENDPOINT_ALLOWLIST[normalizedEnvironment]
+    .includes(originFingerprint);
+  if (!endpointAllowed) {
     return {
       configured: true,
       valid: false,
-      reason: 'ISTORE_ISEND_SANDBOX_URL must point directly to iSend, not to a Wix /_functions route',
+      reason: `${secretName} host and port are not in the approved iStore iSend allowlist`,
+    };
+  }
+
+  const configuredPath = parsed.pathname;
+  const hasTrailingSlash = configuredPath.length > 1 && configuredPath.endsWith('/');
+  const normalizedPath = hasTrailingSlash ? configuredPath.slice(0, -1) : configuredPath;
+  if (!isApprovedISendPath(normalizedEnvironment, originFingerprint, normalizedPath)) {
+    return {
+      configured: true,
+      valid: false,
+      reason: `${secretName} path must be the host root or ${ISEND_CONTEXT_ROOT}; /api/login requires the owner-approved staging origin`,
+    };
+  }
+
+  const canonicalPath = normalizedPath === '/' ? '' : normalizedPath;
+  const canonicalPort = port === 443 ? '' : `:${port}`;
+  return {
+    configured: true,
+    valid: true,
+    environment: normalizedEnvironment,
+    protocol: 'https',
+    hostname,
+    port,
+    baseUrl: `https://${hostname}${canonicalPort}${canonicalPath}`,
+    hasContextPath: normalizedPath !== '/',
+    hasISendContextRoot: normalizedPath === ISEND_CONTEXT_ROOT,
+  };
+}
+
+function validateWixSiteRoot(value, allowedOriginFingerprints = WIX_SITE_ORIGIN_ALLOWLIST) {
+  if (!String(value || '').trim()) {
+    return {
+      configured: false,
+      valid: false,
+      reason: 'WIX_SITE_BASE_URL is missing',
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (error) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'WIX_SITE_BASE_URL must be an absolute HTTPS URL',
+    };
+  }
+
+  if (parsed.protocol !== 'https:') {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'WIX_SITE_BASE_URL must use HTTPS',
+    };
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'WIX_SITE_BASE_URL must not contain credentials, a query string, or a fragment',
+    };
+  }
+  if (parsed.pathname !== '/' && parsed.pathname !== '') {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'WIX_SITE_BASE_URL must be the published site origin without a path',
+    };
+  }
+
+  const port = parsed.port ? Number(parsed.port) : 443;
+  const originAllowed = allowedOriginFingerprints.includes(
+    endpointOriginFingerprint(parsed.hostname, port),
+  );
+  if (!originAllowed) {
+    return {
+      configured: true,
+      valid: false,
+      reason: 'WIX_SITE_BASE_URL origin is not the owner-approved published Wix site',
     };
   }
 
   return {
     configured: true,
     valid: true,
-    protocol: parsed.protocol.replace(':', ''),
-    hasContextPath: parsed.pathname !== '/',
-    hasISendContextRoot: hasISendContextRoot(value),
+    protocol: 'https',
+    hasPath: false,
   };
 }
 
-function validateSetup(values = {}) {
+function validateSetup(values = {}, options = {}) {
   const directValues = {
     ISTORE_ISEND_API_USER_ID: values.user,
     ISTORE_ISEND_API_PASSWORD: values.password,
@@ -154,22 +278,46 @@ function validateSetup(values = {}) {
   const wixMissing = Object.keys(wixValues)
     .filter((name) => !String(wixValues[name] || '').trim());
   const stagingUrl = validateDirectISendRoot(values.stagingUrl);
+  const wixSiteUrl = validateWixSiteRoot(
+    values.wixSiteUrl,
+    options.allowedWixOriginFingerprints,
+  );
 
   return {
     directISendReady: directMissing.length === 0 && stagingUrl.valid,
-    wixEndpointReady: wixMissing.length === 0,
+    wixEndpointReady: wixMissing.length === 0 && wixSiteUrl.valid,
     inventoryReady: directMissing.length === 0
       && stagingUrl.valid
       && Boolean(String(values.storageClientNo || '').trim()),
     directMissing,
     wixMissing,
     stagingUrl,
+    wixSiteUrl,
+  };
+}
+
+function sanitizeSetupForOutput(setup) {
+  const stagingUrl = setup && setup.stagingUrl
+    ? {
+      configured: setup.stagingUrl.configured,
+      valid: setup.stagingUrl.valid,
+      environment: setup.stagingUrl.environment,
+      protocol: setup.stagingUrl.protocol,
+      hasContextPath: setup.stagingUrl.hasContextPath,
+      hasISendContextRoot: setup.stagingUrl.hasISendContextRoot,
+      reason: setup.stagingUrl.reason,
+    }
+    : setup && setup.stagingUrl;
+  return {
+    ...setup,
+    stagingUrl,
   };
 }
 
 function setupMeetsRequirements(setup, opts) {
   const configuredUrlIsValid = !setup.stagingUrl.configured || setup.stagingUrl.valid;
-  if (!configuredUrlIsValid) return false;
+  const configuredWixUrlIsValid = !setup.wixSiteUrl.configured || setup.wixSiteUrl.valid;
+  if (!configuredUrlIsValid || !configuredWixUrlIsValid) return false;
 
   if ((opts['require-direct'] && opts['skip-direct'])
     || (opts['require-wix'] && opts['skip-wix'])) {
@@ -211,12 +359,46 @@ function summarizeResults(results) {
   };
 }
 
-function sanitizeError(error) {
-  return String(error && error.message ? error.message : error)
-    .replace(/https?:\/\/[^\s/$.?#].[^\s]*/gi, '[url]')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b/g, '[address]')
-    .replace(/userPassword["']?\s*:\s*["'][^"']+["']/gi, 'userPassword:"[redacted]"')
-    .replace(/password["']?\s*:\s*["'][^"']+["']/gi, 'password:"[redacted]"');
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getNetworkRedactionTokens(values) {
+  const tokens = new Set();
+  for (const value of values || []) {
+    if (!String(value || '').trim()) continue;
+    try {
+      const parsed = new URL(value);
+      if (parsed.host) tokens.add(parsed.host);
+      if (parsed.hostname) tokens.add(parsed.hostname);
+    } catch (error) {
+      // Invalid configured URLs are rejected before a live request. Do not
+      // preserve their raw value in diagnostics.
+    }
+  }
+  return Array.from(tokens).sort((left, right) => right.length - left.length);
+}
+
+function sanitizeError(error, sensitiveUrls = []) {
+  let message = String(error && error.message ? error.message : error || 'Request failed');
+  message = message
+    .replace(/\bhttps?:\/\/[^\s"'<>]+/gi, '[url]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '[address]')
+    .replace(/\[[0-9a-f:]+\](?::\d+)?/gi, '[address]');
+
+  for (const token of getNetworkRedactionTokens(sensitiveUrls)) {
+    message = message.replace(new RegExp(escapeRegExp(token), 'gi'), '[host]');
+  }
+
+  message = message.replace(
+    /\b(userPassword|password|sessionPassword|sessionId|authorization|cookie|x-isend-[a-z0-9-]*secret)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,}\]]+)/gi,
+    '$1=[redacted]',
+  );
+
+  const rawCode = String(error && error.code || '').trim();
+  const safeCode = /^[A-Za-z0-9_-]{1,64}$/.test(rawCode) ? rawCode : '';
+  const formatted = safeCode ? `${safeCode}: ${message}` : message;
+  return formatted.slice(0, 500);
 }
 
 function trimTrailingSlash(value) {
@@ -227,7 +409,6 @@ function normalizeISendBaseUrl(value) {
   let baseUrl = trimTrailingSlash(value);
   const endpointSuffixes = [
     '/Json/Public/login',
-    '/api/login',
   ];
 
   let changed = true;
@@ -273,13 +454,12 @@ function hasISendContextRoot(urlString) {
 
 function getLoginUrls(baseUrl) {
   const normalizedBaseUrl = normalizeISendBaseUrl(baseUrl);
+  if (normalizedBaseUrl.toLowerCase().endsWith('/api/login')) {
+    return [normalizedBaseUrl];
+  }
   const urls = [buildISendUrlFromRoot(normalizedBaseUrl, '/Json/Public/login/')];
   if (!hasISendContextRoot(normalizedBaseUrl)) {
     urls.push(buildISendUrlFromRoot(`${normalizedBaseUrl}${ISEND_CONTEXT_ROOT}`, '/Json/Public/login/'));
-  }
-  const configuredUrl = trimTrailingSlash(baseUrl);
-  if (configuredUrl.toLowerCase().endsWith('/api/login')) {
-    urls.push(configuredUrl);
   }
   return urls.filter((url, index, list) => list.indexOf(url) === index);
 }
@@ -323,8 +503,9 @@ function getServiceWindowStatus(now) {
   };
 }
 
-function skippedOutsideServiceWindow(name, options) {
-  if (options.force || options.serviceWindow.withinServiceWindow) return null;
+function skippedOutsideServiceWindow(name, options, settings = {}) {
+  const allowForce = settings.allowForce !== false;
+  if ((allowForce && options.force) || options.serviceWindow.withinServiceWindow) return null;
 
   return {
     name,
@@ -404,24 +585,66 @@ function requestJson(method, urlString, body, timeout, headers = {}) {
       return;
     }
 
-    const lib = parsed.protocol === 'https:' ? https : http;
+    if (parsed.protocol !== 'https:') {
+      reject(new Error('Live staging requests must use HTTPS'));
+      return;
+    }
+    if (parsed.username || parsed.password || parsed.hash) {
+      reject(new Error('Live staging request URL contains forbidden credentials or fragment'));
+      return;
+    }
+
     const data = body ? JSON.stringify(body) : undefined;
     const requestHeaders = Object.assign({}, headers);
     if (data) {
       requestHeaders['Content-Type'] = 'application/json';
       requestHeaders['Content-Length'] = Buffer.byteLength(data);
     }
-    const req = lib.request({
+    let req;
+    let response;
+    let settled = false;
+    let deadlineId;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineId);
+      callback(value);
+    };
+    const abortRequest = (error) => {
+      settle(reject, error);
+      if (response && !response.destroyed) response.destroy(error);
+      if (req && !req.destroyed) req.destroy(error);
+    };
+    const timeoutError = () => new Error(`Request timed out after ${timeout}ms`);
+
+    deadlineId = setTimeout(() => abortRequest(timeoutError()), timeout);
+    req = https.request({
       method,
       hostname: parsed.hostname,
       path: parsed.pathname + (parsed.search || ''),
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      port: parsed.port || 443,
       headers: requestHeaders,
       timeout,
     }, (res) => {
+      response = res;
+      if (res.statusCode >= 300 && res.statusCode < 400) {
+        abortRequest(new Error(`Redirect response rejected with status ${res.statusCode}`));
+        return;
+      }
+
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
+      let receivedBytes = 0;
+      res.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_RESPONSE_BYTES) {
+          abortRequest(new Error(`Response exceeded ${MAX_RESPONSE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('error', (error) => settle(reject, error));
       res.on('end', () => {
+        if (settled) return;
         const text = Buffer.concat(chunks).toString();
         let parsedBody;
         try {
@@ -429,7 +652,7 @@ function requestJson(method, urlString, body, timeout, headers = {}) {
         } catch (error) {
           parsedBody = text;
         }
-        resolve({
+        settle(resolve, {
           ok: res.statusCode >= 200 && res.statusCode < 300,
           statusCode: res.statusCode,
           headers: res.headers || {},
@@ -438,10 +661,9 @@ function requestJson(method, urlString, body, timeout, headers = {}) {
       });
     });
 
-    req.on('error', reject);
+    req.on('error', (error) => settle(reject, error));
     req.on('timeout', () => {
-      req.destroy();
-      reject(new Error(`Request timed out after ${timeout}ms`));
+      abortRequest(timeoutError());
     });
 
     if (data) req.write(data);
@@ -471,7 +693,11 @@ function requestStatus(urlString, timeout) {
       res.on('end', () => resolve({ status: res.statusCode }));
     });
 
-    req.on('error', (error) => resolve({ status: 'error', code: error.code || error.message }));
+    req.on('error', (error) => {
+      const rawCode = String(error && error.code || '');
+      const code = /^[A-Za-z0-9_-]{1,64}$/.test(rawCode) ? rawCode : 'request-error';
+      resolve({ status: 'error', code });
+    });
     req.on('timeout', () => {
       req.destroy();
       resolve({ status: 'timeout' });
@@ -501,8 +727,6 @@ async function diagnose(options) {
   if (options.wixSiteUrl) {
     const base = trimTrailingSlash(options.wixSiteUrl);
     const wixPaths = [
-      '/_functions/testISendLoginFromWix?env=staging',
-      '/_functions-dev/testISendLoginFromWix?env=staging',
       '/_functions/testISendLoginFromWix',
       '/_functions-dev/testISendLoginFromWix',
       '/_functions/isendWebhook',
@@ -669,11 +893,14 @@ async function checkDirectInventory(options) {
 }
 
 async function checkWixEndpoint(options) {
-  const skipped = skippedOutsideServiceWindow('wix-isend-staging', options);
+  const skipped = skippedOutsideServiceWindow(
+    'wix-isend-staging',
+    options,
+    { allowForce: false },
+  );
   if (skipped) return skipped;
 
-  const forceParam = options.force ? '&force=true' : '';
-  const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix?env=staging${forceParam}`;
+  const url = `${trimTrailingSlash(options.wixSiteUrl)}/_functions/testISendLoginFromWix`;
   const result = await requestJson('GET', url, null, options.timeout, {
     'X-ISEND-POLLER-SECRET': options.pollerSecret,
   });
@@ -734,7 +961,7 @@ async function main() {
       mode: 'offline-configuration-validation',
       outcome: success ? 'passed' : 'failed',
       success,
-      setup,
+      setup: sanitizeSetupForOutput(setup),
     }, null, 2));
     process.exit(success ? 0 : 2);
   }
@@ -752,7 +979,7 @@ async function main() {
       mode: 'configuration-validation',
       outcome: 'failed',
       success: false,
-      setup,
+      setup: sanitizeSetupForOutput(setup),
     }, null, 2));
     process.exit(2);
   }
@@ -793,7 +1020,7 @@ async function main() {
         name: check.name,
         ok: false,
         status: 'failed',
-        error: sanitizeError(error),
+        error: sanitizeError(error, [options.stagingUrl, options.wixSiteUrl]),
       });
     }
   }
@@ -807,16 +1034,20 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
-    console.error(error.message);
+  main().catch(() => {
+    console.error('Staging check failed unexpectedly');
     process.exit(1);
   });
 }
 
 module.exports = {
   getAuthenticatedSessionEvidence,
+  isApprovedISendPath,
   setupMeetsRequirements,
   summarizeResults,
+  sanitizeSetupForOutput,
+  sanitizeError,
   validateDirectISendRoot,
   validateSetup,
+  validateWixSiteRoot,
 };

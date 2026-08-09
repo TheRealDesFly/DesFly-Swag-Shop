@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => {
     elevatedMethods,
     assertMappingMutationLock: vi.fn(),
     getByISendOrderNo: vi.fn(),
+    isISendSingleParcelContractConfirmed: vi.fn(),
     releaseProcessed: vi.fn(),
     updateProcessed: vi.fn(),
     withMappingMutationLock: vi.fn(),
@@ -31,6 +32,9 @@ vi.mock('backend/isendIdempotency', () => ({
 }));
 vi.mock('backend/isendMappings', () => ({
   getByISendOrderNo: mocks.getByISendOrderNo,
+}));
+vi.mock('backend/isendFulfillmentContract', () => ({
+  isISendSingleParcelContractConfirmed: mocks.isISendSingleParcelContractConfirmed,
 }));
 vi.mock('backend/isendMappingMutationLock', () => ({
   MAX_MAPPING_MUTATION_LEASE_MS: 5 * 60 * 1000,
@@ -53,19 +57,23 @@ describe('Wix eCommerce fulfillment creation', () => {
       wixOrderId: 'wix-order-1',
       meta: { lastKnownISendStatus: 'SHIPPED' },
     });
+    mocks.isISendSingleParcelContractConfirmed.mockResolvedValue(true);
     mocks.withMappingMutationLock.mockImplementation(async (iSendOrderNo, callback) => (
       callback({ iSendOrderNo })
     ));
     mocks.createWixFulfillment.mockResolvedValue({ fulfillmentId: 'fulfillment-1' });
     mocks.getWixOrder.mockResolvedValue({
       _id: 'wix-order-1',
+      status: 'APPROVED',
+      paymentStatus: 'PAID',
+      fulfillmentStatus: 'NOT_FULFILLED',
       lineItems: [{ _id: 'line-item-1', quantity: 1 }],
     });
     mocks.releaseProcessed.mockResolvedValue({});
     mocks.updateProcessed.mockResolvedValue({});
   });
 
-  it('uses one order-level claim to prohibit a second tracking number', async () => {
+  it('allows a confirmed single-parcel event and prohibits a later second tracking number', async () => {
     const options = {
       environment: 'staging',
       lineItems: [{ _id: 'line-item-1', quantity: 1 }],
@@ -73,8 +81,8 @@ describe('Wix eCommerce fulfillment creation', () => {
     };
     await createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', options);
 
-    const orderLevelKey = getSingleParcelFulfillmentKey('ISEND-1');
-    expect(orderLevelKey).toBe('isend:ISEND-1:single-parcel-fulfillment');
+    const orderLevelKey = getSingleParcelFulfillmentKey('ISEND-1', 'staging');
+    expect(orderLevelKey).toBe('isend:staging:ISEND-1:single-parcel-fulfillment');
     expect(mocks.claimProcessed).toHaveBeenCalledWith(
       orderLevelKey,
       expect.objectContaining({ trackingNumber: 'TRACK123' }),
@@ -95,9 +103,8 @@ describe('Wix eCommerce fulfillment creation', () => {
       'wix-order-1',
       { ...options, trackingNumber: 'TRACK456' },
     )).rejects.toMatchObject({
-      code: 'fulfillment-reconciliation-required',
-      idempotencyKey: orderLevelKey,
-      idempotencyStatus: 'completed-key-mismatch',
+      code: 'unsupported-isend-split-shipment',
+      retryable: false,
     });
     expect(mocks.createWixFulfillment).toHaveBeenCalledTimes(1);
     expect(mocks.withMappingMutationLock).toHaveBeenLastCalledWith(
@@ -105,6 +112,26 @@ describe('Wix eCommerce fulfillment creation', () => {
       expect.any(Function),
       { leaseMs: 5 * 60 * 1000 },
     );
+  });
+
+  it('blocks the first ambiguous tracking event while the partner contract is unconfirmed', async () => {
+    mocks.isISendSingleParcelContractConfirmed.mockResolvedValue(false);
+
+    await expect(createISendSingleParcelFulfillment(
+      'ISEND-1',
+      'wix-order-1',
+      {
+        environment: 'staging',
+        trackingNumber: 'TRACK123',
+      },
+    )).rejects.toMatchObject({
+      code: 'isend-single-parcel-contract-unconfirmed',
+      retryable: false,
+    });
+
+    expect(mocks.withMappingMutationLock).not.toHaveBeenCalled();
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
   });
 
   it('skips a single-parcel fulfillment after a final mapping status', async () => {
@@ -140,9 +167,153 @@ describe('Wix eCommerce fulfillment creation', () => {
     expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['multiple tracking numbers', {
+      trackingNumber: 'TRACK123',
+      trackingNumbers: ['TRACK123', 'TRACK456'],
+    }],
+    ['an array in the primary tracking field', {
+      trackingNumber: ['TRACK123', 'TRACK456'],
+    }],
+    ['multiple parcel records', {
+      trackingNumber: 'TRACK123',
+      parcels: [
+        { trackingNumber: 'TRACK123' },
+        { trackingNumber: 'TRACK456' },
+      ],
+    }],
+    ['a declared multi-parcel count', {
+      trackingNumber: 'TRACK123',
+      parcelCount: 2,
+    }],
+    ['a malformed declared parcel count', {
+      trackingNumber: 'TRACK123',
+      parcelCount: 'unknown',
+    }],
+    ['contradictory declared parcel counts', {
+      trackingNumber: 'TRACK123',
+      parcelCount: 1,
+      totalParcels: 2,
+    }],
+    ['empty explicit parcel metadata', {
+      trackingNumber: 'TRACK123',
+      parcelCount: 1,
+      parcels: [],
+    }],
+    ['an empty trackingNumbers declaration that contradicts the primary value', {
+      trackingNumber: 'TRACK123',
+      trackingNumbers: [],
+    }],
+    ['a parcel line-item allocation', {
+      trackingNumber: 'TRACK123',
+      lineItemAllocations: [{ lineItemId: 'line-item-1', quantity: 1 }],
+    }],
+  ])('fails closed for %s before acquiring a lock or claim', async (_label, splitFields) => {
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      ...splitFields,
+    })).rejects.toMatchObject({
+      code: 'unsupported-isend-split-shipment',
+      retryable: false,
+    });
+
+    expect(mocks.withMappingMutationLock).not.toHaveBeenCalled();
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when Wix is already partially fulfilled', async () => {
+    mocks.getWixOrder.mockResolvedValue({
+      _id: 'wix-order-1',
+      status: 'APPROVED',
+      paymentStatus: 'PAID',
+      fulfillmentStatus: 'PARTIALLY_FULFILLED',
+      lineItems: [
+        { _id: 'line-item-1', quantity: 2, fulfilledQuantity: 1 },
+      ],
+    });
+
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({
+      code: 'unsupported-isend-split-shipment',
+      retryable: false,
+    });
+
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when fulfilled quantities show completion but Wix status is stale', async () => {
+    mocks.getWixOrder.mockResolvedValue({
+      _id: 'wix-order-1',
+      status: 'APPROVED',
+      paymentStatus: 'PAID',
+      fulfillmentStatus: '',
+      lineItems: [
+        { _id: 'line-item-1', quantity: 1, fulfilledQuantity: 1 },
+        { _id: 'line-item-2', quantity: 2, fulfilledQuantity: 2 },
+      ],
+    });
+
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging',
+      trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({
+      code: 'unsupported-isend-split-shipment',
+      retryable: false,
+    });
+
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['CANCELED', 'PAID', 'NOT_FULFILLED', 'isend-wix-order-not-fulfillable'],
+    ['APPROVED', 'FULLY_REFUNDED', 'NOT_FULFILLED', 'isend-wix-order-refund-review-required'],
+    ['APPROVED', 'PARTIALLY_REFUNDED', 'NOT_FULFILLED', 'isend-wix-order-refund-review-required'],
+    ['APPROVED', 'PAID', 'FULFILLED', 'isend-wix-order-already-fulfilled'],
+  ])(
+    'fails closed for Wix lifecycle state %s/%s/%s',
+    async (status, paymentStatus, fulfillmentStatus, code) => {
+      mocks.getWixOrder.mockResolvedValue({
+        _id: 'wix-order-1',
+        status,
+        paymentStatus,
+        fulfillmentStatus,
+        lineItems: [{ _id: 'line-item-1', quantity: 1 }],
+      });
+
+      await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+        environment: 'staging',
+        trackingNumber: 'TRACK123',
+      })).rejects.toMatchObject({
+        code,
+        retryable: false,
+      });
+
+      expect(mocks.claimProcessed).not.toHaveBeenCalled();
+      expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+    },
+  );
+
+  it('scopes single-parcel idempotency keys by environment', () => {
+    expect(getSingleParcelFulfillmentKey('ISEND-1', 'staging'))
+      .toBe('isend:staging:ISEND-1:single-parcel-fulfillment');
+    expect(getSingleParcelFulfillmentKey('ISEND-1', 'production'))
+      .toBe('isend:production:ISEND-1:single-parcel-fulfillment');
+    expect(() => getSingleParcelFulfillmentKey('ISEND-1')).toThrow(
+      'requires an explicit iSend environment',
+    );
+  });
+
   it('rejects partial line items before consuming the order-level claim', async () => {
     mocks.getWixOrder.mockResolvedValue({
       _id: 'wix-order-1',
+      status: 'APPROVED',
+      paymentStatus: 'PAID',
+      fulfillmentStatus: 'NOT_FULFILLED',
       lineItems: [
         { _id: 'line-item-1', quantity: 1 },
         { _id: 'line-item-2', quantity: 2 },
@@ -179,6 +350,9 @@ describe('Wix eCommerce fulfillment creation', () => {
   it('uses every authoritative Wix line item when the caller omits line items', async () => {
     mocks.getWixOrder.mockResolvedValue({
       _id: 'wix-order-1',
+      status: 'APPROVED',
+      paymentStatus: 'PAID',
+      fulfillmentStatus: 'NOT_FULFILLED',
       lineItems: [
         { _id: 'line-item-2', quantity: 2 },
         { _id: 'line-item-1', quantity: 1 },
@@ -289,6 +463,7 @@ describe('Wix eCommerce fulfillment creation', () => {
       idempotencyKey: 'reused-key',
     })).rejects.toMatchObject({
       code: 'fulfillment-reconciliation-required',
+      retryable: false,
       idempotencyStatus: 'completed-key-mismatch',
     });
 
@@ -335,6 +510,7 @@ describe('Wix eCommerce fulfillment creation', () => {
     })).rejects.toMatchObject({
       name: 'FulfillmentReconciliationRequiredError',
       code: 'fulfillment-reconciliation-required',
+      retryable: false,
       orderId: 'wix-order-1',
       idempotencyKey: 'fulfillment-key',
       idempotencyStatus: status || 'unknown',
@@ -352,6 +528,7 @@ describe('Wix eCommerce fulfillment creation', () => {
       idempotencyKey: 'fulfillment-key',
     })).rejects.toMatchObject({
       code: 'fulfillment-reconciliation-required',
+      retryable: false,
       idempotencyStatus: 'unknown_outcome',
     });
 
@@ -374,6 +551,7 @@ describe('Wix eCommerce fulfillment creation', () => {
       idempotencyKey: 'fulfillment-key',
     })).rejects.toMatchObject({
       code: 'fulfillment-reconciliation-required',
+      retryable: false,
       idempotencyStatus: 'processing',
     });
 
@@ -390,6 +568,7 @@ describe('Wix eCommerce fulfillment creation', () => {
       idempotencyKey: 'fulfillment-key',
     })).rejects.toMatchObject({
       code: 'fulfillment-reconciliation-required',
+      retryable: false,
       idempotencyStatus: 'processing',
     });
 

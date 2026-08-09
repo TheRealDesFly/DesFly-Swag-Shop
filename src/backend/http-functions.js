@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { testISendLogin } from 'backend/isendService';
 import {
   createISendSingleParcelFulfillment,
+  extractISendParcelContractMetadata,
   getSingleParcelFulfillmentKey,
 } from 'backend/orderFulfillment';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
@@ -73,6 +74,43 @@ function endpointConfigurationErrorResponse() {
   });
 }
 
+function safeCount(value) {
+  const normalized = Number(value);
+  return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : 0;
+}
+
+const SAFE_POLLER_FAILURE_STAGES = new Set([
+  'business-response',
+  'environment-binding',
+  'fulfillment',
+  'getOrder',
+  'query-identity',
+  'reconciliation-state',
+  'status',
+  'tracking',
+  'tracking-allocation',
+]);
+
+function pollerFailureResponse(result) {
+  const failureDetails = Array.isArray(result && result.details)
+    ? result.details.filter((detail) => detail && detail.success === false)
+    : [];
+  const failedStages = Array.from(new Set(failureDetails
+    .map((detail) => String(detail.stage || '').trim())
+    .filter((stage) => SAFE_POLLER_FAILURE_STAGES.has(stage))))
+    .sort();
+
+  return {
+    success: false,
+    code: 'isend-poller-failed',
+    message: 'iSend poller reported one or more failures',
+    processedMappings: safeCount(result && result.processedMappings),
+    processed: safeCount(result && result.processed),
+    failureCount: Math.max(failureDetails.length, 1),
+    failedStages,
+  };
+}
+
 /**
  * A simple HTTP GET endpoint to validate iSend credentials from Wix.
  * This function is called from the frontend or a webhook tester.
@@ -87,8 +125,24 @@ export async function get_testISendLoginFromWix(request) {
       return jsonResponse(401, { success: false, message: 'Unauthorized' });
     }
 
-    const force = request && request.query && request.query.force === 'true';
-    const result = await testISendLogin({ force, environment: 'staging' });
+    let environment;
+    try {
+      environment = await getConfiguredISendEnvironment();
+    } catch (error) {
+      throw new SecretConfigurationError('Missing or invalid configured iSend environment');
+    }
+    if (environment !== 'staging') {
+      return jsonResponse(409, {
+        success: false,
+        code: 'staging-diagnostic-disabled',
+        message: 'Staging diagnostic is disabled for this site environment',
+      });
+    }
+
+    // The configured site environment and the service-window check inside
+    // testISendLogin are authoritative. Query parameters cannot override
+    // either release boundary.
+    const result = await testISendLogin({ environment });
     return ok({
       headers: {
         'Content-Type': 'application/json',
@@ -140,7 +194,10 @@ export async function post_isendWebhook(request) {
       : !result || result.success === false ? 500 : 200;
     return jsonResponse(status, result || { success: false, message: 'Webhook handler returned no result' });
   } catch (error) {
-    return serverError({ headers: { 'Content-Type': 'application/json' }, body: { success: false, message: error.message } });
+    return serverError({
+      headers: { 'Content-Type': 'application/json' },
+      body: { success: false, message: 'Webhook processing failed' },
+    });
   }
 }
 
@@ -154,16 +211,18 @@ export async function post_runISendPoller(request) {
       return jsonResponse(401, { success: false, message: 'Unauthorized' });
     }
 
-    const { payload } = await consumeJsonRequestBody(request);
-    const types = payload && payload.types ? payload.types : ['tracking', 'status'];
+    await consumeJsonRequestBody(request);
     // The site's configured ISTORE_ISEND_ENV is authoritative. A remote
-    // trigger must not redirect this Wix site across staging/production.
-    const result = await runPoller({ types });
+    // trigger must not redirect this Wix site across staging/production or
+    // expand the scheduled webhook safety net into a broad/manual data scan.
+    const result = await runPoller({
+      types: ['tracking', 'status'],
+      limit: 5,
+      maxPages: 1,
+      reconciliationOnly: true,
+    });
     if (!result || result.success !== true) {
-      return jsonResponse(500, result || {
-        success: false,
-        message: 'iSend poller returned no result',
-      });
+      return jsonResponse(500, pollerFailureResponse(result));
     }
     return ok({ headers: { 'Content-Type': 'application/json' }, body: result });
   } catch (error) {
@@ -173,7 +232,10 @@ export async function post_runISendPoller(request) {
     if (error instanceof RequestBodyError) {
       return requestBodyErrorResponse(error);
     }
-    return serverError({ headers: { 'Content-Type': 'application/json' }, body: { success: false, message: error.message } });
+    return serverError({
+      headers: { 'Content-Type': 'application/json' },
+      body: { success: false, message: 'iSend poller failed' },
+    });
   }
 }
 
@@ -249,6 +311,11 @@ export async function post_createFulfillmentFromWix(request) {
       shippingProvider,
       trackingLink,
       idempotencyKey,
+      trackingNumbers,
+      parcels,
+      parcelCount,
+      totalParcels,
+      lineItemAllocations,
     } = payload || {};
 
     if (!orderId) {
@@ -272,7 +339,11 @@ export async function post_createFulfillmentFromWix(request) {
       });
     }
 
-    const canonicalIdempotencyKey = getSingleParcelFulfillmentKey(normalizedISendOrderNo);
+    const environment = await getConfiguredISendEnvironment();
+    const canonicalIdempotencyKey = getSingleParcelFulfillmentKey(
+      normalizedISendOrderNo,
+      environment,
+    );
     const suppliedIdempotencyKey = String(idempotencyKey || '').trim();
     if (suppliedIdempotencyKey && suppliedIdempotencyKey !== canonicalIdempotencyKey) {
       return jsonResponse(400, {
@@ -282,7 +353,14 @@ export async function post_createFulfillmentFromWix(request) {
       });
     }
 
-    const environment = await getConfiguredISendEnvironment();
+    const parcelContract = extractISendParcelContractMetadata({
+      ...(payload || {}),
+      trackingNumbers,
+      parcels,
+      parcelCount,
+      totalParcels,
+      lineItemAllocations,
+    });
     const result = await createISendSingleParcelFulfillment(
       normalizedISendOrderNo,
       orderId,
@@ -292,6 +370,7 @@ export async function post_createFulfillmentFromWix(request) {
         trackingNumber,
         shippingProvider,
         trackingLink,
+        ...parcelContract,
       },
     );
 
@@ -325,9 +404,20 @@ export async function post_createFulfillmentFromWix(request) {
         message: 'Fulfillment line items do not match the authoritative Wix order',
       });
     }
+    if (error && error.retryable === false) {
+      return jsonResponse(
+        error.code === 'unsupported-isend-split-shipment' ? 409 : 422,
+        {
+          success: false,
+          retryable: false,
+          code: error.code || 'invalid-fulfillment-contract',
+          message: error.message,
+        },
+      );
+    }
     return serverError({
       headers: { 'Content-Type': 'application/json' },
-      body: { success: false, message: error.message },
+      body: { success: false, message: 'Fulfillment request failed' },
     });
   }
 }
