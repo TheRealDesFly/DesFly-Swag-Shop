@@ -15,10 +15,13 @@ const activeLines = workflow.split(/\r?\n/).filter(
 
 describe('iSend staging smoke workflow contract', () => {
   it('stores workflow as YAML-valid local-first disabled config', () => {
-    expect(activeLines).toHaveLength(3);
+    expect(activeLines.length).toBeGreaterThanOrEqual(6);
     expect(activeLines).toContain('name: iSend Staging Smoke Tests (disabled)');
     expect(activeLines).toContain('on: []');
-    expect(activeLines).toContain('jobs: {}');
+    expect(activeLines).toContain('jobs:');
+    expect(activeLines).toContain('  noop-staging-smoke-inactive:');
+    expect(activeLines).toContain('    if: false');
+    expect(activeLines).toContain('    runs-on: ubuntu-latest');
     expect(workflow).toContain('# name: iSend Staging Smoke Tests');
     expect(workflow).toContain('uses: actions/checkout@v4');
     expect(workflow).toContain('uses: actions/setup-node@v4');
@@ -26,11 +29,12 @@ describe('iSend staging smoke workflow contract', () => {
 
   it('asserts intentionally-disabled triggers and live-probe controls are inactive', () => {
     expect(workflow).toContain('on: []');
-    expect(workflow).toContain('jobs: {}');
+    expect(workflow).toContain('jobs:');
+    expect(activeLines).toContain('    if: false');
     expect(workflow).toContain('# on:');
     expect(workflow).toContain('# jobs:');
-    expect(workflow).not.toMatch(/^[ \t]+on:/m);
-    expect(workflow).not.toMatch(/^[ \t]+jobs:/m);
+    expect(workflow).not.toMatch(/^[ \t]+on:\s*$/m);
+    expect(workflow).not.toMatch(/^[ \t]+jobs:\s*$/m);
     expect(workflow).not.toMatch(/^[ \t]+concurrency:/m);
   });
 

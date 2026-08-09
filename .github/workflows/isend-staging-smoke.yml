@@ -1,6 +1,12 @@
 name: iSend Staging Smoke Tests (disabled)
 on: []
-jobs: {}
+jobs:
+  noop-staging-smoke-inactive:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Intentional local-first disabled state
+        run: echo "iSend staging smoke checks are intentionally disabled."
 
 # name: iSend Staging Smoke Tests
 
