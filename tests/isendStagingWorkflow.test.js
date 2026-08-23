@@ -1,52 +1,37 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const workflow = fs.readFileSync(
-  new URL('../.github/workflows/isend-staging-smoke.yml', import.meta.url),
-  'utf8',
-);
-
-const activeLines = workflow.split(/\r?\n/).filter(
-  (line) => {
-    const trimmed = line.trim();
-    return trimmed.length > 0 && !/^#/.test(trimmed);
-  },
-);
+const workflowsDir = new URL('../.github/workflows', import.meta.url);
 
 describe('iSend staging smoke workflow contract', () => {
-  it('stores workflow as YAML-valid local-first disabled config', () => {
-    expect(activeLines.length).toBeGreaterThanOrEqual(6);
-    expect(activeLines).toContain('name: iSend Staging Smoke Tests (disabled)');
-    expect(activeLines).toContain('on: []');
-    expect(activeLines).toContain('jobs:');
-    expect(activeLines).toContain('  noop-staging-smoke-inactive:');
-    expect(activeLines).toContain('    if: false');
-    expect(activeLines).toContain('    runs-on: ubuntu-latest');
-    expect(workflow).toContain('# name: iSend Staging Smoke Tests');
-    expect(workflow).toContain('uses: actions/checkout@v4');
-    expect(workflow).toContain('uses: actions/setup-node@v4');
+  it('keeps GitHub Actions smoke workflows absent by local-first policy', () => {
+    const workflowFiles = fs.existsSync(workflowsDir)
+      ? fs.readdirSync(workflowsDir).filter((entry) => /\.(ya?ml)$/i.test(entry))
+      : [];
+
+    expect(workflowFiles).toEqual([]);
+    expect(fs.existsSync(new URL('../.github/workflows/isend-staging-smoke.yml', import.meta.url)))
+      .toBe(false);
   });
 
-  it('asserts intentionally-disabled triggers and live-probe controls are inactive', () => {
-    expect(workflow).toContain('on: []');
-    expect(workflow).toContain('jobs:');
-    expect(activeLines).toContain('    if: false');
-    expect(workflow).toContain('# on:');
-    expect(workflow).toContain('# jobs:');
-    expect(workflow).not.toMatch(/^[ \t]+on:\s*$/m);
-    expect(workflow).not.toMatch(/^[ \t]+jobs:\s*$/m);
-    expect(workflow).not.toMatch(/^[ \t]+concurrency:/m);
-  });
+  it('does not leave workflow YAML elsewhere under .github', () => {
+    const githubDir = new URL('../.github', import.meta.url);
+    const found = [];
 
-  it('preserves the default-branch and Malaysia service-window release gates', () => {
-    expect(workflow).toContain(
-      "if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}",
-    );
-    expect(workflow).toContain('expected_ref="refs/heads/${DEFAULT_BRANCH}"');
-    expect(workflow).toContain('if [[ "$GITHUB_REF" != "$expected_ref" ]]');
-    expect(workflow).toContain('if (( myt_hour >= 10 && myt_hour < 22 )); then');
-    expect(workflow).toContain(
-      "if: ${{ needs.service_window.outputs.within == 'true' }}",
-    );
+    function walk(dir) {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const current = path.join(dir.pathname, entry.name);
+        if (entry.isDirectory()) {
+          walk(current);
+        } else if (/\.(ya?ml)$/i.test(entry.name)) {
+          found.push(entry.name);
+        }
+      }
+    }
+
+    walk(githubDir);
+    expect(found).toEqual([]);
   });
 });

@@ -211,23 +211,9 @@ npm run check:staging -- --force --inventory
 
 `npm run check:staging:diagnose` reports Wix route status codes and iSend port reachability without printing the configured hostnames or secrets. It cannot bypass the Wix diagnostic's configured-staging or service-window gates.
 
-## GitHub Actions Secrets
+## GitHub Actions
 
-For `.github/workflows/isend-staging-smoke.yml`, configure:
-
-- `ISTORE_ISEND_API_USER_ID`
-- `ISTORE_ISEND_API_PASSWORD`
-- `ISTORE_ISEND_SANDBOX_URL`
-- `WIX_SITE_BASE_URL`
-- `ISEND_POLLER_TRIGGER_SECRET`
-
-The workflow has three deliberately separate behaviors:
-
-- Every pull request and push runs PR-safe offline checks: `npm ci`, lint, the unit test suite, script syntax, acceptance of a documented allowlisted direct iSend root, and rejection of a Wix function URL. Forked pull requests do not receive secrets and make no staging requests.
-- Scheduled runs occur at 11:23, 15:23, and 19:23 MYT. This replaces the previous every-30-minute schedule to reduce load while retaining three daily checks.
-- Scheduled and manually dispatched runs pass through a 10:00-22:00 MYT gate and are restricted to the repository's default branch. An outside-window manual request or non-default-branch live request fails explicitly; a delayed scheduled run outside the window records a neutral skip. Inside the window, CI requires all five secrets above, then requires both the direct iSend and published Wix probes to run and pass. Missing secrets, skipped probes, and failed probes cannot satisfy the live job.
-
-The workflow has read-only repository permissions and bounds every job with a timeout. Scheduled/manual live probes share a serialized live concurrency group; push and pull-request validation use separate event-specific groups and cannot cancel a live probe. First-party actions are pinned to reviewed immutable release SHAs.
+The repository intentionally has no GitHub Actions workflows. Live staging proof is collected from the owner-approved local or Wix-side smoke commands in this runbook, during the 10:00-22:00 MYT service window, and retained as redacted evidence. Do not reintroduce a workflow without a separate approval and capacity-model update.
 
 ## Retry-Exhausted Requeue And Unknown Outcomes
 

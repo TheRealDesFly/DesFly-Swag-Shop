@@ -14,7 +14,7 @@ Record the evidence here or in the team's controlled change record. Do not recor
 | Wix target | Site ID and owner account |
 | Preview | Preview URL and reviewer approval |
 | Publication | Publish timestamp and Wix deployment/build result |
-| Strict staging workflow | GitHub Actions run URL and result |
+| Strict staging probe | Redacted local or Wix-side diagnostic command output and result |
 | Staging canary | Wix order ID, iSend `custOrderNo`, tracking number, and timestamps |
 | Production authorization | Named approver and partner-contract references |
 
@@ -26,7 +26,7 @@ Do not put secret values in this document, chat, tickets, screenshots, or retain
 | --- | --- | --- |
 | Owner explicitly authorizes Admin-only read/write permissions and creation/repair of all nine Wix integration collections, fields, and indexes. | The two existing collections currently expose content to Everyone; required lifecycle, mapping, idempotency, audit, inventory, email, maintenance, and index state is incomplete. | Compare every hosted collection ID, field type, permission, item count/migration, and active index to this manifest. |
 | Owner securely provisions all thirteen Wix secret names, binds `ISTORE_ISEND_DEPLOYED_REVISION` to the exact source SHA being published, and keeps `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset/non-`true` until partner approval. | Webhook authentication, protected poll/fulfillment/recovery routes, environment selection, capacity-evidence binding, and single-parcel fulfillment fail closed without them. | Verify names, selected staging environment, and deployed-revision equality without displaying credential values; test authorized/unauthorized route behavior. |
-| Repository owner preserves the five verified GitHub Actions secret names and confirms their staging-scoped values through the strict live probe. | Read-only repository inspection proves the names exist but cannot read values or establish that they target the reviewed staging environment. | Run the pinned default-branch workflow during the MYT window and retain redacted direct/Wix authenticated-session evidence. |
+| Owner preserves the private local and Wix staging diagnostic inputs and confirms their staging-scoped values through the strict live probe. | Read-only source inspection proves only required names, not values or target correctness. | Run the owner-approved local or Wix-side probe during the MYT window and retain redacted direct/Wix authenticated-session evidence. |
 | Network/iSend owner makes the reviewed staging endpoint reachable from the approved runner, including any source-IP/firewall allowlist. | Direct login and inventory currently time out from this runner. | Repeat redacted reachability, login, and inventory checks inside the service window. |
 | Partner confirms `custOrderNo` create/query/webhook semantics, uniqueness scope, signed-body fields/HMAC rules, event ordering, and request/concurrency limits. | Mapping, dedupe, monotonic status, and capacity must use authoritative identities and limits rather than inference. | Validate real redacted create/query/webhook shapes, identity-mismatch rejection, replay, delayed-event handling, and capacity headroom. |
 | Partner approves the one-complete-parcel contract or supplies an allocation contract mapping every tracking number to Wix line-item IDs/quantities. | Fulfillment is deliberately disabled until this is proven; multi/contradictory parcel evidence fails closed. | Prove one-parcel success/idempotent replay and rejection of multiple, contradictory, partial, or sequential second tracking cases without a second fulfillment. |
@@ -57,7 +57,7 @@ Keep the environment selector on the staging environment through staging accepta
 
 The protected fulfillment endpoint is not a split-shipment escape hatch. It requires the mapped `iSendOrderNo` and one tracking number, reads the full authoritative Wix order inside the single-parcel coordinator, and rejects partial line-item assertions or caller-selected keys. Leave `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset or non-`true` until the named approver records partner confirmation that every order has one complete parcel; missing, unreadable, or other values fail closed. Set it to exactly `true` only with that evidence.
 
-The GitHub Actions live probe has its own repository-secret configuration. It requires these exact names:
+The local live probe requires these exact private inputs:
 
 - `ISTORE_ISEND_API_USER_ID`
 - `ISTORE_ISEND_API_PASSWORD`
@@ -69,7 +69,7 @@ Acceptance:
 
 - Wix reports all thirteen backend secret names present.
 - The staging environment is selected.
-- The GitHub repository reports all five workflow secret names present.
+- The local smoke configuration reports all five live-probe input names present when required.
 - No secret value appears in source, command output retained as evidence, or screenshots.
 
 ## 2. Provision Wix Data
@@ -292,9 +292,9 @@ Create a Wix Automation triggered when an item is added to `ISendPendingEmails` 
 
 Test the automation with a controlled recipient before using a customer order.
 
-## 6. Run the Strict Staging Workflow
+## 6. Run the Strict Staging Probe
 
-Run the `iSend Staging Smoke Tests` workflow from the repository's default branch during 10:00-22:00 Malaysia Time. Retain a run in which:
+Run the local or Wix-side staging smoke probe from the exact reviewed source revision during 10:00-22:00 Malaysia Time. Retain redacted evidence in which:
 
 - offline validation, lint, and all unit tests pass;
 - the direct iSend login probe runs and passes;
@@ -302,14 +302,14 @@ Run the `iSend Staging Smoke Tests` workflow from the repository's default branc
 - neither live probe is skipped; and
 - the overall live result is `passed`, not `neutral` or `partial`.
 
-Local preflight may be run with:
+Local preflight is:
 
 ```bash
 npm run check:staging:setup -- --require-direct --require-wix
 npm run check:staging
 ```
 
-Local readiness does not replace the default-branch GitHub workflow or Wix publication evidence.
+Local readiness does not replace Wix publication evidence.
 
 ## 7. Capture One End-to-End Single-Parcel Staging Order
 
@@ -413,7 +413,7 @@ Record the decisions and sample redacted payloads with the production authorizat
 
 ## 11. Production Canary
 
-Do not start the canary until secrets, data, publication, strict workflow, single-parcel staging evidence, reconciliation drills, capacity acceptance, alerts, and partner decisions are all complete.
+Do not start the canary until secrets, data, publication, strict staging probe, single-parcel staging evidence, reconciliation drills, capacity acceptance, alerts, and partner decisions are all complete.
 
 1. Schedule the canary inside the iSend service window with Wix, iSend, and operations owners present.
 2. Freeze or tightly control normal order intake so only one identified single-parcel canary can enter the new path.

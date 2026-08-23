@@ -18,7 +18,7 @@ const DEPLOYED_PLAN = Object.freeze({
   retentionVerificationBatchSize: 100,
   retentionBulkDeleteSize: 500,
   operationalHealthScheduledCyclesPerDay: 24,
-  stagingSmokeScheduledCyclesPerDay: 3,
+  stagingSmokeScheduledCyclesPerDay: 0,
   smokeProviderRequestsPerCycle: 4,
   capacityUtilizationTarget: 0.8,
   runtimeSafetyTarget: 0.8,
@@ -945,12 +945,14 @@ function verifyDeployedPlan(projectRoot) {
       );
     }
   }
-  const smokeWorkflow = fs.readFileSync(
-    path.join(projectRoot, '.github/workflows/isend-staging-smoke.yml'),
-    'utf8',
-  );
-  if (!smokeWorkflow.includes('23 3,7,11 * * *')) {
-    throw new Error('Capacity model cannot verify the three deployed staging smoke cycles');
+  const workflowsDir = path.join(projectRoot, '.github/workflows');
+  const workflowFiles = fs.existsSync(workflowsDir)
+    ? fs.readdirSync(workflowsDir).filter((entry) => /\.(ya?ml)$/i.test(entry))
+    : [];
+  if (workflowFiles.length) {
+    throw new Error(
+      `Capacity model expects no GitHub Actions smoke workflow; found ${workflowFiles.join(', ')}`,
+    );
   }
   return { ...DEPLOYED_PLAN };
 }
