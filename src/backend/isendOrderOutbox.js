@@ -2,9 +2,12 @@
  * Durable outbound queue for Wix orders sent to iStore/iSend.
  *
  * Required Wix Data collections and recommended indexes:
- * - ISendOrderOutbox: compound indexes on status with `nextAttemptAt`,
- *   `retryExhausted`, and `leaseExpiresAt`. The deterministic item ID is the
- *   order-key identity boundary without consuming a fourth regular index.
+ * - ISendOrderOutbox: compound indexes on status with `nextAttemptAt` and
+ *   `leaseExpiresAt`, plus a regular `lifecycleRequiresAttention` index.
+ *   The retry-exhausted health query is environment-scoped and uses the
+ *   status/environment prefix of the queue indexes, preserving Wix's
+ *   three-regular-index limit. The deterministic item ID is the order-key
+ *   identity boundary.
  * - ISendOrderOutboxClaims: a compound index on `claimKey`, `generation`.
  * Both collections must use Admin-only content permissions because the order
  * snapshot contains customer and delivery data.
@@ -2452,6 +2455,7 @@ async function findPersistentAttention(now, currentEnvironment) {
       .find(TRUSTED_READ_OPTIONS),
     wixData.query(OUTBOX_COLLECTION)
       .eq('status', OUTBOX_STATUS.RETRY)
+      .eq('environment', currentEnvironment)
       .eq('retryExhausted', true)
       .limit(ATTENTION_SCAN_LIMIT)
       .find(TRUSTED_READ_OPTIONS),

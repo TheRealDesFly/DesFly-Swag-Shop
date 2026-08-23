@@ -93,7 +93,7 @@ Recommended indexes:
 - `ISendOrderMap.iSendOrderNo` unique so one customer-order identity cannot resolve to two Wix orders. This remains global and fail-closed until cross-environment reuse can be authenticated safely.
 - `ISendOrderMap.(environment, reconciliationActive, lastReconciledAt)` compound regular index for the bounded current-environment safety net.
 - `ISendProcessedEvents.idempotencyKey` unique; deterministic IDs plus a legacy-row pre-read protect upgraded code, and the index closes old/new deployment races.
-- `ISendOrderOutbox.(status, environment, nextAttemptAt)`, `(status, environment, retryExhausted)`, and `(status, environment, leaseExpiresAt)`; add `lifecycleRequiresAttention` and validate whether the target plan can also support `(environment, lifecycleRequiresAttention)`.
+- `ISendOrderOutbox.(status, environment, nextAttemptAt)` and `(status, environment, leaseExpiresAt)`, plus `lifecycleRequiresAttention`. The retry-exhausted health query is scoped to the current environment and uses the status/environment prefix of the queue indexes; mismatch and unassigned scans cover other environment states.
 - `ISendOrderLifecycleIntents.(orderKey, environment, recordedAt descending)`.
 - `ISendOrderOutboxClaims.(claimKey ascending, generation descending)` compound; `leaseExpiresAt` and `releasedAt` regular. Retention also requires target-site query-plan proof for `releasedAt` plus `_id` cursor/order and empty `releasedAt` plus `leaseExpiresAt`; block deletion if the plan needs a different compound-index/cursor design.
 - `ISendInventory.(environment, sku)` compound regular; a deterministic environment/SKU `_id` is the concurrency identity boundary.

@@ -89,9 +89,8 @@ Create all nine collections below. Set content permissions to Admin-only read an
 Indexes:
 
 - Compound index on `status`, then `environment`, then `nextAttemptAt`.
-- Compound index on `status`, then `environment`, then `retryExhausted`.
 - Compound index on `status`, then `environment`, then `leaseExpiresAt`.
-- Regular index on `lifecycleRequiresAttention`; if the Wix plan permits another custom index, also add compound (`environment`, `lifecycleRequiresAttention`) for the environment-scoped health query. If both cannot be active, keep publication blocked until target-site query-plan evidence proves the regular index is sufficient.
+- Regular index on `lifecycleRequiresAttention`. Wix's three-regular-index limit is satisfied by the two queue indexes above plus this health index. The retry-exhausted health query must be scoped to the current environment and use the status/environment prefix of the queue indexes; mismatch and unassigned scans cover other environment states.
 
 The `status` field now also uses `canceled`. Fingerprints are lowercase SHA-256 hex. The lifecycle and attention fields are nullable except where a new order row records its initial fingerprint/event timestamps.
 
