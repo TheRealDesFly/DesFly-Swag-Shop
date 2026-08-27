@@ -1,10 +1,22 @@
-function response(status) {
-  return (options = {}) => ({ status, ...options });
+const WIX_HTTP_FUNCTION_RESPONSE = Symbol('WixHttpFunctionResponse');
+
+export function response(options = {}) {
+  const result = { ...options };
+  Object.defineProperty(result, WIX_HTTP_FUNCTION_RESPONSE, { value: true });
+  return result;
 }
 
-export const ok = response(200);
-export const badRequest = response(400);
-export const unauthorized = response(401);
-export const forbidden = response(403);
-export const notFound = response(404);
-export const serverError = response(500);
+function statusResponse(status) {
+  return (options = {}) => response({ status, ...options });
+}
+
+export function isWixHttpFunctionResponse(value) {
+  return Boolean(value && value[WIX_HTTP_FUNCTION_RESPONSE]);
+}
+
+export const ok = statusResponse(200);
+export const badRequest = statusResponse(400);
+export const unauthorized = statusResponse(401);
+export const forbidden = statusResponse(403);
+export const notFound = statusResponse(404);
+export const serverError = statusResponse(500);

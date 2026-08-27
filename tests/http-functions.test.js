@@ -51,6 +51,7 @@ import {
   post_requeueISendOrder,
   post_runISendPoller,
 } from '../src/backend/http-functions';
+import { isWixHttpFunctionResponse } from 'wix-http-functions';
 
 describe('Wix HTTP functions', () => {
   beforeEach(() => {
@@ -87,6 +88,7 @@ describe('Wix HTTP functions', () => {
     const response = await get_testISendLoginFromWix({ headers: {}, query: {} });
 
     expect(response).toMatchObject({ status: 401, body: { success: false } });
+    expect(isWixHttpFunctionResponse(response)).toBe(true);
     expect(mocks.getSecret).not.toHaveBeenCalled();
     expect(mocks.getConfiguredISendEnvironment).not.toHaveBeenCalled();
     expect(mocks.testISendLogin).not.toHaveBeenCalled();

@@ -1,4 +1,4 @@
-import { ok, serverError } from 'wix-http-functions';
+import { ok, response, serverError } from 'wix-http-functions';
 import crypto from 'crypto';
 import {
   classifyISendDiagnosticError,
@@ -20,11 +20,11 @@ import { consumeJsonRequestBody, RequestBodyError } from 'backend/requestBody';
 class SecretConfigurationError extends Error {}
 
 function jsonResponse(status, body) {
-  return {
+  return response({
     status,
     headers: { 'Content-Type': 'application/json' },
     body,
-  };
+  });
 }
 
 function requestBodyErrorResponse(error) {
