@@ -5,12 +5,12 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const DEPLOYED_PLAN = Object.freeze({
-  productiveServiceHoursPerDay: 12,
+  productiveServiceHoursPerDay: 14,
   outboxScheduledCyclesPerDay: 24,
-  outboxProductiveCyclesPerDay: 12,
+  outboxProductiveCyclesPerDay: 14,
   outboxBatchSize: 5,
   pollerScheduledCyclesPerDay: 24,
-  pollerProductiveCyclesPerDay: 12,
+  pollerProductiveCyclesPerDay: 14,
   pollerBatchSize: 5,
   retentionScheduledCyclesPerDay: 1,
   retentionScanLimit: 1000,

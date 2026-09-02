@@ -482,7 +482,7 @@ They currently do not contain custom business logic beyond the default scaffoldi
 1. A new Wix order is created.
 2. Wix triggers the legacy `wixStores_onNewOrder` or modern `wixEcom_onOrderApproved` handler in `src/backend/events.js`; update, refund/payment, transaction, and cancellation events use the corresponding lifecycle handlers.
 3. Approval persists the full order in `ISendOrderOutbox`; every later lifecycle handler persists an append-only `ISendOrderLifecycleIntents` record before claim contention. Event handlers do not call iSend.
-4. The hourly scheduled worker claims a bounded batch, rereads the authoritative Wix order/lifecycle state, and calls `sendOrderToISend` only inside 10:00-22:00 MYT.
+4. The hourly scheduled worker claims a bounded batch, rereads the authoritative Wix order/lifecycle state, and calls `sendOrderToISend` only inside 09:00-23:00 MYT.
 5. A business-success response with queryable `custOrderNo` is saved in `ISendOrderMap` before the outbox row becomes `sent`; `orderNo` and `orderId` alone remain quarantined until the partner confirms their semantics.
 6. When iSend sends a webhook, `post_isendWebhook` authenticates the exact raw bytes and calls `handleWebhook`.
 7. `handleWebhook` checks idempotency and routes the payload:

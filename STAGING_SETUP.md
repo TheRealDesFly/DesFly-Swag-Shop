@@ -15,6 +15,10 @@ Set these in Wix as backend-only secrets:
 - `ISTORE_ISEND_API_PASSWORD`
 - `ISTORE_ISEND_ORDER_ORIGIN`
 - `ISTORE_ISEND_SANDBOX_URL`
+- `ISTORE_ISEND_PROD_STORAGE_CLIENT_NO`
+- `ISTORE_ISEND_PRODUCTION_API_USER_ID`
+- `ISTORE_ISEND_PRODUCTION_API_PASSWORD`
+- `ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN`
 - `ISTORE_ISEND_PRODUCTION_URL`
 - `ISTORE_ISEND_WEBHOOK_SECRET`
 - `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED`: leave unset or set to a value other than `true` until the partner-approved single-parcel contract is recorded; fulfillment fails closed
@@ -22,7 +26,9 @@ Set these in Wix as backend-only secrets:
 - `ISEND_FULFILLMENT_TRIGGER_SECRET`
 - `ISEND_RECOVERY_TRIGGER_SECRET`
 
-Production must set `ISTORE_ISEND_ENV` to `production`. The backend uses the production URL only when that environment is selected, and it never falls back from production to staging. New outbox rows and mappings persist that normalized environment. Workers fail closed when a durable record is missing the binding or does not match the current selector; changing the selector can no longer redirect old staging work to production. Set `ISTORE_ISEND_DEPLOYED_REVISION` to the exact reviewed 40-character source SHA before publishing that backend; operational health remains red when it is absent, malformed, or different from the capacity-evidence revision. Set `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` to exactly `true` only after the named approver records partner confirmation that each order has one complete parcel; missing, unreadable, or other values keep fulfillment disabled.
+Production must set `ISTORE_ISEND_ENV` to `production`. The backend uses only the production-prefixed iSend credentials and production URL when that environment is selected, and it never falls back to staging credentials or the staging URL. New outbox rows and mappings persist that normalized environment. Workers fail closed when a durable record is missing the binding or does not match the current selector; changing the selector can no longer redirect old staging work to production. Set `ISTORE_ISEND_DEPLOYED_REVISION` to the exact reviewed 40-character source SHA before publishing that backend; operational health remains red when it is absent, malformed, or different from the capacity-evidence revision. Set `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` to exactly `true` only after the named approver records partner confirmation that each order has one complete parcel; missing, unreadable, or other values keep fulfillment disabled.
+
+The partner-provided production root `https://webapi.istoreisend-wms.com/IsisWMS-War` is allowlisted for production. The production API user is the API-access identity supplied by the partner, not the separate Odin user ID.
 
 ## Wix Data Collections
 
@@ -87,7 +93,7 @@ Second, rows whose `meta.eventType` proves they are legacy raw-webhook claims mu
 
 Claim generations are append-only during normal processing to prevent lease ID reuse. The daily retention job deletes at most 500 explicitly released, expired, nonlatest generations after a configurable safety interval that defaults to 7 days. It scans at most 1,000 rows with strong reads, always preserves the highest numeric generation for every `claimKey`, and fails closed on missing/invalid identity, generation, or lifecycle fields. Unreleased or unexpired claims are never selected for deletion. A persisted `_id` keyset cursor in `ISendMaintenanceState` prevents permanently preserved latest rows from starving later pages; a completed pass clears the cursor for the next cycle. Never manually delete the latest row, because that would reset monotonic fencing.
 
-`src/backend/jobs.config` runs the hourly outbox worker at minute 0, a five-mapping status reconciliation safety net at minute 30, hourly operational health at minute 45, and claim retention daily at 18:15 UTC (02:15 MYT). Only the outbox and poller make iSend calls, and only inside 10:00-22:00 MYT. The outbox and poller each have at most 60 productive work slots per service-window day before retries, starting backlog, and slow upstream calls consume capacity. Retention has nominal daily deletion capacity of 500 rows and scan capacity of 1,000 rows. These are bounds, not evidence; validate all runtimes, request budgets, storage occupancy/runway, and Wix limits with the exact-SHA capacity checker before production.
+`src/backend/jobs.config` runs the hourly outbox worker at minute 0, a five-mapping status reconciliation safety net at minute 30, hourly operational health at minute 45, and claim retention daily at 18:15 UTC (02:15 MYT). Only the outbox and poller make iSend calls, and only inside 09:00-23:00 MYT. The outbox and poller each have at most 70 productive work slots per service-window day before retries, starting backlog, and slow upstream calls consume capacity. Retention has nominal daily deletion capacity of 500 rows and scan capacity of 1,000 rows. These are bounds, not evidence; validate all runtimes, request budgets, storage occupancy/runway, and Wix limits with the exact-SHA capacity checker before production.
 
 Before enabling claim retention, export `ISendOrderOutboxClaims`, verify the `releasedAt` index and the `ISendMaintenanceState` field types/permissions, and retain the export as recovery evidence. In a controlled staging backend invocation, seed one claim key with two released generations older than 7 days plus a latest generation, one unexpired claim, one unreleased claim, and one recently released claim. Run `cleanupISendClaimGenerations({ dryRun: true })`, retain the summary, then run the real cleanup. Prove only the old nonlatest generation was removed, the latest/active/unreleased/recent rows remain, the cursor advances or completes, and the scheduled job log is green. `ISendClaimRetentionCapacityError` exposes the exact failed reason in `summary.attentionReasons`, including `retention-delete-capacity` or `retention-cycle-incomplete`; either requires an alert plus backlog review.
 
@@ -181,7 +187,7 @@ By default, the script performs whichever checks it has enough valid configurati
 - Published Wix endpoint check at `/_functions/testISendLoginFromWix`. The script sends `ISEND_POLLER_TRIGGER_SECRET` as `X-ISEND-POLLER-SECRET`; the endpoint runs only when the site's authoritative `ISTORE_ISEND_ENV` is staging, ignores caller environment/force overrides, redacts the upstream root, and must report authenticated-session evidence.
 - Direct inventory query when `--inventory` is provided; it logs in first and sends the returned iSend session cookie/session fields with the inventory request.
 
-It does not print secret values or configured hostnames, including in DNS/TLS/socket errors. Live probes are skipped outside the configured 10:00 AM-10:00 PM Malaysia Time service window. `--force` may run the direct iSend login/inventory probe intentionally, but it never bypasses the protected Wix diagnostic's service-window gate.
+It does not print secret values or configured hostnames, including in DNS/TLS/socket errors. Live staging probes are skipped outside the configured 9:00 AM-11:00 PM Malaysia Time service window. `--force` may run the direct iSend login/inventory probe intentionally, but it never bypasses the protected Wix staging diagnostic's service-window gate. After an authorized production cutover, `npm run check:production` runs only direct and protected Wix production login diagnostics; it does not submit orders or query inventory.
 
 The JSON result uses explicit outcomes:
 
@@ -200,7 +206,7 @@ npm run check:staging -- --force --inventory
 
 ## Troubleshooting Local Smoke Tests
 
-- iStore/iSend staging may only be active during the partner-provided service window. Current code uses 10:00 AM-10:00 PM Malaysia Time.
+- iStore/iSend staging may only be active during the partner-provided service window. Current code uses 9:00 AM-11:00 PM Malaysia Time.
 - `skipped: true` with `Outside iStore iSend service window`: the command did not call that endpoint because the current Malaysia Time is outside the configured staging window. Run again during the window; `--force` is limited to the direct iSend login/inventory probe and cannot force the Wix diagnostic.
 - `ISTORE_ISEND_SANDBOX_URL host and port are not in the approved iStore iSend allowlist`: replace it with one of the exact staging roots above. `WIX_SITE_BASE_URL` is the separate setting for the published Wix site and must also use HTTPS.
 - `connect ETIMEDOUT [address]` on `direct-isend-staging`: the configured iSend staging host is not reachable from the local network on its configured port. Check VPN, firewall, allowlist, endpoint host, and whether the iSend staging service is up.
@@ -213,7 +219,7 @@ npm run check:staging -- --force --inventory
 
 ## GitHub Actions
 
-The repository intentionally has no GitHub Actions workflows. Live staging proof is collected from the owner-approved local or Wix-side smoke commands in this runbook, during the 10:00-22:00 MYT service window, and retained as redacted evidence. Do not reintroduce a workflow without a separate approval and capacity-model update.
+The repository intentionally has no GitHub Actions workflows. Live staging proof is collected from the owner-approved local or Wix-side smoke commands in this runbook, during the 09:00-23:00 MYT service window, and retained as redacted evidence. Do not reintroduce a workflow without a separate approval and capacity-model update.
 
 ## Retry-Exhausted Requeue And Unknown Outcomes
 

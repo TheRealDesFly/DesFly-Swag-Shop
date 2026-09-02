@@ -232,7 +232,7 @@ describe('iSend diagnostic error classification', () => {
     });
 
     expect(diagnostics).toMatchObject({
-      diagnosticBuild: 'isend-login-diagnostic-v2',
+      diagnosticBuild: 'isend-login-diagnostic-v3',
       failureClass,
       phase,
       attemptCount: 1,

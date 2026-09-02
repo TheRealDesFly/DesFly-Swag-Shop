@@ -23,6 +23,7 @@
     "check:dev": "npm run check:dev:setup && npm run lint && npm run test:diagnostic",
     "check:dev:live": "node scripts/check-staging-connection.js --skip-wix --force --require-live",
     "check:isend": "node scripts/check-isend.js",
+    "check:production": "node scripts/check-isend.js --env production --require-wix",
     "check:capacity": "node scripts/check-isend-capacity.js",
     "check:staging": "node scripts/check-staging-connection.js",
     "check:staging:setup": "node scripts/check-staging-connection.js --validate-setup",

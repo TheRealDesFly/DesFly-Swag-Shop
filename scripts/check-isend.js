@@ -5,21 +5,53 @@ Simple CLI to check iStore iSend login for staging and production.
 Usage:
   node scripts/check-isend.js --env staging|production|both \
     --staging-url <url> --production-url <url> --user <user> --password <pass> --timeout 10000
+  node scripts/check-isend.js --env production --require-wix
 
 Environment variables supported (used as defaults):
   ISTORE_ISEND_API_USER_ID
   ISTORE_ISEND_API_PASSWORD
   ISTORE_ISEND_SANDBOX_URL
+  ISTORE_ISEND_PRODUCTION_API_USER_ID
+  ISTORE_ISEND_PRODUCTION_API_PASSWORD
   ISTORE_ISEND_PRODUCTION_URL
+  WIX_SITE_BASE_URL
+  ISEND_POLLER_TRIGGER_SECRET
 */
 
+const fs = require('fs');
 const https = require('https');
+const path = require('path');
 const {
   sanitizeError,
   validateDirectISendRoot,
+  validateWixSiteRoot,
 } = require('./check-staging-connection');
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const EXPECTED_WIX_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v3';
+
+function loadDotEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+
+  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const index = trimmed.indexOf('=');
+    if (index === -1) continue;
+
+    const key = trimmed.slice(0, index).trim();
+    let value = trimmed.slice(index + 1).trim();
+    if (!key || process.env[key]) continue;
+
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
+}
 
 function parseArgs() {
   const argv = process.argv.slice(2);
@@ -138,6 +170,90 @@ function postJson(urlString, body, timeout) {
     });
 
     req.write(data);
+    req.end();
+  });
+}
+
+function getJson(urlString, headers, timeout) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(urlString);
+    } catch (error) {
+      return reject(new Error('Invalid URL'));
+    }
+    if (parsed.protocol !== 'https:') {
+      return reject(new Error('Wix diagnostic requests must use HTTPS'));
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      return reject(new Error('Wix diagnostic URL must not contain credentials, a query, or a fragment'));
+    }
+
+    const requestTimeout = timeout || 10000;
+    let req;
+    let response;
+    let settled = false;
+    let deadlineId;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineId);
+      callback(value);
+    };
+    const abortRequest = (error) => {
+      settle(reject, error);
+      if (response && !response.destroyed) response.destroy(error);
+      if (req && !req.destroyed) req.destroy(error);
+    };
+
+    deadlineId = setTimeout(
+      () => abortRequest(new Error(`Request timed out after ${requestTimeout}ms`)),
+      requestTimeout,
+    );
+    req = https.request({
+      method: 'GET',
+      hostname: parsed.hostname,
+      path: parsed.pathname,
+      port: parsed.port || 443,
+      headers,
+      timeout: requestTimeout,
+    }, (res) => {
+      response = res;
+      if (res.statusCode >= 300 && res.statusCode < 400) {
+        abortRequest(new Error(`Redirect response rejected with status ${res.statusCode}`));
+        return;
+      }
+
+      const chunks = [];
+      let receivedBytes = 0;
+      res.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_RESPONSE_BYTES) {
+          abortRequest(new Error(`Response exceeded ${MAX_RESPONSE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('error', (error) => settle(reject, error));
+      res.on('end', () => {
+        if (settled) return;
+        const text = Buffer.concat(chunks).toString();
+        let json;
+        try {
+          json = text ? JSON.parse(text) : {};
+        } catch (error) {
+          json = {};
+        }
+        settle(resolve, {
+          statusCode: res.statusCode,
+          body: json,
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+        });
+      });
+    });
+
+    req.on('error', (error) => settle(reject, error));
+    req.on('timeout', () => abortRequest(new Error(`Request timed out after ${requestTimeout}ms`)));
     req.end();
   });
 }
@@ -277,22 +393,66 @@ function formatLoginAttemptsForOutput(attempts, sensitiveUrls = []) {
   });
 }
 
+async function checkProductionWixEndpoint(wixSiteUrl, pollerSecret, timeout) {
+  const validation = validateWixSiteRoot(wixSiteUrl);
+  if (!validation.valid) {
+    throw new Error(validation.reason);
+  }
+
+  const url = `${trimTrailingSlash(wixSiteUrl)}/_functions/testISendProductionLoginFromWix`;
+  const result = await getJson(url, {
+    'X-ISEND-POLLER-SECRET': pollerSecret,
+  }, timeout);
+  const body = result.body || {};
+  const hasAuthenticatedSession = (body.hasSessionId === true && body.hasSessionPassword === true)
+    || body.hasSessionCookie === true;
+  if (!result.ok
+    || body.success !== true
+    || body.environment !== 'production'
+    || body.diagnosticBuild !== EXPECTED_WIX_DIAGNOSTIC_BUILD
+    || !hasAuthenticatedSession) {
+    const error = new Error(`Protected production diagnostic failed with status ${result.statusCode}`);
+    error.code = 'production-diagnostic-failed';
+    throw error;
+  }
+
+  return {
+    ok: true,
+    statusCode: result.statusCode,
+    diagnosticBuild: body.diagnosticBuild,
+    environment: body.environment,
+    hasSessionId: body.hasSessionId === true,
+    hasSessionPassword: body.hasSessionPassword === true,
+    hasSessionCookie: body.hasSessionCookie === true,
+  };
+}
+
 /**
  * Main CLI entrypoint.
  * It reads command-line flags, validates required credentials, and checks staging/production login endpoints.
  */
 async function main() {
+  loadDotEnv(path.join(process.cwd(), '.env'));
+
   const opts = parseArgs();
   const env = (opts.env || 'both').toLowerCase();
   const timeout = parseInt(opts.timeout || process.env.CHECK_ISEND_TIMEOUT || '10000', 10);
 
-  const user = opts.user || process.env.ISTORE_ISEND_API_USER_ID || process.env.ISTORE_ISEND_API_USER;
-  const pass = opts.password || process.env.ISTORE_ISEND_API_PASSWORD || process.env.ISTORE_ISEND_API_PASS;
+  const stagingUser = opts.user || process.env.ISTORE_ISEND_API_USER_ID || process.env.ISTORE_ISEND_API_USER;
+  const stagingPass = opts.password || process.env.ISTORE_ISEND_API_PASSWORD || process.env.ISTORE_ISEND_API_PASS;
+  const productionUser = opts.user || process.env.ISTORE_ISEND_PRODUCTION_API_USER_ID;
+  const productionPass = opts.password || process.env.ISTORE_ISEND_PRODUCTION_API_PASSWORD;
   const stagingUrl = opts['staging-url'] || process.env.ISTORE_ISEND_SANDBOX_URL;
   const productionUrl = opts['production-url'] || process.env.ISTORE_ISEND_PRODUCTION_URL || process.env.ISTORE_ISEND_URL;
+  const wixSiteUrl = opts['wix-site-url'] || process.env.WIX_SITE_BASE_URL;
+  const pollerSecret = opts['poller-secret'] || process.env.ISEND_POLLER_TRIGGER_SECRET;
 
-  if (!user || !pass) {
-    console.error('Missing credentials. Provide --user and --password or set ISTORE_ISEND_API_USER_ID and ISTORE_ISEND_API_PASSWORD env vars.');
+  if ((env === 'staging' || env === 'both') && (!stagingUser || !stagingPass)) {
+    console.error('Missing staging credentials. Provide --user and --password or set ISTORE_ISEND_API_USER_ID and ISTORE_ISEND_API_PASSWORD env vars.');
+    process.exit(2);
+  }
+  if ((env === 'production' || env === 'both') && (!productionUser || !productionPass)) {
+    console.error('Missing production credentials. Provide --user and --password or set ISTORE_ISEND_PRODUCTION_API_USER_ID and ISTORE_ISEND_PRODUCTION_API_PASSWORD env vars.');
     process.exit(2);
   }
 
@@ -306,18 +466,46 @@ async function main() {
   }
 
   const checks = [];
-  if (env === 'staging' || env === 'both') checks.push({ name: 'staging', url: stagingUrl });
-  if (env === 'production' || env === 'both') checks.push({ name: 'production', url: productionUrl });
+  if (env === 'staging' || env === 'both') {
+    checks.push({ name: 'staging', url: stagingUrl, user: stagingUser, pass: stagingPass });
+  }
+  if (opts['require-wix'] && env !== 'production') {
+    console.error('--require-wix is supported only with --env production.');
+    process.exit(2);
+  }
+  if (opts['require-wix'] && (!wixSiteUrl || !pollerSecret)) {
+    console.error('Protected Wix production diagnostic requires WIX_SITE_BASE_URL and ISEND_POLLER_TRIGGER_SECRET.');
+    process.exit(2);
+  }
+  if (env === 'production' || env === 'both') {
+    checks.push({ name: 'production', url: productionUrl, user: productionUser, pass: productionPass });
+  }
 
   for (const c of checks) {
     console.log(`Checking ${c.name} iSend login...`);
-    const result = await checkLogin(c.url, user, pass, timeout, c.name);
+    const result = await checkLogin(c.url, c.user, c.pass, timeout, c.name);
     if (result.ok) {
       console.log(`  ${c.name} OK (session returned).`);
     } else {
       console.error(
         `  ${c.name} FAILED`,
         JSON.stringify(formatLoginAttemptsForOutput(result.attempts, [c.url])),
+      );
+      process.exit(1);
+    }
+  }
+
+  if (opts['require-wix']) {
+    console.log('Checking protected Wix production login diagnostic...');
+    try {
+      const result = await checkProductionWixEndpoint(wixSiteUrl, pollerSecret, timeout);
+      console.log(
+        `  production Wix OK (${result.diagnosticBuild}; authenticated session returned).`,
+      );
+    } catch (error) {
+      console.error(
+        '  production Wix FAILED',
+        sanitizeError(error, [wixSiteUrl]),
       );
       process.exit(1);
     }
@@ -337,6 +525,7 @@ if (require.main === module) {
 module.exports = {
   checkLogin,
   formatLoginAttemptsForOutput,
+  checkProductionWixEndpoint,
   getAuthenticatedSessionEvidence,
   isAuthenticatedLoginResponse,
 };

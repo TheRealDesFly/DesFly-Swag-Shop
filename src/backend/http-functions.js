@@ -78,6 +78,24 @@ function endpointConfigurationErrorResponse() {
   });
 }
 
+function loginDiagnosticSuccessResponse(result) {
+  return ok({
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: {
+      success: result.success,
+      diagnosticBuild: ISEND_LOGIN_DIAGNOSTIC_BUILD,
+      skipped: result.skipped,
+      reason: result.reason,
+      environment: result.environment,
+      hasSessionId: result.hasSessionId,
+      hasSessionPassword: result.hasSessionPassword,
+      hasSessionCookie: result.hasSessionCookie,
+    },
+  });
+}
+
 function safeCount(value) {
   const normalized = Number(value);
   return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : 0;
@@ -147,21 +165,7 @@ export async function get_testISendLoginFromWix(request) {
     // testISendLogin are authoritative. Query parameters cannot override
     // either release boundary.
     const result = await testISendLogin({ environment });
-    return ok({
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: {
-        success: result.success,
-        diagnosticBuild: ISEND_LOGIN_DIAGNOSTIC_BUILD,
-        skipped: result.skipped,
-        reason: result.reason,
-        environment: result.environment,
-        hasSessionId: result.hasSessionId,
-        hasSessionPassword: result.hasSessionPassword,
-        hasSessionCookie: result.hasSessionCookie,
-      },
-    });
+    return loginDiagnosticSuccessResponse(result);
   } catch (error) {
     if (error instanceof SecretConfigurationError) {
       return endpointConfigurationErrorResponse();
@@ -175,6 +179,54 @@ export async function get_testISendLoginFromWix(request) {
       body: {
         success: false,
         message: 'iSend staging diagnostic failed',
+        diagnostics,
+      },
+    });
+  }
+}
+
+/**
+ * Protected, read-only production login diagnostic.
+ *
+ * The site's authoritative environment must already be production. The forced
+ * login bypasses only the staging support-hours check; it cannot submit orders,
+ * query inventory, run the poller, or create fulfillments.
+ */
+export async function get_testISendProductionLoginFromWix(request) {
+  try {
+    if (!await requireSecretHeader(request, 'x-isend-poller-secret', 'ISEND_POLLER_TRIGGER_SECRET')) {
+      return jsonResponse(401, { success: false, message: 'Unauthorized' });
+    }
+
+    let environment;
+    try {
+      environment = await getConfiguredISendEnvironment();
+    } catch (error) {
+      throw new SecretConfigurationError('Missing or invalid configured iSend environment');
+    }
+    if (environment !== 'production') {
+      return jsonResponse(409, {
+        success: false,
+        code: 'production-diagnostic-disabled',
+        message: 'Production diagnostic is disabled for this site environment',
+      });
+    }
+
+    const result = await testISendLogin({ environment, force: true });
+    return loginDiagnosticSuccessResponse(result);
+  } catch (error) {
+    if (error instanceof SecretConfigurationError) {
+      return endpointConfigurationErrorResponse();
+    }
+    const diagnostics = classifyISendDiagnosticError(error);
+    console.error('iSend production diagnostic failed', diagnostics);
+    return serverError({
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: {
+        success: false,
+        message: 'iSend production diagnostic failed',
         diagnostics,
       },
     });

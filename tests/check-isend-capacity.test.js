@@ -84,24 +84,24 @@ describe('iSend capacity evidence', () => {
     expect(report.accepted).toBe(true);
     expect(report.deployedPlan).toMatchObject({
       outboxScheduledCyclesPerDay: 24,
-      outboxProductiveCyclesPerDay: 12,
+      outboxProductiveCyclesPerDay: 14,
       outboxBatchSize: 5,
       pollerScheduledCyclesPerDay: 24,
-      pollerProductiveCyclesPerDay: 12,
+      pollerProductiveCyclesPerDay: 14,
       retentionScheduledCyclesPerDay: 1,
       operationalHealthScheduledCyclesPerDay: 24,
       stagingSmokeScheduledCyclesPerDay: 0,
     });
     expect(report.capacity).toMatchObject({
-      nominalOutboxOrdersPerProductiveDay: 60,
-      safeOutboxOrdersPerProductiveDay: 48,
-      nominalPollerMappingsPerProductiveDay: 60,
-      safePollerMappingsPerProductiveDay: 48,
+      nominalOutboxOrdersPerProductiveDay: 70,
+      safeOutboxOrdersPerProductiveDay: 56,
+      nominalPollerMappingsPerProductiveDay: 70,
+      safePollerMappingsPerProductiveDay: 56,
       outboxDrainServiceHours: 6,
       reconciliationCycleHours: 6,
-      pollerProviderRequestsPerServiceDay: 120,
+      pollerProviderRequestsPerServiceDay: 140,
       smokeProviderRequestsPerServiceDay: 0,
-      estimatedProviderRequestsPerServiceDay: 178,
+      estimatedProviderRequestsPerServiceDay: 198,
       verificationReadBatchesPerRun: 3,
       bulkDeleteWriteBatchesPerRun: 1,
       minimumRetentionReadRequestsPerRun: 6,
@@ -141,14 +141,14 @@ describe('iSend capacity evidence', () => {
 
     expect(report.demand).toMatchObject({
       outboxWorkItemsPerPeakDay: 34,
-      pollerMappingChecksPerServiceDay: 60,
+      pollerMappingChecksPerServiceDay: 70,
       smokeCyclesPerDay: 2,
     });
     expect(report.capacity).toMatchObject({
       outboxProviderRequestsPerServiceDay: 68,
-      pollerProviderRequestsPerServiceDay: 120,
+      pollerProviderRequestsPerServiceDay: 140,
       smokeProviderRequestsPerServiceDay: 8,
-      estimatedProviderRequestsPerServiceDay: 196,
+      estimatedProviderRequestsPerServiceDay: 216,
     });
   });
 

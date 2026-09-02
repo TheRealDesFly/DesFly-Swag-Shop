@@ -86,7 +86,7 @@ describe('local Wix-to-iSend diagnostic contract', () => {
       status: 200,
       body: {
         success: true,
-        diagnosticBuild: 'isend-login-diagnostic-v2',
+        diagnosticBuild: 'isend-login-diagnostic-v3',
         environment: 'staging',
         ...expectedEvidence,
       },
@@ -137,7 +137,7 @@ describe('local Wix-to-iSend diagnostic contract', () => {
 
     expect(result.status).toBe(500);
     expect(result.body.diagnostics).toMatchObject({
-      diagnosticBuild: 'isend-login-diagnostic-v2',
+      diagnosticBuild: 'isend-login-diagnostic-v3',
       phase,
       failureClass,
       attemptCount: 1,

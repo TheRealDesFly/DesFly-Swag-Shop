@@ -41,8 +41,8 @@ export const OUTBOX_STATUS = Object.freeze({
 });
 
 const MYT_OFFSET_MS = 8 * 60 * 60 * 1000;
-const SERVICE_START_HOUR_MYT = 10;
-const SERVICE_END_HOUR_MYT = 22;
+const SERVICE_START_HOUR_MYT = 9;
+const SERVICE_END_HOUR_MYT = 23;
 const DEFAULT_MAX_ATTEMPTS = 5;
 const MAX_CONFIGURED_ATTEMPTS = 10;
 const DEFAULT_BATCH_SIZE = 5;
@@ -178,8 +178,8 @@ function getServiceWindow(nowValue) {
 
   return {
     timezone: 'MYT',
-    serviceStart: '10:00',
-    serviceEnd: '22:00',
+    serviceStart: '09:00',
+    serviceEnd: '23:00',
     checkedAt: now,
     withinServiceWindow,
     nextOpenAt,

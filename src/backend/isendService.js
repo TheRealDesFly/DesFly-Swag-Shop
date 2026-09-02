@@ -11,11 +11,11 @@ import {
 } from 'backend/isendConfig';
 
 const MYT_OFFSET_MINUTES = 8 * 60;
-const SERVICE_START_HOUR_MYT = 10;
-const SERVICE_END_HOUR_MYT = 22;
+const SERVICE_START_HOUR_MYT = 9;
+const SERVICE_END_HOUR_MYT = 23;
 const REQUEST_TIMEOUT_MS = 20000;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
-export const ISEND_LOGIN_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v2';
+export const ISEND_LOGIN_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v3';
 
 const SAFE_DIAGNOSTIC_FAILURE_CLASSES = new Set([
   'configuration',
@@ -271,8 +271,8 @@ function getServiceWindowStatus(now) {
   const mytDate = getMytDate(checkedAt);
   return {
     timezone: 'MYT',
-    serviceStart: '10:00',
-    serviceEnd: '22:00',
+    serviceStart: '09:00',
+    serviceEnd: '23:00',
     checkedAt: checkedAt.toISOString(),
     checkedAtMYT: mytDate.toISOString().replace('Z', '+08:00'),
     withinServiceWindow: isWithinISendServiceWindow(checkedAt),

@@ -18,12 +18,12 @@ const path = require('path');
 const crypto = require('crypto');
 
 const MYT_OFFSET_MINUTES = 8 * 60;
-const SERVICE_START_HOUR_MYT = 10;
-const SERVICE_END_HOUR_MYT = 22;
+const SERVICE_START_HOUR_MYT = 9;
+const SERVICE_END_HOUR_MYT = 23;
 const DEFAULT_TIMEOUT_MS = 20000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
-const EXPECTED_WIX_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v2';
+const EXPECTED_WIX_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v3';
 const OWNER_APPROVED_STAGING_LOGIN_ORIGIN_FINGERPRINT =
   '36dc1cea96d6bb7e9e448ebe63e4511488c3fc9c04f91adb4535a6d0e90a36cb';
 const ISEND_ENDPOINT_ALLOWLIST = Object.freeze({
@@ -34,6 +34,7 @@ const ISEND_ENDPOINT_ALLOWLIST = Object.freeze({
   ]),
   production: Object.freeze([
     'd0c995986dd80e0bec3577f67d42e94276d2385105739214f84a7ec9d642550a',
+    '5c0f2aa05cbe11a7bd41cc52e68fa08680318183c9422af3851b94c2219a2f28',
   ]),
 });
 // SHA-256 of the owner-approved published Wix origin's lowercase
@@ -496,8 +497,8 @@ function getServiceWindowStatus(now) {
   const hour = mytDate.getUTCHours();
   return {
     timezone: 'MYT',
-    serviceStart: '10:00',
-    serviceEnd: '22:00',
+    serviceStart: '09:00',
+    serviceEnd: '23:00',
     checkedAt: checkedAt.toISOString(),
     checkedAtMYT: mytDate.toISOString().replace('Z', '+08:00'),
     withinServiceWindow: hour >= SERVICE_START_HOUR_MYT && hour < SERVICE_END_HOUR_MYT,

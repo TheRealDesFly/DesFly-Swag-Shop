@@ -25,7 +25,7 @@ Do not put secret values in this document, chat, tickets, screenshots, or retain
 | Owner/partner action | Why it is required | Engineering verification after delivery |
 | --- | --- | --- |
 | Owner explicitly authorizes Admin-only read/write permissions and creation/repair of all nine Wix integration collections, fields, and indexes. | The two existing collections currently expose content to Everyone; required lifecycle, mapping, idempotency, audit, inventory, email, maintenance, and index state is incomplete. | Compare every hosted collection ID, field type, permission, item count/migration, and active index to this manifest. |
-| Owner securely provisions all thirteen Wix secret names, binds `ISTORE_ISEND_DEPLOYED_REVISION` to the exact source SHA being published, and keeps `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset/non-`true` until partner approval. | Webhook authentication, protected poll/fulfillment/recovery routes, environment selection, capacity-evidence binding, and single-parcel fulfillment fail closed without them. | Verify names, selected staging environment, and deployed-revision equality without displaying credential values; test authorized/unauthorized route behavior. |
+| Owner securely provisions all seventeen Wix secret names, binds `ISTORE_ISEND_DEPLOYED_REVISION` to the exact source SHA being published, and keeps `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset/non-`true` until partner approval. | Webhook authentication, protected poll/fulfillment/recovery routes, environment selection, capacity-evidence binding, and single-parcel fulfillment fail closed without them. | Verify names, selected staging environment, and deployed-revision equality without displaying credential values; test authorized/unauthorized route behavior. |
 | Owner preserves the private local and Wix staging diagnostic inputs and confirms their staging-scoped values through the strict live probe. | Read-only source inspection proves only required names, not values or target correctness. | Run the owner-approved local or Wix-side probe during the MYT window and retain redacted direct/Wix authenticated-session evidence. |
 | Network/iSend owner makes the reviewed staging endpoint reachable from the approved runner, including any source-IP/firewall allowlist. | Direct login and inventory currently time out from this runner. | Repeat redacted reachability, login, and inventory checks inside the service window. |
 | Partner confirms `custOrderNo` create/query/webhook semantics, uniqueness scope, signed-body fields/HMAC rules, event ordering, and request/concurrency limits. | Mapping, dedupe, monotonic status, and capacity must use authoritative identities and limits rather than inference. | Validate real redacted create/query/webhook shapes, identity-mismatch rejection, replay, delayed-event handling, and capacity headroom. |
@@ -46,6 +46,10 @@ Create or verify these exact names in Wix Secrets Manager as backend-only secret
 - `ISTORE_ISEND_API_PASSWORD`
 - `ISTORE_ISEND_ORDER_ORIGIN`
 - `ISTORE_ISEND_SANDBOX_URL`
+- `ISTORE_ISEND_PROD_STORAGE_CLIENT_NO`
+- `ISTORE_ISEND_PRODUCTION_API_USER_ID`
+- `ISTORE_ISEND_PRODUCTION_API_PASSWORD`
+- `ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN`
 - `ISTORE_ISEND_PRODUCTION_URL`
 - `ISTORE_ISEND_WEBHOOK_SECRET`
 - `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED`
@@ -67,7 +71,7 @@ The local live probe requires these exact private inputs:
 
 Acceptance:
 
-- Wix reports all thirteen backend secret names present.
+- Wix reports all seventeen backend secret names present.
 - The staging environment is selected.
 - The local smoke configuration reports all five live-probe input names present when required.
 - No secret value appears in source, command output retained as evidence, or screenshots.
@@ -252,7 +256,7 @@ This is mandatory for the three side-effect collections too: their stable legacy
    - cron expression: `45 * * * *`
 7. Verify the protected staging diagnostic at `GET /_functions/testISendLoginFromWix` using header `X-ISEND-POLLER-SECRET`. A valid response must show authenticated-session evidence without exposing session values.
 
-The outbox submits a bounded batch of five orders hourly, while the staggered poller reconciles five active mappings hourly as a webhook safety net. Both make iSend calls only inside 10:00-22:00 Malaysia Time. Claim retention makes no iSend request; it scans at most 1,000 old released claim rows and deletes at most 500 safe nonlatest rows per daily run. Operational health fails its hourly job on unresolved lifecycle, fulfillment, retention, capacity, or sensitive-data-policy state. A successful publication is not staging acceptance by itself.
+The outbox submits a bounded batch of five orders hourly, while the staggered poller reconciles five active mappings hourly as a webhook safety net. Both make iSend calls only inside 09:00-23:00 Malaysia Time. Claim retention makes no iSend request; it scans at most 1,000 old released claim rows and deletes at most 500 safe nonlatest rows per daily run. Operational health fails its hourly job on unresolved lifecycle, fulfillment, retention, capacity, or sensitive-data-policy state. A successful publication is not staging acceptance by itself.
 
 ### Stale packaged artifact
 
@@ -293,7 +297,7 @@ Test the automation with a controlled recipient before using a customer order.
 
 ## 6. Run the Strict Staging Probe
 
-Run the local or Wix-side staging smoke probe from the exact reviewed source revision during 10:00-22:00 Malaysia Time. Retain redacted evidence in which:
+Run the local or Wix-side staging smoke probe from the exact reviewed source revision during 09:00-23:00 Malaysia Time. Retain redacted evidence in which:
 
 - offline validation, lint, and all unit tests pass;
 - the direct iSend login probe runs and passes;

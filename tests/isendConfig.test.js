@@ -74,6 +74,11 @@ describe('iSend endpoint policy', () => {
       'production',
       'https://istoreisend-wms.com:5191/IsisWMS-War',
     ],
+    [
+      'https://webapi.istoreisend-wms.com/IsisWMS-War',
+      'production',
+      'https://webapi.istoreisend-wms.com/IsisWMS-War',
+    ],
   ])('accepts documented %s root for %s', (value, environment, expected) => {
     expect(validateISendBaseUrl(value, environment)).toBe(expected);
   });
@@ -113,6 +118,10 @@ describe('iSend endpoint policy', () => {
       ISTORE_ISEND_API_USER_ID: 'user-1',
       ISTORE_ISEND_API_PASSWORD: 'password-1',
       ISTORE_ISEND_ORDER_ORIGIN: 'WIX',
+      ISTORE_ISEND_PROD_STORAGE_CLIENT_NO: 'production-storage-1',
+      ISTORE_ISEND_PRODUCTION_API_USER_ID: 'production-user-1',
+      ISTORE_ISEND_PRODUCTION_API_PASSWORD: 'production-password-1',
+      ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN: 'PRODUCTION-WIX',
       ISTORE_ISEND_ENV: 'production',
       ISTORE_ISEND_SANDBOX_URL: 'https://staging.istoreisend-wms.com:5191/IsisWMS-War/',
       ISTORE_ISEND_PRODUCTION_URL: 'https://istoreisend-wms.com:5191/IsisWMS-War/',
@@ -126,7 +135,27 @@ describe('iSend endpoint policy', () => {
       sandboxUrl: 'https://staging.istoreisend-wms.com:5191/IsisWMS-War',
       productionUrl: 'https://istoreisend-wms.com:5191/IsisWMS-War',
       orderTimeZone: 'Asia/Kuala_Lumpur',
+      storageClientNo: 'production-storage-1',
+      userNo: 'production-user-1',
+      userPassword: 'production-password-1',
+      orderOrigin: 'PRODUCTION-WIX',
     });
+  });
+
+  it('does not fall back to staging credentials in production', async () => {
+    const secrets = {
+      ISTORE_ISEND_STORAGE_CLIENT_NO: 'staging-storage',
+      ISTORE_ISEND_API_USER_ID: 'staging-user',
+      ISTORE_ISEND_API_PASSWORD: 'staging-password',
+      ISTORE_ISEND_ORDER_ORIGIN: 'STAGING-WIX',
+      ISTORE_ISEND_ENV: 'production',
+      ISTORE_ISEND_PRODUCTION_URL: 'https://istoreisend-wms.com:5191/IsisWMS-War',
+    };
+    mocks.getSecret.mockImplementation(async (name) => secrets[name]);
+
+    await expect(getISendConfig()).rejects.toThrow(
+      'Missing Wix secret: ISTORE_ISEND_PROD_STORAGE_CLIENT_NO',
+    );
   });
 
   it('fails configuration before returning an unapproved URL', async () => {

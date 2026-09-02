@@ -15,6 +15,8 @@ const ISEND_ENDPOINT_ALLOWLIST = Object.freeze({
   ]),
   production: Object.freeze([
     'd0c995986dd80e0bec3577f67d42e94276d2385105739214f84a7ec9d642550a',
+    // Partner-provided production web API origin.
+    '5c0f2aa05cbe11a7bd41cc52e68fa08680318183c9422af3851b94c2219a2f28',
   ]),
 });
 
@@ -23,6 +25,10 @@ const SECRET_NAMES = {
   apiUserId: 'ISTORE_ISEND_API_USER_ID',
   apiPassword: 'ISTORE_ISEND_API_PASSWORD',
   orderOrigin: 'ISTORE_ISEND_ORDER_ORIGIN',
+  productionStorageClientNo: 'ISTORE_ISEND_PROD_STORAGE_CLIENT_NO',
+  productionApiUserId: 'ISTORE_ISEND_PRODUCTION_API_USER_ID',
+  productionApiPassword: 'ISTORE_ISEND_PRODUCTION_API_PASSWORD',
+  productionOrderOrigin: 'ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN',
   environment: 'ISTORE_ISEND_ENV',
   sandboxUrl: 'ISTORE_ISEND_SANDBOX_URL',
   productionUrl: 'ISTORE_ISEND_PRODUCTION_URL',
@@ -160,18 +166,41 @@ export async function getConfiguredISendEnvironment(options = {}) {
 
 // options: { environment: 'staging'|'production', useSandbox: boolean }
 export async function getISendConfig(options = {}) {
+  const configuredEnvironment = await readOptionalSecret(SECRET_NAMES.environment);
+  const requestedEnvironment = options.environment || (
+    typeof options.useSandbox === 'boolean'
+      ? (options.useSandbox ? 'staging' : 'production')
+      : undefined
+  );
+  const environment = normalizeEnvironment(requestedEnvironment || configuredEnvironment);
+  if (!environment) {
+    throw new Error(`Missing Wix secret: ${SECRET_NAMES.environment}`);
+  }
+
+  const credentialNames = environment === 'production'
+    ? {
+      storageClientNo: SECRET_NAMES.productionStorageClientNo,
+      apiUserId: SECRET_NAMES.productionApiUserId,
+      apiPassword: SECRET_NAMES.productionApiPassword,
+      orderOrigin: SECRET_NAMES.productionOrderOrigin,
+    }
+    : {
+      storageClientNo: SECRET_NAMES.storageClientNo,
+      apiUserId: SECRET_NAMES.apiUserId,
+      apiPassword: SECRET_NAMES.apiPassword,
+      orderOrigin: SECRET_NAMES.orderOrigin,
+    };
+
   const [
     storageClientNo,
     apiUserId,
     apiPassword,
     orderOrigin,
-    configuredEnvironment,
   ] = await Promise.all([
-    readRequiredSecret(SECRET_NAMES.storageClientNo),
-    readRequiredSecret(SECRET_NAMES.apiUserId),
-    readRequiredSecret(SECRET_NAMES.apiPassword),
-    readRequiredSecret(SECRET_NAMES.orderOrigin),
-    readOptionalSecret(SECRET_NAMES.environment),
+    readRequiredSecret(credentialNames.storageClientNo),
+    readRequiredSecret(credentialNames.apiUserId),
+    readRequiredSecret(credentialNames.apiPassword),
+    readRequiredSecret(credentialNames.orderOrigin),
   ]);
 
   const sandboxUrl = await readOptionalSecret(SECRET_NAMES.sandboxUrl);
@@ -182,15 +211,6 @@ export async function getISendConfig(options = {}) {
   const validatedProductionUrl = productionUrl
     ? validateISendBaseUrl(productionUrl, 'production')
     : undefined;
-  const requestedEnvironment = options.environment || (
-    typeof options.useSandbox === 'boolean'
-      ? (options.useSandbox ? 'staging' : 'production')
-      : undefined
-  );
-  const environment = normalizeEnvironment(requestedEnvironment || configuredEnvironment);
-  if (!environment) {
-    throw new Error(`Missing Wix secret: ${SECRET_NAMES.environment}`);
-  }
   const useSandbox = environment !== 'production';
   const baseUrl = useSandbox ? validatedSandboxUrl : validatedProductionUrl;
 

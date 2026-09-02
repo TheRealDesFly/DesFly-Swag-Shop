@@ -31,7 +31,7 @@ The local runtime requires these nonempty values:
 - `ISTORE_ISEND_ORDER_ORIGIN`
 - `ISTORE_ISEND_ENV=staging`
 
-`ISTORE_ISEND_PRODUCTION_URL` must remain blank locally. `WIX_SITE_BASE_URL` and `ISEND_POLLER_TRIGGER_SECRET` are optional production-verification inputs and are not required for development or direct iSend connectivity.
+All production placeholders remain blank for normal staging development. Populate `ISTORE_ISEND_PRODUCTION_API_USER_ID`, `ISTORE_ISEND_PRODUCTION_API_PASSWORD`, `ISTORE_ISEND_PROD_STORAGE_CLIENT_NO`, `ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN`, and `ISTORE_ISEND_PRODUCTION_URL` in the ignored local `.env` only for an explicit, read-only production connectivity check; production runtime values also belong in Wix Secrets Manager. `WIX_SITE_BASE_URL` and `ISEND_POLLER_TRIGGER_SECRET` are optional production-verification inputs and are not required for development or direct staging iSend connectivity.
 
 ## 3. Offline development gates
 
@@ -73,7 +73,8 @@ npm run check:dev:live
 3. Commit and push the candidate; require local `HEAD` to equal its upstream SHA.
 4. Create a Wix preview from the clean reviewed candidate. A preview validates the candidate but is not production proof.
 5. Merge through review, then publish remote `main` without `--force` only after explicit publication approval.
-6. During 10:00-22:00 MYT, run the protected Wix GET diagnostic. Production proof requires HTTP 200, the reviewed diagnostic build marker, `environment=staging`, and authenticated session-presence evidence.
+6. During 09:00-23:00 MYT, run the protected Wix GET staging diagnostic. Staging proof requires HTTP 200, the reviewed diagnostic build marker, `environment=staging`, and authenticated session-presence evidence.
+7. After the authorized selector cutover, run `npm run check:production`. It requires both a direct production login and the protected Wix production login diagnostic to return authenticated-session evidence from the reviewed build without sending an order.
 
 Never weaken the Wix production service-window guard to make a development test pass. Use sanitized diagnostic classifications to identify the next reviewed fix.
 

@@ -22,9 +22,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('wix-secrets-backend', () => ({ getSecret: mocks.getSecret }));
 vi.mock('backend/isendService', () => ({
-  ISEND_LOGIN_DIAGNOSTIC_BUILD: 'isend-login-diagnostic-v2',
+  ISEND_LOGIN_DIAGNOSTIC_BUILD: 'isend-login-diagnostic-v3',
   classifyISendDiagnosticError: (error) => ({
-    diagnosticBuild: 'isend-login-diagnostic-v2',
+    diagnosticBuild: 'isend-login-diagnostic-v3',
     phase: error.phase || 'unknown',
     failureClass: error.failureClass || 'indeterminate',
     attemptCount: error.attemptCount || 0,
@@ -46,6 +46,7 @@ vi.mock('backend/isendOrderOutbox', () => ({ requeueISendOrder: mocks.requeueISe
 
 import {
   get_testISendLoginFromWix,
+  get_testISendProductionLoginFromWix,
   post_createFulfillmentFromWix,
   post_isendWebhook,
   post_requeueISendOrder,
@@ -105,7 +106,7 @@ describe('Wix HTTP functions', () => {
     expect(mocks.testISendLogin).toHaveBeenCalledWith({ environment: 'staging' });
     expect(response.body).toMatchObject({
       success: true,
-      diagnosticBuild: 'isend-login-diagnostic-v2',
+      diagnosticBuild: 'isend-login-diagnostic-v3',
       environment: 'staging',
       hasSessionId: true,
       hasSessionPassword: true,
@@ -143,7 +144,7 @@ describe('Wix HTTP functions', () => {
 
     expect(response.status).toBe(500);
     expect(response.body.diagnostics).toEqual({
-      diagnosticBuild: 'isend-login-diagnostic-v2',
+      diagnosticBuild: 'isend-login-diagnostic-v3',
       phase: 'outbound-request',
       failureClass: 'outbound-network',
       attemptCount: 1,
@@ -215,6 +216,109 @@ describe('Wix HTTP functions', () => {
         message: 'Endpoint is not configured',
       },
     });
+  });
+
+  it('protects the production diagnostic before touching Wix secrets or iSend', async () => {
+    const response = await get_testISendProductionLoginFromWix({ headers: {}, query: {} });
+
+    expect(response).toMatchObject({ status: 401, body: { success: false } });
+    expect(mocks.getSecret).not.toHaveBeenCalled();
+    expect(mocks.getConfiguredISendEnvironment).not.toHaveBeenCalled();
+    expect(mocks.testISendLogin).not.toHaveBeenCalled();
+  });
+
+  it('runs only a forced read-only login after the site is configured for production', async () => {
+    mocks.getConfiguredISendEnvironment.mockResolvedValueOnce('production');
+    mocks.testISendLogin.mockResolvedValueOnce({
+      success: true,
+      skipped: false,
+      environment: 'production',
+      baseUrl: 'https://must-not-leak.example/IsisWMS-War',
+      loginPath: '/Json/Public/login/',
+      hasSessionId: true,
+      hasSessionPassword: true,
+      hasSessionCookie: false,
+      checkedAt: '2026-09-02T17:00:00.000Z',
+      serviceWindow: { withinServiceWindow: false },
+    });
+
+    const response = await get_testISendProductionLoginFromWix({
+      headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
+      query: { environment: 'staging' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(mocks.testISendLogin).toHaveBeenCalledWith({
+      environment: 'production',
+      force: true,
+    });
+    expect(response.body).toMatchObject({
+      success: true,
+      diagnosticBuild: 'isend-login-diagnostic-v3',
+      environment: 'production',
+      hasSessionId: true,
+      hasSessionPassword: true,
+      hasSessionCookie: false,
+    });
+    expect(response.body).not.toHaveProperty('baseUrl');
+    expect(response.body).not.toHaveProperty('loginPath');
+    expect(response.body).not.toHaveProperty('checkedAt');
+    expect(response.body).not.toHaveProperty('serviceWindow');
+  });
+
+  it('disables the production diagnostic while the site remains on staging', async () => {
+    const response = await get_testISendProductionLoginFromWix({
+      headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
+      query: {},
+    });
+
+    expect(response).toEqual({
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        code: 'production-diagnostic-disabled',
+        message: 'Production diagnostic is disabled for this site environment',
+      },
+    });
+    expect(mocks.testISendLogin).not.toHaveBeenCalled();
+  });
+
+  it('sanitizes production diagnostic failures', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.getConfiguredISendEnvironment.mockResolvedValueOnce('production');
+    mocks.testISendLogin.mockRejectedValueOnce(Object.assign(
+      new Error('private production credential and URL'),
+      {
+        failureClass: 'authentication-rejected',
+        phase: 'authentication',
+        attemptCount: 1,
+        hasUpstreamResponse: true,
+        requestPath: '/private-login-path',
+      },
+    ));
+
+    const response = await get_testISendProductionLoginFromWix({
+      headers: { 'X-ISEND-POLLER-SECRET': 'trigger-secret' },
+    });
+
+    expect(response).toMatchObject({
+      status: 500,
+      body: {
+        success: false,
+        message: 'iSend production diagnostic failed',
+        diagnostics: {
+          diagnosticBuild: 'isend-login-diagnostic-v3',
+          phase: 'authentication',
+          failureClass: 'authentication-rejected',
+          attemptCount: 1,
+          hasUpstreamResponse: true,
+        },
+      },
+    });
+    expect(JSON.stringify({ response, calls: consoleError.mock.calls }))
+      .not.toMatch(/private production credential|private-login-path/);
+    consoleError.mockRestore();
   });
 
   it('consumes the poller body once and clamps all caller options to the scheduled safety net', async () => {

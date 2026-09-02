@@ -87,6 +87,11 @@ describe('staging smoke result semantics', () => {
       'production',
       'https://istoreisend-wms.com:5191/IsisWMS-War',
     ],
+    [
+      'https://webapi.istoreisend-wms.com/IsisWMS-War',
+      'production',
+      'https://webapi.istoreisend-wms.com/IsisWMS-War',
+    ],
   ])('accepts the documented %s endpoint for %s', (value, environment, expected) => {
     expect(validateDirectISendRoot(value, environment)).toMatchObject({
       configured: true,
