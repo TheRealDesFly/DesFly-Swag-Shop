@@ -240,6 +240,18 @@ async function queryOrder(config, session, orderReference, customerOrderNo) {
   return { payload, exactRows };
 }
 
+async function queryOrderWithRetry(config, session, orderReference, customerOrderNo) {
+  let result;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    result = await queryOrder(config, session, orderReference, customerOrderNo);
+    if (result.exactRows.length === 1 || customerOrderNo || attempt === 4) {
+      return { ...result, attempt };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** (attempt - 1))));
+  }
+  return { ...result, attempt: 4 };
+}
+
 async function executeCanary(config, session, candidate) {
   const { orderReference, payload: orderPayload } = buildCanaryOrder(config, candidate);
   const evidence = {
@@ -278,23 +290,10 @@ async function executeCanary(config, session, candidate) {
   }
   evidence.canaryOrderCreated = true;
 
-  let customerOrderNo = addResult.payload?.returnObject?.custOrderNo
+  const customerOrderNo = addResult.payload?.returnObject?.custOrderNo
     || addResult.payload?.custOrderNo;
-  if (!customerOrderNo) {
-    try {
-      const reconciliation = await queryOrder(config, session, orderReference);
-      if (reconciliation.payload?.success === true && reconciliation.exactRows.length === 1
-        && reconciliation.exactRows[0]?.custOrderNo) {
-        customerOrderNo = reconciliation.exactRows[0].custOrderNo;
-        evidence.identityRecovered = true;
-      } else {
-        evidence.identityReconciliationAmbiguous = true;
-      }
-    } catch (error) {
-      evidence.identityReconciliationAmbiguous = true;
-    }
-  }
 
+  // Cancellation is intentionally the first side effect after an accepted Add.
   evidence.cancelRequestCount += 1;
   try {
     const cancelResult = await postJson(
@@ -318,9 +317,17 @@ async function executeCanary(config, session, candidate) {
   }
 
   try {
-    const postCancel = await queryOrder(config, session, orderReference, customerOrderNo);
+    const postCancel = await queryOrderWithRetry(
+      config,
+      session,
+      orderReference,
+      customerOrderNo,
+    );
     evidence.postCancelQuerySucceeded = postCancel.payload?.success === true;
     const exact = postCancel.exactRows[0];
+    if (!customerOrderNo && exact?.custOrderNo) evidence.identityRecovered = true;
+    if (!customerOrderNo && !exact?.custOrderNo) evidence.identityReconciliationAmbiguous = true;
+    evidence.postCancelQueryAttempt = postCancel.attempt;
     const safeStatus = exact?.orderStatus || exact?.status || exact?.whseOrderStatus;
     if (safeStatus !== undefined && safeStatus !== null) {
       evidence.postCancelStatus = String(safeStatus).slice(0, 80);

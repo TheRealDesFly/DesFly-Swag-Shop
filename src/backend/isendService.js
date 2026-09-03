@@ -17,6 +17,8 @@ const SERVICE_END_HOUR_MYT = 23;
 const REQUEST_TIMEOUT_MS = 20000;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
 const ISEND_EXTERNAL_ID_MAX_LENGTH = 30;
+const POST_SUBMIT_RECONCILIATION_ATTEMPTS = 4;
+const POST_SUBMIT_RECONCILIATION_DELAY_MS = 500;
 export const ISEND_LOGIN_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v3';
 
 const SAFE_DIAGNOSTIC_FAILURE_CLASSES = new Set([
@@ -838,54 +840,72 @@ export async function sendOrderToISend(order, options = {}) {
   // the external/platform order number accepted by doQueryOrderPage. Recover
   // custOrderNo only from one exact documentNo match; every empty, duplicate,
   // or mismatched result remains ambiguous so the outbox cannot resubmit it.
-  let queryResult;
-  try {
-    const queryUrl = buildSessionUrl(config, session, '/Json/WhseOrder/doQueryOrderPage');
-    queryResult = await postJson(queryUrl, {
-      orderQuery: {
-        documentNo: payload.orderNumber,
-        orderOrigin: config.orderOrigin,
-      },
-      pageData: {
-        currentLength: 2,
-        currentOffset: 0,
-      },
-    }, getSessionHeaders(session));
-  } catch (error) {
-    throw withISendPhase(error, 'post-submit-reconciliation');
+  const queryUrl = buildSessionUrl(config, session, '/Json/WhseOrder/doQueryOrderPage');
+  const baseDelayMs = options.postSubmitReconciliationDelayMs
+    ?? POST_SUBMIT_RECONCILIATION_DELAY_MS;
+  for (let attempt = 1; attempt <= POST_SUBMIT_RECONCILIATION_ATTEMPTS; attempt += 1) {
+    let queryResult;
+    try {
+      queryResult = await postJson(queryUrl, {
+        orderQuery: {
+          documentNo: payload.orderNumber,
+          orderOrigin: config.orderOrigin,
+        },
+        pageData: {
+          currentLength: 2,
+          currentOffset: 0,
+        },
+      }, getSessionHeaders(session));
+    } catch (error) {
+      throw withISendPhase(error, 'post-submit-reconciliation');
+    }
+
+    const queryPage = queryResult?.returnObject;
+    const queryRows = Array.isArray(queryPage?.currentPageData)
+      ? queryPage.currentPageData
+      : [];
+    const totalRecord = Number(queryPage?.totalRecord);
+    const row = queryRows.length === 1 ? queryRows[0] : null;
+    const exactDocumentMatch = hasUsableValue(payload.orderNumber)
+      && String(row?.documentNo || '').trim() === String(payload.orderNumber).trim();
+    const reconciledCustomerOrderNo = row?.custOrderNo;
+
+    if (queryResult?.success === true
+      && totalRecord === 1
+      && exactDocumentMatch
+      && hasUsableValue(reconciledCustomerOrderNo)
+      && String(reconciledCustomerOrderNo).trim().length <= 200) {
+      return {
+        ...createResult,
+        returnObject: {
+          ...(createResult.returnObject && typeof createResult.returnObject === 'object'
+            ? createResult.returnObject
+            : {}),
+          custOrderNo: String(reconciledCustomerOrderNo).trim(),
+        },
+        reconciliation: {
+          source: 'documentNo-query',
+          exactMatch: true,
+          attempt,
+        },
+      };
+    }
+
+    const notVisibleYet = queryResult?.success === true
+      && totalRecord === 0
+      && queryRows.length === 0;
+    if (!notVisibleYet || attempt === POST_SUBMIT_RECONCILIATION_ATTEMPTS) {
+      return createResult;
+    }
+    if (baseDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(
+        resolve,
+        baseDelayMs * (2 ** (attempt - 1)),
+      ));
+    }
   }
 
-  const queryPage = queryResult?.returnObject;
-  const queryRows = Array.isArray(queryPage?.currentPageData)
-    ? queryPage.currentPageData
-    : [];
-  const totalRecord = Number(queryPage?.totalRecord);
-  const row = queryRows.length === 1 ? queryRows[0] : null;
-  const exactDocumentMatch = hasUsableValue(payload.orderNumber)
-    && String(row?.documentNo || '').trim() === String(payload.orderNumber).trim();
-  const reconciledCustomerOrderNo = row?.custOrderNo;
-
-  if (queryResult?.success !== true
-    || totalRecord !== 1
-    || !exactDocumentMatch
-    || !hasUsableValue(reconciledCustomerOrderNo)
-    || String(reconciledCustomerOrderNo).trim().length > 200) {
-    return createResult;
-  }
-
-  return {
-    ...createResult,
-    returnObject: {
-      ...(createResult.returnObject && typeof createResult.returnObject === 'object'
-        ? createResult.returnObject
-        : {}),
-      custOrderNo: String(reconciledCustomerOrderNo).trim(),
-    },
-    reconciliation: {
-      source: 'documentNo-query',
-      exactMatch: true,
-    },
-  };
+  return createResult;
 }
 
 /**

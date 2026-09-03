@@ -457,7 +457,6 @@ describe('Wix eCommerce order mapping', () => {
   });
 
   it.each([
-    ['zero rows', { totalRecord: 0, currentPageData: [] }],
     ['duplicate rows', {
       totalRecord: 2,
       currentPageData: [
@@ -494,6 +493,83 @@ describe('Wix eCommerce order mapping', () => {
         success: true,
         returnObject: null,
       });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries a temporarily invisible accepted order without resubmitting Add', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: null,
+        msgList: { actualAdd: true, msgList: [] },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { totalRecord: 0, currentPageData: [] },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: {
+          totalRecord: 1,
+          currentPageData: [{ documentNo: '1001', custOrderNo: '595900000001' }],
+        },
+      }));
+
+    try {
+      await expect(sendOrderToISend(validOrder(), {
+        postSubmitReconciliationDelayMs: 0,
+      })).resolves.toMatchObject({
+        success: true,
+        returnObject: { custOrderNo: '595900000001' },
+        reconciliation: { source: 'documentNo-query', exactMatch: true, attempt: 2 },
+      });
+      const addCalls = mocks.fetch.mock.calls.filter(([url]) => (
+        url.endsWith('/Json/WebApiOrder/doAddWebApiOrder')
+      ));
+      expect(addCalls).toHaveLength(1);
+      expect(mocks.fetch).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a successful null Add ambiguous after four empty identity queries', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: null,
+        msgList: { actualAdd: true, msgList: [] },
+      }));
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      mocks.fetch.mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { totalRecord: 0, currentPageData: [] },
+      }));
+    }
+
+    try {
+      await expect(sendOrderToISend(validOrder(), {
+        postSubmitReconciliationDelayMs: 0,
+      })).resolves.toMatchObject({ success: true, returnObject: null });
+      expect(mocks.fetch).toHaveBeenCalledTimes(6);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
