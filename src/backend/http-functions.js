@@ -186,6 +186,56 @@ export async function get_testISendLoginFromWix(request) {
 }
 
 /**
+ * Protected, read-only staging login diagnostic for a production-selected site.
+ *
+ * This endpoint lets an operator prove the staged credentials and outbound Wix
+ * route without changing the authoritative environment selector. It performs
+ * login only and continues to honor the iSend staging service window.
+ */
+export async function get_testISendStagingLoginFromProductionWix(request) {
+  try {
+    if (!await requireSecretHeader(
+      request,
+      'x-isend-staging-diagnostic-secret',
+      'ISEND_STAGING_DIAGNOSTIC_SECRET',
+    )) {
+      return jsonResponse(401, { success: false, message: 'Unauthorized' });
+    }
+
+    let environment;
+    try {
+      environment = await getConfiguredISendEnvironment();
+    } catch (error) {
+      throw new SecretConfigurationError('Missing or invalid configured iSend environment');
+    }
+    if (environment !== 'production') {
+      return jsonResponse(409, {
+        success: false,
+        code: 'cross-environment-staging-diagnostic-disabled',
+        message: 'Cross-environment staging diagnostic requires a production-selected site',
+      });
+    }
+
+    const result = await testISendLogin({ environment: 'staging' });
+    return loginDiagnosticSuccessResponse(result);
+  } catch (error) {
+    if (error instanceof SecretConfigurationError) {
+      return endpointConfigurationErrorResponse();
+    }
+    const diagnostics = classifyISendDiagnosticError(error);
+    console.error('iSend cross-environment staging diagnostic failed', diagnostics);
+    return serverError({
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        message: 'iSend staging diagnostic failed',
+        diagnostics,
+      },
+    });
+  }
+}
+
+/**
  * Protected, read-only production login diagnostic.
  *
  * The site's authoritative environment must already be production. The forced

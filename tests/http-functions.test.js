@@ -47,6 +47,7 @@ vi.mock('backend/isendOrderOutbox', () => ({ requeueISendOrder: mocks.requeueISe
 import {
   get_testISendLoginFromWix,
   get_testISendProductionLoginFromWix,
+  get_testISendStagingLoginFromProductionWix,
   post_createFulfillmentFromWix,
   post_isendWebhook,
   post_requeueISendOrder,
@@ -59,6 +60,7 @@ describe('Wix HTTP functions', () => {
     vi.clearAllMocks();
     mocks.getSecret.mockImplementation(async (name) => ({
       ISEND_POLLER_TRIGGER_SECRET: 'trigger-secret',
+      ISEND_STAGING_DIAGNOSTIC_SECRET: 'staging-diagnostic-secret',
       ISEND_RECOVERY_TRIGGER_SECRET: 'recovery-secret',
       ISEND_FULFILLMENT_TRIGGER_SECRET: 'fulfillment-secret',
     })[name]);
@@ -223,6 +225,61 @@ describe('Wix HTTP functions', () => {
 
     expect(response).toMatchObject({ status: 401, body: { success: false } });
     expect(mocks.getSecret).not.toHaveBeenCalled();
+    expect(mocks.getConfiguredISendEnvironment).not.toHaveBeenCalled();
+    expect(mocks.testISendLogin).not.toHaveBeenCalled();
+  });
+
+  it('runs a staging-only login without changing a production selector', async () => {
+    mocks.getConfiguredISendEnvironment.mockResolvedValueOnce('production');
+
+    const response = await get_testISendStagingLoginFromProductionWix({
+      headers: {
+        'X-ISEND-STAGING-DIAGNOSTIC-SECRET': 'staging-diagnostic-secret',
+      },
+      query: { environment: 'production', force: 'true' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(mocks.getConfiguredISendEnvironment).toHaveBeenCalledTimes(1);
+    expect(mocks.testISendLogin).toHaveBeenCalledWith({ environment: 'staging' });
+    expect(response.body).toMatchObject({
+      success: true,
+      diagnosticBuild: 'isend-login-diagnostic-v3',
+      environment: 'staging',
+      hasSessionId: true,
+      hasSessionPassword: true,
+      hasSessionCookie: true,
+    });
+    expect(response.body).not.toHaveProperty('baseUrl');
+    expect(response.body).not.toHaveProperty('loginPath');
+  });
+
+  it('disables the cross-environment staging diagnostic unless Wix is production-selected', async () => {
+    mocks.getConfiguredISendEnvironment.mockResolvedValueOnce('staging');
+
+    const response = await get_testISendStagingLoginFromProductionWix({
+      headers: {
+        'X-ISEND-STAGING-DIAGNOSTIC-SECRET': 'staging-diagnostic-secret',
+      },
+      query: {},
+    });
+
+    expect(response).toEqual({
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        success: false,
+        code: 'cross-environment-staging-diagnostic-disabled',
+        message: 'Cross-environment staging diagnostic requires a production-selected site',
+      },
+    });
+    expect(mocks.testISendLogin).not.toHaveBeenCalled();
+  });
+
+  it('protects the cross-environment staging diagnostic before reading configuration', async () => {
+    const response = await get_testISendStagingLoginFromProductionWix({ headers: {}, query: {} });
+
+    expect(response).toMatchObject({ status: 401, body: { success: false } });
     expect(mocks.getConfiguredISendEnvironment).not.toHaveBeenCalled();
     expect(mocks.testISendLogin).not.toHaveBeenCalled();
   });
