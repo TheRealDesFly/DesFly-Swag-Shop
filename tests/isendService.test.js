@@ -272,8 +272,44 @@ describe('Wix eCommerce order mapping', () => {
 
     expect(payload).toMatchObject({
       orderAmountIncTax: 125.5,
-      detailList: [{ skuNo: 'PATCH-1', orderQty: 2, salePrice: 0 }],
+      detailList: [{ itemId: '1', skuNo: 'PATCH-1', orderQty: 2, salePrice: 0 }],
     });
+  });
+
+  it('maps long Wix identities into stable iSend IDs of at most 30 characters', () => {
+    const order = validOrder({
+      _id: '00000000-1111-2222-3333-444444444444',
+      number: 'ORDER-NUMBER-THAT-IS-LONGER-THAN-THIRTY-CHARACTERS',
+      buyerInfo: {
+        id: '99999999-8888-7777-6666-555555555555',
+        email: 'buyer@example.com',
+        phone: '+60123456789',
+      },
+    });
+
+    const first = mapOrderToISend(order, mappingConfig);
+    const second = mapOrderToISend(order, mappingConfig);
+
+    expect(first.orderId).toMatch(/^WX[0-9a-f]{28}$/);
+    expect(first.orderNumber).toMatch(/^WN[0-9a-f]{28}$/);
+    expect(first.deliverToCustAddr.customerNo).toMatch(/^CU[0-9a-f]{28}$/);
+    expect(first.orderId).toBe(second.orderId);
+    expect(first.orderNumber).toBe(second.orderNumber);
+    expect(first.deliverToCustAddr.customerNo).toBe(second.deliverToCustAddr.customerNo);
+  });
+
+  it('uses unique per-line item IDs even when the same SKU appears twice', () => {
+    const payload = mapOrderToISend(validOrder({
+      lineItems: [
+        { name: 'Patch one', sku: 'PATCH-1', quantity: 1, price: 50 },
+        { name: 'Patch two', sku: 'PATCH-1', quantity: 1, price: 75.5 },
+      ],
+    }), mappingConfig);
+
+    expect(payload.detailList).toEqual([
+      expect.objectContaining({ itemId: '1', skuNo: 'PATCH-1' }),
+      expect.objectContaining({ itemId: '2', skuNo: 'PATCH-1' }),
+    ]);
   });
 
   it('rejects a missing order identity', () => {

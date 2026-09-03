@@ -4,6 +4,7 @@
  * sends orders to iSend, and retrieves tracking/status information.
  */
 import { fetch } from 'wix-fetch';
+import crypto from 'crypto';
 import {
   getISendConfig,
   ISEND_ORDER_TIME_ZONE,
@@ -15,6 +16,7 @@ const SERVICE_START_HOUR_MYT = 9;
 const SERVICE_END_HOUR_MYT = 23;
 const REQUEST_TIMEOUT_MS = 20000;
 const ISEND_CONTEXT_ROOT = '/IsisWMS-War';
+const ISEND_EXTERNAL_ID_MAX_LENGTH = 30;
 export const ISEND_LOGIN_DIAGNOSTIC_BUILD = 'isend-login-diagnostic-v3';
 
 const SAFE_DIAGNOSTIC_FAILURE_CLASSES = new Set([
@@ -566,6 +568,12 @@ function getItemSku(item) {
   return source.sku || '';
 }
 
+function normalizeISendExternalId(value, prefix) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized.length <= ISEND_EXTERNAL_ID_MAX_LENGTH) return normalized;
+  return `${prefix}${crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 28)}`;
+}
+
 function getCustomerName(shipping, order) {
   const fromShipping = shipping.fullName || `${shipping.firstName || ''} ${shipping.lastName || ''}`.trim();
   const buyerInfo = order.buyerInfo || {};
@@ -697,9 +705,10 @@ function validateOrderPayload(payload) {
 function buildCustomerAddress(order, shipping, config) {
   const name = getCustomerName(shipping, order);
   const buyerInfo = order.buyerInfo || {};
+  const customerIdentity = buyerInfo.id || buyerInfo.memberId || order.buyerId || config.userId;
 
   return {
-    customerNo: buyerInfo.id || buyerInfo.memberId || order.buyerId || config.userId,
+    customerNo: normalizeISendExternalId(customerIdentity, 'CU'),
     customerDesc: name,
     addrTypeNo: 'ADDRESS_TYPE_HOME',
     city: shipping.city || getAddressValue(shipping, 'city'),
@@ -732,7 +741,9 @@ export function mapOrderToISend(order, config) {
 
   const shipping = getShippingDetails(order);
   const lineItems = getLineItems(order);
-  const orderId = order._id || order.id || order.number;
+  const sourceOrderId = order._id || order.id || order.number;
+  const orderId = normalizeISendExternalId(sourceOrderId, 'WX');
+  const orderNumber = normalizeISendExternalId(order.number || sourceOrderId, 'WN');
   const orderAmount = toFiniteNumber(getOrderAmount(order));
   const customerAddress = buildCustomerAddress(order, shipping, config);
 
@@ -741,7 +752,7 @@ export function mapOrderToISend(order, config) {
     orderOrigin: config.orderOrigin,
     userId: config.userId,
     orderId,
-    orderNumber: order.number ? String(order.number) : String(orderId),
+    orderNumber,
     orderSource: config.orderSource,
     orderDate: formatISendDate(
       getOrderDate(order),
@@ -758,8 +769,8 @@ export function mapOrderToISend(order, config) {
     orderCostAmount: orderAmount,
     codFlag: false,
     remark: order.note || order.buyerNote || '',
-    detailList: lineItems.map((item) => ({
-      itemId: String(getItemSku(item) || '').trim(),
+    detailList: lineItems.map((item, index) => ({
+      itemId: String(index + 1),
       skuNo: String(getItemSku(item) || '').trim(),
       skuDesc: getLineItemDescription(item),
       orderQty: toFiniteNumber(item && (item.quantity ?? item.qty)),

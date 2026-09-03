@@ -172,8 +172,8 @@ function formatMytDate(now) {
 }
 
 function buildCanaryOrder(config, candidate, now = new Date()) {
-  const unique = `${now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`;
-  const orderReference = `WIX-CANARY-${unique}`;
+  const unique = `${now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}${crypto.randomBytes(3).toString('hex')}`;
+  const orderReference = `WIXCANARY-${unique}`;
   const sku = String(candidate.storageClientSkuNo || candidate.skuNo).trim();
   const address = {
     customerNo: orderReference,
@@ -214,7 +214,7 @@ function buildCanaryOrder(config, candidate, now = new Date()) {
       codFlag: false,
       remark: 'AUTHORIZED PRODUCTION CANARY - CANCEL IMMEDIATELY - DO NOT FULFILL',
       detailList: [{
-        itemId: sku,
+        itemId: '1',
         skuNo: sku,
         skuDesc: String(candidate.skuDesc || 'Production canary item').slice(0, 200),
         orderQty: 1,
