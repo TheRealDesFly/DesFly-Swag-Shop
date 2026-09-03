@@ -401,6 +401,31 @@ Production capacity is accepted only when peak volume plus retry headroom remain
 
 ## 10. Resolve Partner Contract Decisions
 
+The partner-provided *iStore iSend API Reference, Version 1.9* (2025) confirms
+the following interface facts, but it does not by itself approve a production
+canary:
+
+- Add Order uses `POST /Json/WebApiOrder/doAddWebApiOrder`; its documented
+  success example has `success=true`, `msgList.actualAdd=true`, and
+  `returnObject=null`.
+- Query Order Status and Tracking Code accepts both `custOrderNo` and
+  `documentNo`, describes `documentNo` as the external/platform order number,
+  and returns `custOrderNo` in `currentPageData`.
+- The Order Status Webhook payload uses `action="order"`, places the status in
+  `value`, and carries `custOrderNo` plus `documentNo`.
+- The document does not specify an HMAC/signature header, signed delivery ID,
+  retry policy, multi-parcel line allocation, global cross-environment
+  `custOrderNo` uniqueness, credential rotation, or whether the newly created
+  order is immediately queryable by `documentNo`.
+
+The worker therefore performs only a bounded post-create identity recovery:
+when Add Order succeeds without `custOrderNo`, it queries by the submitted
+platform order number and accepts exactly one row with an exact `documentNo`
+match and a nonblank `custOrderNo`. Zero, duplicate, mismatched, delayed, or
+failed query results remain `unknown_outcome` and must not be resubmitted.
+Webhook handling recognizes the documented `action`/`value` shape only after
+the existing HMAC check succeeds; do not register an unsigned webhook.
+
 Obtain written iSend confirmation for each item:
 
 1. A successful create-order response contains `custOrderNo`, that value is the correct query key for `/Json/WhseOrder/doQueryOrderPage`, and a successful query reports authoritative `returnObject.totalRecord=1` plus exactly one page row carrying the same `custOrderNo` when the order exists.
@@ -421,7 +446,7 @@ Do not start the canary until secrets, data, publication, strict staging probe, 
 1. Schedule the canary inside the iSend service window with Wix, iSend, and operations owners present.
 2. Freeze or tightly control normal order intake so only one identified single-parcel canary can enter the new path.
 3. Stop new staging intake and quiesce staging webhook delivery. Prove there are no staging outbox rows in `pending`, `processing`, or retryable `retry`; resolve every staging attention state; and require every staging mapping to have `reconciliationActive=false`. Require explicit, proven environment bindings on every environment-sensitive outbox/mapping row and every migrated webhook audit, inventory row, pending email, and raw-webhook claim. Append-only lease claims are not environment business records and are governed by their claim key/generation retention rule instead.
-4. Verify the production root is exactly `https://istoreisend-wms.com:5191/IsisWMS-War` (or its host-only form), verify the credentials and recorded single-parcel approval gate, then change only the Wix environment selector to the production environment through Secrets Manager.
+4. Verify the production root is exactly `https://webapi.istoreisend-wms.com/IsisWMS-War` (or its host-only form), verify the credentials and recorded single-parcel approval gate, then change only the Wix environment selector to the production environment through Secrets Manager.
 5. Observe all scheduled jobs once, require zero missing- or other-environment conflicts, and require a green claim-retention summary before accepting a production order.
 6. Submit one controlled order and observe every evidence point from the staging checklist through fulfillment and email.
 7. Wait through a webhook replay or deliberate poll reconciliation and confirm idempotency.

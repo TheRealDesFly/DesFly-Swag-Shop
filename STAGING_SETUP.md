@@ -142,7 +142,7 @@ Use an HTTPS iStore/iSend host root or `/IsisWMS-War` context root for `ISTORE_I
 Verified official context roots:
 
 - Staging: `https://staging.istoreisend-wms.com:5191/IsisWMS-War`
-- Production: `https://istoreisend-wms.com:5191/IsisWMS-War`
+- Production: `https://webapi.istoreisend-wms.com/IsisWMS-War`
 - Alternate staging/test web API host: `https://webapi.istoreisend-wms.com/IsisWMS-War`
 
 Outbound order timestamps are serialized explicitly in `Asia/Kuala_Lumpur` time rather than inheriting the Wix or developer-machine timezone. The backend's 20-second deadline covers both the request and response-body read and aborts the underlying fetch when the deadline expires.

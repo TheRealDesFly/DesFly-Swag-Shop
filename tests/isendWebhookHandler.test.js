@@ -745,6 +745,34 @@ describe('iSend webhook handling', () => {
     });
   });
 
+  it('accepts the documented signed action/value order-status webhook shape', async () => {
+    const { request } = signedRequest({
+      storageClientNo: 'SSL1234',
+      action: 'order',
+      value: 'LOADED',
+      custOrderNo: 'ORDER123',
+      documentNo: '1001',
+      triggeredAt: '09/01/2025 03:04:00',
+    });
+
+    const result = await handleWebhook(request);
+
+    expect(result).toMatchObject({ success: true, status: 200, processed: true });
+    expect(mocks.getByISendOrderNo).toHaveBeenCalledWith('ORDER123', 'staging');
+    expect(mocks.updateMappingStatus).toHaveBeenCalledWith('ORDER123', 'LOADED', {
+      environment: 'staging',
+      deferDeliveryEffects: true,
+    });
+    expect(mocks.createFulfillment).not.toHaveBeenCalled();
+    expect(mocks.markProcessed).toHaveBeenCalledWith(
+      expect.stringMatching(/^staging:order\.status:/),
+      expect.objectContaining({
+        environment: 'staging',
+        eventType: 'order.status',
+      }),
+    );
+  });
+
   it('prefers queryable custOrderNo when a webhook also includes internal orderNo', async () => {
     const { request } = signedRequest({
       eventType: 'order.status.updated',

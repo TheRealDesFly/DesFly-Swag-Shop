@@ -806,12 +806,75 @@ export async function sendOrderToISend(order, options = {}) {
     throw withISendPhase(error, 'login');
   }
 
+  let createResult;
   try {
     const url = buildSessionUrl(config, session, '/Json/WebApiOrder/doAddWebApiOrder');
-    return await postJson(url, payload, getSessionHeaders(session));
+    createResult = await postJson(url, payload, getSessionHeaders(session));
   } catch (error) {
     throw withISendPhase(error, 'submit');
   }
+
+  const returnedCustomerOrderNo = createResult?.returnObject?.custOrderNo
+    || createResult?.custOrderNo;
+  const addWasSuccessful = createResult?.success === true
+    && createResult?.msgList?.actualAdd !== false;
+  if (!addWasSuccessful || hasUsableValue(returnedCustomerOrderNo)) {
+    return createResult;
+  }
+
+  // The partner's v1.9 API reference documents a successful Add Order
+  // response with returnObject=null. It separately documents documentNo as
+  // the external/platform order number accepted by doQueryOrderPage. Recover
+  // custOrderNo only from one exact documentNo match; every empty, duplicate,
+  // or mismatched result remains ambiguous so the outbox cannot resubmit it.
+  let queryResult;
+  try {
+    const queryUrl = buildSessionUrl(config, session, '/Json/WhseOrder/doQueryOrderPage');
+    queryResult = await postJson(queryUrl, {
+      orderQuery: {
+        documentNo: payload.orderNumber,
+        orderOrigin: config.orderOrigin,
+      },
+      pageData: {
+        currentLength: 2,
+        currentOffset: 0,
+      },
+    }, getSessionHeaders(session));
+  } catch (error) {
+    throw withISendPhase(error, 'post-submit-reconciliation');
+  }
+
+  const queryPage = queryResult?.returnObject;
+  const queryRows = Array.isArray(queryPage?.currentPageData)
+    ? queryPage.currentPageData
+    : [];
+  const totalRecord = Number(queryPage?.totalRecord);
+  const row = queryRows.length === 1 ? queryRows[0] : null;
+  const exactDocumentMatch = hasUsableValue(payload.orderNumber)
+    && String(row?.documentNo || '').trim() === String(payload.orderNumber).trim();
+  const reconciledCustomerOrderNo = row?.custOrderNo;
+
+  if (queryResult?.success !== true
+    || totalRecord !== 1
+    || !exactDocumentMatch
+    || !hasUsableValue(reconciledCustomerOrderNo)
+    || String(reconciledCustomerOrderNo).trim().length > 200) {
+    return createResult;
+  }
+
+  return {
+    ...createResult,
+    returnObject: {
+      ...(createResult.returnObject && typeof createResult.returnObject === 'object'
+        ? createResult.returnObject
+        : {}),
+      custOrderNo: String(reconciledCustomerOrderNo).trim(),
+    },
+    reconciliation: {
+      source: 'documentNo-query',
+      exactMatch: true,
+    },
+  };
 }
 
 /**

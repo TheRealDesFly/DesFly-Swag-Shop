@@ -377,4 +377,116 @@ describe('Wix eCommerce order mapping', () => {
       vi.useRealTimers();
     }
   });
+
+  it('recovers custOrderNo from one exact documented documentNo query after a null add response', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: null,
+        msgList: { actualAdd: true, msgList: [] },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: {
+          totalRecord: 1,
+          currentPageData: [{ documentNo: '1001', custOrderNo: '595900000001' }],
+        },
+      }));
+
+    try {
+      await expect(sendOrderToISend(validOrder())).resolves.toMatchObject({
+        success: true,
+        returnObject: { custOrderNo: '595900000001' },
+        reconciliation: { source: 'documentNo-query', exactMatch: true },
+      });
+      expect(mocks.fetch).toHaveBeenCalledTimes(3);
+      expect(mocks.fetch.mock.calls[2][0]).toBe(
+        'https://staging.istoreisend-wms.com:5191/IsisWMS-War/Json/WhseOrder/doQueryOrderPage',
+      );
+      expect(JSON.parse(mocks.fetch.mock.calls[2][1].body)).toEqual({
+        orderQuery: { documentNo: '1001', orderOrigin: 'WIX' },
+        pageData: { currentLength: 2, currentOffset: 0 },
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['zero rows', { totalRecord: 0, currentPageData: [] }],
+    ['duplicate rows', {
+      totalRecord: 2,
+      currentPageData: [
+        { documentNo: '1001', custOrderNo: '595900000001' },
+        { documentNo: '1001', custOrderNo: '595900000002' },
+      ],
+    }],
+    ['a mismatched document', {
+      totalRecord: 1,
+      currentPageData: [{ documentNo: 'DIFFERENT', custOrderNo: '595900000001' }],
+    }],
+    ['a missing customer order number', {
+      totalRecord: 1,
+      currentPageData: [{ documentNo: '1001' }],
+    }],
+  ])('keeps a successful null add response ambiguous when reconciliation returns %s', async (_label, page) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: null,
+        msgList: { actualAdd: true, msgList: [] },
+      }))
+      .mockResolvedValueOnce(loginResponse({ success: true, returnObject: page }));
+
+    try {
+      await expect(sendOrderToISend(validOrder())).resolves.toMatchObject({
+        success: true,
+        returnObject: null,
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('marks a failed post-create identity query as post-submit reconciliation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' },
+      }))
+      .mockResolvedValueOnce(loginResponse({
+        success: true,
+        returnObject: null,
+        msgList: { actualAdd: true, msgList: [] },
+      }))
+      .mockRejectedValueOnce(new TypeError('network failure'));
+
+    try {
+      await expect(sendOrderToISend(validOrder())).rejects.toMatchObject({
+        isendPhase: 'post-submit-reconciliation',
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
 });

@@ -284,11 +284,17 @@ export async function handleWebhook(request) {
     // Parse only after authenticating the exact bytes received from iSend.
     const payload = parseJsonBody(rawBody, { allowEmpty: false });
     const trackingCandidates = extractTrackingNumbers(payload);
-    const eventType = String(payload.eventType || payload.type || '').toLowerCase();
+    const partnerAction = String(payload.action || '').trim().toLowerCase();
+    const eventType = String(
+      payload.eventType
+      || payload.type
+      || (partnerAction === 'order' ? 'order.status' : ''),
+    ).toLowerCase();
     const possibleStatus = payload.orderStatus
       || payload.order && (payload.order.orderStatus || payload.order.status)
       || payload.tracking && payload.tracking.status
-      || payload.status;
+      || payload.status
+      || (partnerAction === 'order' ? payload.value : null);
     const isTrackingEvent = /tracking|shipment/.test(eventType);
     const isInventoryEvent = /inventory/.test(eventType);
     const isStatusEvent = /order\.status|status/.test(eventType);
