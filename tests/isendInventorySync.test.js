@@ -132,7 +132,9 @@ describe('inventory reconciliation', () => {
   it.each([0, 7])('writes and verifies the exact absolute quantity %s', async (quantity) => {
     enableMaintenance(); source.returnObject.currentPageData[0].availableQty = quantity;
     expect(await apply()).toMatchObject({ success: true, written: 1, results: [{ status: 'verified', quantity }] });
-    expect(mocks.updateStock).toHaveBeenCalledExactlyOnceWith('p1', { trackQuantity: true, variants: [{ variantId: 'v1', quantity }] });
+    expect(mocks.updateStock).toHaveBeenCalledExactlyOnceWith('p1', {
+      trackQuantity: true, variants: [{ variantId: 'v1', quantity, inStock: quantity > 0 }],
+    });
     expect(mocks.assertLock).toHaveBeenCalledTimes(1);
     expect(mocks.lock).toHaveBeenCalledWith('inventory-sync:site', expect.any(Function), { leaseMs: 300000 });
   });

@@ -6,20 +6,31 @@ import { queryStorageClientInventory } from 'backend/isendService';
 import { assertMappingMutationLock, withMappingMutationLock } from 'backend/isendMappingMutationLock';
 import { buildInventoryPlan, inventoryQuantity, validateInventorySkus } from 'backend/isendInventoryPlan';
 
+/**
+ * @typedef {import('backend/isendInventoryPlan').InventoryTarget} InventoryTarget
+ * @typedef {import('backend/isendInventoryPlan').WarehouseInventoryRow} WarehouseInventoryRow
+ * @typedef {import('wix-stores-backend').InventoryItem} WixInventoryItem
+ * @typedef {{environment: string, country: string, mode?: string, maintenanceStartedAt?: string, maintenanceUntil?: string, availableQtyContractConfirmed?: boolean, checkoutPausedAndOrdersReconciled?: boolean, allowedSkus?: string[]}} InventorySettings
+ * @typedef {{skus?: string[], mode?: string, expectedPlanHash?: string}} InventorySyncOptions
+ */
+
 const READ_OPTIONS = { suppressAuth: true, consistentRead: true };
 const MAX_PRODUCTS = 1000;
 const MAX_PLAN_AGE_MS = 60 * 1000;
 const MAX_MAINTENANCE_MS = 15 * 60 * 1000;
 
 export class InventorySyncError extends Error {
+  /** @param {string} code */
   constructor(code) {
     super(code);
     this.code = code;
   }
 }
 
+/** @param {string} code @returns {never} */
 function fail(code) { throw new InventorySyncError(code); }
 
+/** @returns {Promise<InventorySettings>} */
 async function readSettings() {
   let settings;
   try { settings = JSON.parse(await getSecret('ISEND_INVENTORY_SYNC_CONFIG')); } catch { /* Fail closed below. */ }
@@ -29,9 +40,11 @@ async function readSettings() {
   return settings;
 }
 
+/** @param {InventorySettings} settings @param {string} environment @param {string[]} skus */
 function assertMaintenance(settings, environment, skus) {
-  const start = Date.parse(settings.maintenanceStartedAt);
-  const end = Date.parse(settings.maintenanceUntil);
+  const start = Date.parse(settings.maintenanceStartedAt || '');
+  const end = Date.parse(settings.maintenanceUntil || '');
+  const allowedSkus = settings.allowedSkus;
   const now = Date.now();
   // This repository serves one production storefront. A staging selector is
   // not a separate Wix catalog; staging warehouse stock is preview-only here.
@@ -40,12 +53,13 @@ function assertMaintenance(settings, environment, skus) {
     || settings.checkoutPausedAndOrdersReconciled !== true
     || !Number.isFinite(start) || !Number.isFinite(end)
     || now < start || now >= end || end - start > MAX_MAINTENANCE_MS
-    || !Array.isArray(settings.allowedSkus)
-    || skus.some((sku) => !settings.allowedSkus.includes(sku))) {
+    || !Array.isArray(allowedSkus)
+    || skus.some((sku) => !allowedSkus.includes(sku))) {
     fail('inventory-apply-disabled');
   }
 }
 
+/** @param {string} productId @returns {Promise<WixInventoryItem>} */
 async function readInventory(productId) {
   const result = await wixData.query('Stores/InventoryItems').eq('productId', productId)
     .limit(2).find(READ_OPTIONS);
@@ -56,6 +70,7 @@ async function readInventory(productId) {
 /** Catalog V1 adapter. Use the inventory's actual variant ID, including the
  * default variant of an unmanaged product; never invent a default UUID.
  * A capped/incomplete catalog cannot establish unique SKU ownership.
+ * @returns {Promise<InventoryTarget[]>}
  */
 export async function readWixInventoryTargets() {
   const products = [];
@@ -94,11 +109,13 @@ export async function readWixInventoryTargets() {
   return targets;
 }
 
+/** @param {string[]} skus @param {InventorySettings} settings @param {string} environment */
 async function preparePlan(skus, settings, environment) {
   const startedAt = Date.now();
   const config = await getISendConfig({ environment });
   if (config.environment !== environment) fail('inventory-environment-changed');
   const targets = await readWixInventoryTargets();
+  /** @type {WarehouseInventoryRow[]} */
   const warehouseRows = [];
   for (const sku of skus) {
     const result = await queryStorageClientInventory({
@@ -113,8 +130,10 @@ async function preparePlan(skus, settings, environment) {
       || total === null || total > 1000 || page.currentPageData.length !== total) {
       fail('incomplete-isend-inventory');
     }
-    if (page.currentPageData.some((row) => !row || row.storageClientSkuNo !== sku)) fail('isend-sku-filter-mismatch');
-    warehouseRows.push(...page.currentPageData);
+    /** @type {WarehouseInventoryRow[]} */
+    const rows = page.currentPageData;
+    if (rows.some((row) => !row || row.storageClientSkuNo !== sku)) fail('isend-sku-filter-mismatch');
+    warehouseRows.push(...rows);
   }
   if (Date.now() - startedAt > MAX_PLAN_AGE_MS) fail('inventory-snapshot-expired');
   return { startedAt, plan: buildInventoryPlan({
@@ -127,6 +146,7 @@ async function preparePlan(skus, settings, environment) {
  * writer. Catalog V1 absolute stock updates have no checkout reservation fence:
  * applying requires a short, explicitly attested maintenance window. This is
  * NOT a safe continuous-sync algorithm while customers are checking out.
+ * @param {InventorySyncOptions} options
  */
 export async function runISendInventorySync(options = {}) {
   const skus = validateInventorySkus(options.skus);
@@ -143,12 +163,13 @@ export async function runISendInventorySync(options = {}) {
   if (!/^[a-f0-9]{64}$/.test(options.expectedPlanHash || '')) fail('inventory-preview-required');
   // Global site lock, not an environment-specific one: both environments would
   // otherwise be able to write into the same Wix stock records.
-  return withMappingMutationLock('inventory-sync:site', async (lock) => {
+  return withMappingMutationLock('inventory-sync:site', /** @param {Parameters<typeof assertMappingMutationLock>[0]} lock */ async (lock) => {
     const { plan, startedAt } = await preparePlan(skus, settings, environment);
     if (!plan.ready) return { success: false, mode, written: 0, ...plan };
     if (plan.planHash !== options.expectedPlanHash) fail('inventory-plan-changed');
     const results = [];
-    for (const entry of plan.entries.filter((item) => item.status === 'change')) {
+    for (const entry of plan.entries) {
+      if (entry.status !== 'change') continue;
       let writeAttempted = false;
       try {
         const currentSettings = await readSettings();
@@ -165,7 +186,8 @@ export async function runISendInventorySync(options = {}) {
         // retry an ambiguous response or roll back over a concurrent stock edit.
         writeAttempted = true;
         await wixStoresBackend.updateInventoryVariantFieldsByProductId(entry.productId, {
-          trackQuantity: true, variants: [{ variantId: entry.variantId, quantity: entry.quantity }],
+          trackQuantity: true,
+          variants: [{ variantId: entry.variantId, quantity: entry.quantity, inStock: entry.quantity > 0 }],
         });
         const verified = await readInventory(entry.productId);
         const actual = verified.variants.filter((item) => item.variantId === entry.variantId);

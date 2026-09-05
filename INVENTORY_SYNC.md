@@ -1,5 +1,22 @@
 # iStore inventory reconciliation
 
+## Local editor checks
+
+`npm run check` runs lint, strict TypeScript checks for the two inventory modules
+against the generated Wix declarations, and the runtime test suite. Other backend
+modules are resolved as dependencies; their TypeScript diagnostics are outside
+this focused inventory check.
+
+Wix's generated editor configs inherit the deprecated `node` (`node10`) module
+resolver. `npm run configure:types` applies `module: esnext` and
+`moduleResolution: bundler` to those generated projects while preserving their
+paths and Wix types. It also runs before `npm run dev` and during the inventory
+type check. If Wix regenerates `.wix/types` during an editor session, run it again.
+This changes local editor resolution only. TypeScript 6 is pinned as a development
+dependency so the check can reproduce the editor diagnostics.
+
+## Runtime scope
+
 Implemented: protected preview and bounded maintenance-only stock reconciliation
 for Wix Catalog V1. **Not continuous inventory sync and not release evidence.**
 The scheduled order poller and webhook remain unable to change Wix Stores stock.
