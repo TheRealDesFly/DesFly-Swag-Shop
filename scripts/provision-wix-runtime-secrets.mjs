@@ -27,6 +27,19 @@ const generatedSecrets = [
     name: 'ISEND_RECOVERY_TRIGGER_SECRET',
     description: 'Protected operator-only credential for the iSend recovery endpoint.',
   },
+  {
+    name: 'ISEND_INVENTORY_TRIGGER_SECRET',
+    description: 'Protected operator credential for the read-only-by-default iSend inventory endpoint.',
+  },
+  {
+    name: 'ISEND_INVENTORY_SYNC_CONFIG',
+    description: 'Fail-closed iSend inventory environment, country, and operation-mode configuration.',
+    fixedValue: JSON.stringify({
+      environment: 'production',
+      country: 'MALAYSIA',
+      mode: 'preview',
+    }),
+  },
 ];
 
 function parseEnv(contents) {
@@ -51,7 +64,7 @@ function seedLocalSecrets() {
       continue;
     }
 
-    secret.value = randomBytes(32).toString('base64url');
+    secret.value = secret.fixedValue || randomBytes(32).toString('base64url');
     if (contents.length > 0 && !contents.endsWith('\n')) contents += '\n';
     contents += `${secret.name}=${secret.value}\n`;
     statuses.push(`${secret.name}:local-created`);

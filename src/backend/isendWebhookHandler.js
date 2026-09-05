@@ -19,6 +19,7 @@ import {
 import { mapISendStatus, updateMappingStatus } from 'backend/isendStatusMapping';
 import { handleDelivered } from 'backend/orderStateTransitions';
 import { consumeRequestBody, parseJsonBody, RequestBodyError } from 'backend/requestBody';
+import { inventoryQuantity } from 'backend/isendInventoryPlan';
 
 const INVENTORY_COLLECTION = 'ISendInventory';
 const getOrder = elevate(orders.getOrder);
@@ -474,9 +475,12 @@ export async function handleWebhook(request) {
       || (!hasRecognizedEventType && (payload.sku || payload.item?.sku))) {
       // upsert inventory record
       const sku = payload.sku || payload.item && payload.item.sku;
-      const qty = payload.availableQty ?? payload.quantity ?? payload.qty ?? 0;
+      const qty = inventoryQuantity(payload.availableQty ?? payload.quantity ?? payload.qty);
       if (!sku) {
         return { success: false, status: 400, code: 'missing-sku', message: 'Missing SKU' };
+      }
+      if (qty === null) {
+        return { success: false, status: 400, code: 'invalid-inventory-quantity', message: 'Missing or invalid inventory quantity' };
       }
       await upsertInventory(environment, sku, qty);
       await markProcessed(idKey, { environment, eventType, sku });

@@ -13,11 +13,33 @@ import {
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { handleWebhook } from 'backend/isendWebhookHandler';
 import { runPoller } from 'backend/isendPoller';
+import { InventorySyncError, runISendInventorySync } from 'backend/isendInventorySync';
 import { requeueISendOrder } from 'backend/isendOrderOutbox';
 import { getSecret } from 'wix-secrets-backend';
 import { consumeJsonRequestBody, RequestBodyError } from 'backend/requestBody';
 
 class SecretConfigurationError extends Error {}
+
+/** Separate credential from the order poller. Preview performs no CMS/stock writes. */
+export async function post_runISendInventorySync(request) {
+  try {
+    if (!await requireSecretHeader(request, 'x-isend-inventory-secret', 'ISEND_INVENTORY_TRIGGER_SECRET')) {
+      return jsonResponse(401, { success: false, message: 'Unauthorized' });
+    }
+    const { payload } = await consumeJsonRequestBody(request, { allowEmpty: false, maxBytes: 4096 });
+    if (Object.keys(payload).some((key) => !['mode', 'skus', 'expectedPlanHash'].includes(key))) {
+      return jsonResponse(400, { success: false, code: 'unsupported-inventory-option' });
+    }
+    const result = await runISendInventorySync(payload);
+    return jsonResponse(result.success ? 200 : 409, result);
+  } catch (error) {
+    if (error instanceof SecretConfigurationError) return endpointConfigurationErrorResponse();
+    if (error instanceof RequestBodyError) return requestBodyErrorResponse(error);
+    if (error instanceof InventorySyncError) return jsonResponse(409, { success: false, code: error.code });
+    if (error instanceof TypeError) return jsonResponse(400, { success: false, code: 'invalid-inventory-request' });
+    return jsonResponse(503, { success: false, code: 'inventory-sync-unavailable' });
+  }
+}
 
 function jsonResponse(status, body) {
   return response({

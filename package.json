@@ -24,6 +24,7 @@
     "check:dev:live": "node scripts/check-staging-connection.js --skip-wix --force --require-live",
     "check:isend": "node scripts/check-isend.js",
     "check:production": "node scripts/check-isend.js --env production --require-wix",
+    "check:inventory": "node scripts/check-isend-inventory.js",
     "canary:production": "node scripts/run-production-isend-canary.js",
     "provision:wix:runtime-secrets": "node scripts/provision-wix-runtime-secrets.mjs",
     "check:capacity": "node scripts/check-isend-capacity.js",

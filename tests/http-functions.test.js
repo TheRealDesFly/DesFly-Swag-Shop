@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   handleWebhook: vi.fn(),
   requeueISendOrder: vi.fn(),
   runPoller: vi.fn(),
+  runInventorySync: vi.fn(),
   testISendLogin: vi.fn(),
 }));
 
@@ -42,6 +43,10 @@ vi.mock('backend/isendConfig', () => ({
 }));
 vi.mock('backend/isendWebhookHandler', () => ({ handleWebhook: mocks.handleWebhook }));
 vi.mock('backend/isendPoller', () => ({ runPoller: mocks.runPoller }));
+vi.mock('backend/isendInventorySync', () => ({
+  runISendInventorySync: mocks.runInventorySync,
+  InventorySyncError: class extends Error {},
+}));
 vi.mock('backend/isendOrderOutbox', () => ({ requeueISendOrder: mocks.requeueISendOrder }));
 
 import {
@@ -52,6 +57,7 @@ import {
   post_isendWebhook,
   post_requeueISendOrder,
   post_runISendPoller,
+  post_runISendInventorySync,
 } from '../src/backend/http-functions';
 import { isWixHttpFunctionResponse } from 'wix-http-functions';
 
@@ -60,6 +66,7 @@ describe('Wix HTTP functions', () => {
     vi.clearAllMocks();
     mocks.getSecret.mockImplementation(async (name) => ({
       ISEND_POLLER_TRIGGER_SECRET: 'trigger-secret',
+      ISEND_INVENTORY_TRIGGER_SECRET: 'inventory-secret',
       ISEND_STAGING_DIAGNOSTIC_SECRET: 'staging-diagnostic-secret',
       ISEND_RECOVERY_TRIGGER_SECRET: 'recovery-secret',
       ISEND_FULFILLMENT_TRIGGER_SECRET: 'fulfillment-secret',
@@ -218,6 +225,22 @@ describe('Wix HTTP functions', () => {
         message: 'Endpoint is not configured',
       },
     });
+  });
+
+  it('protects inventory operations with a separate credential before any work', async () => {
+    expect(await post_runISendInventorySync({ headers: {} })).toMatchObject({ status: 401 });
+    expect(await post_runISendInventorySync({ headers: { 'x-isend-inventory-secret': 'trigger-secret' } })).toMatchObject({ status: 401 });
+    expect(mocks.runInventorySync).not.toHaveBeenCalled();
+  });
+  it('forwards only inventory mode, SKU scope and reviewed hash', async () => {
+    mocks.runInventorySync.mockResolvedValue({ success: true, mode: 'preview', written: 0 });
+    const result = await post_runISendInventorySync({ headers: { 'x-isend-inventory-secret': 'inventory-secret' }, body: { skus: ['SKU-1'] } });
+    expect(result).toMatchObject({ status: 200, body: { written: 0 } });
+    expect(mocks.runInventorySync).toHaveBeenCalledWith({ skus: ['SKU-1'] });
+  });
+  it.each(['environment', 'force', 'quantity', 'availableQtyContractConfirmed'])('rejects inventory caller override %s', async (key) => {
+    const result = await post_runISendInventorySync({ headers: { 'x-isend-inventory-secret': 'inventory-secret' }, body: { skus: ['SKU-1'], [key]: true } });
+    expect(result).toMatchObject({ status: 400 }); expect(mocks.runInventorySync).not.toHaveBeenCalled();
   });
 
   it('protects the production diagnostic before touching Wix secrets or iSend', async () => {

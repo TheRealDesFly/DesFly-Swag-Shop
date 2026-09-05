@@ -11,6 +11,7 @@ export default defineConfig({
       { find: 'wix-data', replacement: path.join(projectRoot, 'tests/mocks/wix-data.js') },
       { find: 'wix-auth', replacement: path.join(projectRoot, 'tests/mocks/wix-auth.js') },
       { find: 'wix-ecom-backend', replacement: path.join(projectRoot, 'tests/mocks/wix-ecom-backend.js') },
+      { find: 'wix-stores-backend', replacement: path.join(projectRoot, 'tests/mocks/wix-stores-backend.js') },
       { find: 'wix-fetch', replacement: path.join(projectRoot, 'tests/mocks/wix-fetch.js') },
       { find: 'wix-http-functions', replacement: path.join(projectRoot, 'tests/mocks/wix-http-functions.js') },
       { find: 'wix-secrets-backend', replacement: path.join(projectRoot, 'tests/mocks/wix-secrets-backend.js') },

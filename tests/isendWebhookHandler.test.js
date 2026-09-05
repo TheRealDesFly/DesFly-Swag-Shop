@@ -353,6 +353,13 @@ describe('iSend webhook handling', () => {
     expect(mocks.handleDelivered).not.toHaveBeenCalled();
   });
 
+  it.each([undefined, null, '', false, -1, 1.5])('rejects missing or invalid webhook quantity %s without changing stock snapshot', async (qty) => {
+    const result = await handleWebhook(signedRequest({ eventType: 'inventory.updated', sku: 'SKU-1', availableQty: qty }).request);
+    expect(result).toMatchObject({ success: false, status: 400, code: 'invalid-inventory-quantity' });
+    expect(mocks.insert.mock.calls.filter(([collection]) => collection === 'ISendInventory')).toHaveLength(0);
+    expect(mocks.markProcessed).not.toHaveBeenCalled();
+  });
+
   it('uses one deterministic environment/SKU inventory row across deliveries', async () => {
     const sku = 'SKU-INV-1';
     const digest = crypto
