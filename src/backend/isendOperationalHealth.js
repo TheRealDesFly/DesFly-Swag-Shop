@@ -507,6 +507,8 @@ export async function getISendOperationalHealth(options = {}) {
   const [
     pending,
     retry,
+    reconciling,
+    cancelPending,
     unknownOutcome,
     exhaustedRetry,
     staleProcessing,
@@ -521,6 +523,8 @@ export async function getISendOperationalHealth(options = {}) {
   ] = await Promise.all([
     findOutboxStatus('pending', environment, (query) => query.ascending('nextAttemptAt')),
     findOutboxStatus('retry', environment, (query) => query.ascending('nextAttemptAt')),
+    findOutboxStatus('reconciling', environment, (query) => query.ascending('nextAttemptAt')),
+    findOutboxStatus('cancel_pending', environment, (query) => query.ascending('nextAttemptAt')),
     findOutboxStatus('unknown_outcome', environment),
     findOutboxStatus('retry', environment, (query) => query.eq('retryExhausted', true)),
     findOutboxStatus(
@@ -568,8 +572,8 @@ export async function getISendOperationalHealth(options = {}) {
 
   const pendingCount = resultCount(pending);
   const retryCount = resultCount(retry);
-  const backlogCount = pendingCount + retryCount;
-  const oldestReadyAt = oldestDate([pending, retry], 'nextAttemptAt');
+  const backlogCount = pendingCount + retryCount + resultCount(reconciling) + resultCount(cancelPending);
+  const oldestReadyAt = oldestDate([pending, retry, reconciling, cancelPending], 'nextAttemptAt');
   const oldestReadyAgeMinutes = ageMinutes(now, oldestReadyAt) || 0;
   const activeMappingCount = resultCount(activeMappings);
   const fulfillmentClaims = analyzeFulfillmentClaims(
@@ -678,6 +682,8 @@ export async function getISendOperationalHealth(options = {}) {
     metrics: {
       pendingOutbox: pendingCount,
       retryOutbox: retryCount,
+      reconcilingOutbox: resultCount(reconciling),
+      pendingCancellationOutbox: resultCount(cancelPending),
       backlogOutbox: backlogCount,
       oldestReadyAt: oldestReadyAt ? oldestReadyAt.toISOString() : null,
       oldestReadyAgeMinutes,

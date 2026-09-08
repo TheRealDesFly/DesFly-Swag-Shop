@@ -58,7 +58,9 @@ is enabled or the store is production-ready.
 - Reads the visible Catalog V1 product collection (up to 1,000 products), joining
   managed variant SKUs to actual inventory variant IDs. Products omitted by the
   Wix app collection, including hidden products, are outside this tool's scope.
-- Each SKU is queried from iStore with page size 1,000. An incomplete page,
+- Each SKU is queried from iStore with page size 1,000. The deployed API requires
+  1,000 or 50,000, despite the PDF's smaller example; this tool uses the smaller
+  supported size and requires the complete result to fit in one page. An incomplete page,
   unexpected SKU, ambiguous row, wrong client/country, invalid quantity, missing
   SKU or untracked Wix stock blocks the batch. Missing does **not** mean zero.
 - Uses `availableQty`, never `goodQty`, damaged stock, or a guessed sum across

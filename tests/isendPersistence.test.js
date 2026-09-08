@@ -128,6 +128,7 @@ import {
 } from '../src/backend/isendIdempotency';
 import {
   findMappings,
+  finalizeVerifiedCancellation,
   findMappingsForReconciliation,
   findUnclassifiedMappingsForReconciliation,
   findReconciliationEnvironmentConflicts,
@@ -143,6 +144,34 @@ describe('deterministic Wix persistence keys', () => {
     Object.values(mock.collections).forEach((items) => items.splice(0));
     mock.findCalls.splice(0);
     mock.useDefaultDuplicateError();
+  });
+
+  it('retires a verified canceled mapping while preserving existing metadata', async () => {
+    await saveMapping('wix-1', 'warehouse-1', { lastKnownISendStatus: 'PROCESSING', trackingNumber: 'TRACK-KEEP' }, 'production');
+    const verifiedAt = new Date('2026-09-08T05:00:00Z');
+    const result = await finalizeVerifiedCancellation('wix-1', 'production', { iSendOrderNo: 'warehouse-1', verifiedAt });
+    expect(result).toMatchObject({
+      reconciliationActive: false, lastReconciledAt: verifiedAt,
+      meta: { lastKnownISendStatus: 'CANCELLED', trackingNumber: 'TRACK-KEEP', cancellationSource: 'platform-order-detail' },
+    });
+    expect(await findMappingsForReconciliation('production')).toEqual([]);
+  });
+
+  it('allows pre-allocation cancellation without inventing a warehouse mapping', async () => {
+    await expect(finalizeVerifiedCancellation('wix-unallocated', 'production')).resolves.toBeNull();
+    expect(mock.collections.ISendOrderMap).toHaveLength(0);
+  });
+
+  it.each(['DELIVERED', 'RETURNED'])('does not overwrite conflicting %s warehouse evidence during cancellation', async (status) => {
+    await saveMapping('wix-final', 'warehouse-final', { lastKnownISendStatus: status }, 'production');
+    await expect(finalizeVerifiedCancellation('wix-final', 'production')).rejects.toThrow('conflicts with the terminal');
+    expect(mock.collections.ISendOrderMap[0].meta.lastKnownISendStatus).toBe(status);
+  });
+
+  it('rejects a cancellation mapping from a different environment', async () => {
+    await saveMapping('wix-1', 'warehouse-1', {}, 'staging');
+    await expect(finalizeVerifiedCancellation('wix-1', 'production')).rejects.toThrow('environment does not match');
+    expect(mock.wixData.update).not.toHaveBeenCalled();
   });
 
   it('deduplicates side-effect claims without relying on a custom unique index', async () => {

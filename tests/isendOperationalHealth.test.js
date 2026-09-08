@@ -170,6 +170,18 @@ describe('iSend operational health', () => {
     expect(JSON.stringify(report)).not.toMatch(/email@|orderSnapshot|payload/);
   });
 
+  it('includes delayed identity and cancellation work in queue-age alerts', async () => {
+    for (const status of ['reconciling', 'cancel_pending']) {
+      setResponse('ISendOrderOutbox', [['eq', 'status', status], ['eq', 'environment', 'staging']], {
+        totalCount: 1,
+        items: [{ nextAttemptAt: '2026-07-25T12:00:00.000Z' }],
+      });
+    }
+    const report = await getISendOperationalHealth({ now: NOW });
+    expect(report.metrics).toMatchObject({ reconcilingOutbox: 1, pendingCancellationOutbox: 1, backlogOutbox: 2 });
+    expect(report.alerts.map((entry) => entry.name)).toContain('outbox-queue-age');
+  });
+
   it('fails closed when capacity evidence is bound to a different deployment SHA', async () => {
     mocks.getSecret.mockResolvedValue('b'.repeat(40));
 

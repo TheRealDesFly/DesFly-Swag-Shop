@@ -76,7 +76,7 @@ npm run check:dev:live
 6. During 09:00-23:00 MYT, run the protected Wix GET staging diagnostic. Staging proof requires HTTP 200, the reviewed diagnostic build marker, `environment=staging`, and authenticated session-presence evidence.
 7. After the authorized selector cutover, run `npm run check:production`. It requires both a direct production login and the protected Wix production login diagnostic to return authenticated-session evidence from the reviewed build without sending an order.
 
-Never weaken the Wix production service-window guard to make a development test pass. Use sanitized diagnostic classifications to identify the next reviewed fix.
+Keep the 09:00-23:00 MYT guard for staging operations and staging diagnostics. Production order submission, cancellation, reconciliation, and inventory operations run throughout the day using their separate production configuration. A direct diagnostic's `--force` option does not change the staging runtime guard. Use sanitized diagnostic classifications to identify the next reviewed fix.
 
 ## Expected outcomes
 
@@ -84,3 +84,42 @@ Never weaken the Wix production service-window guard to make a development test 
 - `check:dev`: nonzero if setup, lint, or a diagnostic contract test fails.
 - `check:dev:live`: `passed` only after a real direct sandbox login returns authenticated-session evidence.
 - Wix preview/publication: separate reviewed gates; neither is implied by a local pass.
+
+## Verified provider behavior and environment isolation (2026-09-08)
+
+The local staging and production variable sets currently resolve to the same
+provider origin, storage client, and API credentials. The `staging` selector does
+not isolate that account. Tests conducted through those local staging variables
+are evidence from the shared account, not from an independent sandbox. The
+published Wix site remains selected to `production`.
+
+The service and lifecycle diagnostic now reject staging order mutations when
+staging resolves to the configured production provider origin and merchant.
+Read-only diagnostics remain available. Configure a distinct staging account or
+origin before another isolated staging lifecycle test. Do not change the selector
+or environment labels to bypass this guard.
+
+The registered platform-order `userId` differs from the API login user in this
+merchant account. Live reads of known synthetic orders verified the storage client
+number as the registered order user in both local variable sets. Optional
+`ISTORE_ISEND_USER_ID` and `ISTORE_ISEND_PRODUCTION_USER_ID` secrets override that
+default with a separately registered value; authentication credentials stay separate.
+
+The deployed inventory API requires `currentLength` 1000 or 50000 despite the
+reference PDF's smaller range. The service uses only the smaller supported page,
+1000. Order timestamps must use zero-padded `dd/MM/yyyy HH:mm:ss`; correcting that
+format resolved the synthetic Add HTTP 400 response.
+
+Use the actual backend source for read-only verification:
+
+```powershell
+node --use-system-ca --experimental-vm-modules scripts/check-isend-order-lifecycle.mjs --env production --sku EXACT-MERCHANT-SKU
+node --use-system-ca --experimental-vm-modules scripts/check-isend-order-lifecycle.mjs --env production --order-id EXACT-KNOWN-ORDER-ID
+```
+
+Successful Add acceptance is persisted independently from later warehouse
+`custOrderNo` allocation. Sections 5.4.2 and 5.4.3 verify platform identity and
+status; warehouse identity additionally requires the exact document number and
+order origin. Cancellation requires an exact `CANCELLED` platform read-back.
+That alone does not prove warehouse reservation release, shipment interception,
+or a customer refund; verify those effects separately.

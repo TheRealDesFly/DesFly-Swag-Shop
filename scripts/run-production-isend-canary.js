@@ -145,7 +145,7 @@ async function queryInventory(config, session) {
         storageClientSkuNo: '',
         skuStatus: 'ACTIVE',
       },
-      pageData: { currentLength: 1000, currentOffset: 0 },
+      pageData: { currentLength: 100, currentOffset: 0 },
     },
     sessionHeaders(session),
   );

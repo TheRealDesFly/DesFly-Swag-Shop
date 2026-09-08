@@ -1,6 +1,6 @@
 # Wix Owner Handoff Runbook
 
-This runbook covers the owner-only work required after the current iStore/iSend pull request is reviewed and merged into `main`. It moves that exact source revision into the connected Wix site. Complete the staging gates in order. Do not enable production submission until every production gate is signed off.
+This runbook records publication and acceptance evidence for the reviewed iStore/iSend candidate. The owner authorized code fixes, tests, and Wix publication on 2026-09-08. Keep source validation, schema provisioning, publication, and live customer-lifecycle acceptance as separate evidence. The checklist below also applies to future staging-to-production cutovers.
 
 The connected Wix site ID is recorded in `wix.config.json`. Before changing the site, authenticate with `npx wix login`, confirm the expected account with `npx wix whoami`, and verify that the CLI is targeting that site.
 
@@ -20,17 +20,23 @@ Record the evidence here or in the team's controlled change record. Do not recor
 
 ## Owner And Partner Unblock Checklist (Backend Staging Only)
 
+### Customer cancellation requests
+
+The customer-facing **Request cancellation** link opens the [cancellation request form](https://therealdesfly.wixforms.com/f/7503041991672857668). Its Wix form ID is `147917c5-b39a-4f8a-9e22-c2cbc5cb7f1a`. The master-page code adds the link to the existing menu while preserving its items and submenus, and adds a matching footer link when it identifies the existing Refund Policy text. Verify visibility, layout, form opening, and successful submission on desktop and mobile after publication.
+
+Review requests in **Wix Dashboard → Forms & Submissions**, then open the cancellation form's submissions. A submitted form records a request only: it does not cancel a Wix/iSend order or issue a refund. Before acting, verify the requester against the actual customer/order and check fulfillment and payment eligibility. Process an approved cancellation in Wix Orders; the Wix cancellation event then enters the durable iSend cancellation flow described in this runbook. Handle any eligible payment refund through the supported payment-provider workflow. Do not report the order as canceled upstream until the outbox records verified cancellation. Keep request receipt, merchant decision, refund, and warehouse cancellation as distinct outcomes.
+
 Do not put secret values in this document, chat, tickets, screenshots, or retained command output.
 
 | Owner/partner action | Why it is required | Engineering verification after delivery |
 | --- | --- | --- |
-| Owner explicitly authorizes Admin-only read/write permissions and creation/repair of all nine Wix integration collections, fields, and indexes. | The two existing collections currently expose content to Everyone; required lifecycle, mapping, idempotency, audit, inventory, email, maintenance, and index state is incomplete. | Compare every hosted collection ID, field type, permission, item count/migration, and active index to this manifest. |
+| Owner explicitly authorizes Admin-only read/write permissions and creation/repair of all nine Wix integration collections, fields, and indexes. | The 2026-09-08 live inspection found all nine integration collections with Admin-only permissions; the new lifecycle fields were provisioned. Retain exact schema/index and migration read-back evidence for each release. | Compare every hosted collection ID, field type, permission, item count/migration, and active index to this manifest. |
 | Owner securely provisions all seventeen Wix secret names, binds `ISTORE_ISEND_DEPLOYED_REVISION` to the exact source SHA being published, and keeps `ISTORE_ISEND_SINGLE_PARCEL_CONTRACT_CONFIRMED` unset/non-`true` until partner approval. | Webhook authentication, protected poll/fulfillment/recovery routes, environment selection, capacity-evidence binding, and single-parcel fulfillment fail closed without them. | Verify names, selected staging environment, and deployed-revision equality without displaying credential values; test authorized/unauthorized route behavior. |
 | Owner preserves the private local and Wix staging diagnostic inputs and confirms their staging-scoped values through the strict live probe. | Read-only source inspection proves only required names, not values or target correctness. | Run the owner-approved local or Wix-side probe during the MYT window and retain redacted direct/Wix authenticated-session evidence. |
 | Network/iSend owner makes the reviewed staging endpoint reachable from the approved runner, including any source-IP/firewall allowlist. | Direct login and inventory currently time out from this runner. | Repeat redacted reachability, login, and inventory checks inside the service window. |
 | Partner confirms `custOrderNo` create/query/webhook semantics, uniqueness scope, signed-body fields/HMAC rules, event ordering, and request/concurrency limits. | Mapping, dedupe, monotonic status, and capacity must use authoritative identities and limits rather than inference. | Validate real redacted create/query/webhook shapes, identity-mismatch rejection, replay, delayed-event handling, and capacity headroom. |
 | Partner approves the one-complete-parcel contract or supplies an allocation contract mapping every tracking number to Wix line-item IDs/quantities. | Fulfillment is deliberately disabled until this is proven; multi/contradictory parcel evidence fails closed. | Prove one-parcel success/idempotent replay and rejection of multiple, contradictory, partial, or sequential second tracking cases without a second fulfillment. |
-| Partner defines the post-submit cancel/void/update API, idempotency/reconciliation semantics, and operator SLA. | A Wix cancellation after a successful or ambiguous iSend submit cannot safely be translated today. | Prove pre-submit cancellation/refund makes no iSend request and post-submit changes remain durable attention until the reviewed contract exists. |
+| Validate documented platform detail (5.4.2/5.4.3), warehouse identity (5.5.3), and cancellation (5.4.6) behavior on controlled orders. | The code now queues supported cancellations and verifies the exact external order; warehouse identity may be absent before allocation. | Prove no second Add after accepted/null responses, canceled read-back, mapping retirement, ambiguous-cancel read-only recovery, and rejection/partial-refund attention. |
 | Owner approves retention periods and external enforcement for webhook payloads, sent emails, terminal outbox snapshots/diagnostics, and completed fulfillment-claim results, with an accountable approver, policy revision, and evidence location. | These records may contain sensitive data; engineering will not guess retention periods, delete idempotency claims, or scrub active/ambiguous evidence. | Record all four attestations in `ISendMaintenanceState`, verify enforcement and evidence age, and prove operational health stays red when any attestation is absent/stale. |
 | Owner configures Wix Monitoring recipients and escalation ownership. | A failed job is not an alert until an accountable person receives it. | Trigger controlled staging lifecycle, fulfillment, retry, retention, capacity, and policy failures and retain delivery/recovery proof. |
 | Owner authorizes publishing one exact reviewed commit to the Wix staging backend only after every prerequisite above passes. | Current hosted routes/jobs do not contain this audited backend. | Verify Wix build SHA, routes, seven lifecycle handlers, four schedules, schema, secrets, alerts, and strict staging scenarios. No frontend content is in scope. |
@@ -84,11 +90,11 @@ Create all nine collections below. Set content permissions to Admin-only read an
 
 | Type | Field keys |
 | --- | --- |
-| Text | `orderKey`, `wixOrderId`, `status`, `environment`, `leaseToken`, `iSendOrderNo`, `unknownOutcomeReason`, `requeueReason`, `sourceEventId`, `sourceShape`, `orderSnapshotFingerprint`, `latestOrderSnapshotFingerprint`, `wixLifecycleStatus`, `wixPaymentStatus`, `wixFulfillmentStatus`, `lastLifecycleEventId`, `cancellationReason`, `attentionReason`, `latestLifecycleIntentId` |
+| Text | `orderKey`, `wixOrderId`, `status`, `environment`, `leaseToken`, `iSendOrderNo`, `unknownOutcomeReason`, `requeueReason`, `sourceEventId`, `sourceShape`, `orderSnapshotFingerprint`, `latestOrderSnapshotFingerprint`, `wixLifecycleStatus`, `wixPaymentStatus`, `wixFulfillmentStatus`, `lastLifecycleEventId`, `cancellationReason`, `attentionReason`, `latestLifecycleIntentId`, `upstreamOrderId`, `upstreamOrderNumber`, `platformOrderStatus`, `cancellationOutcome` |
 | Object | `orderSnapshot`, `lastError`, `responseSummary`, `unknownOutcomeDetails`, `authoritativeOrderReadError` |
-| Number | `attemptCount`, `maxAttempts`, `claimGeneration` |
-| Boolean | `retryExhausted`, `lifecycleRequiresAttention` |
-| Date and Time | `nextAttemptAt`, `leaseExpiresAt`, `enqueuedAt`, `updatedAt`, `sourceEventTime`, `lastAttemptStartedAt`, `lastAttemptFinishedAt`, `unknownOutcomeAt`, `sentAt`, `requeuedAt`, `lastLifecycleEventTime`, `lastLifecycleEventAt`, `canceledAt`, `lifecycleChangedDuringSubmitAt`, `authoritativeOrderReadAt`, `remediatedAt` |
+| Number | `attemptCount`, `maxAttempts`, `claimGeneration`, `reconciliationAttemptCount`, `cancellationAttemptCount` |
+| Boolean | `retryExhausted`, `lifecycleRequiresAttention`, `upstreamCancellationRequested`, `cancellationRequestMayHaveSucceeded`, `warehouseNotRequired` |
+| Date and Time | `nextAttemptAt`, `leaseExpiresAt`, `enqueuedAt`, `updatedAt`, `sourceEventTime`, `lastAttemptStartedAt`, `lastAttemptFinishedAt`, `unknownOutcomeAt`, `sentAt`, `requeuedAt`, `lastLifecycleEventTime`, `lastLifecycleEventAt`, `canceledAt`, `lifecycleChangedDuringSubmitAt`, `authoritativeOrderReadAt`, `remediatedAt`, `acceptedAt`, `cancellationRequestedAt`, `cancellationLastAttemptAt`, `upstreamCanceledAt` |
 
 Indexes:
 
@@ -96,20 +102,20 @@ Indexes:
 - Compound index on `status`, then `environment`, then `leaseExpiresAt`.
 - Regular index on `lifecycleRequiresAttention`. Wix's three-regular-index limit is satisfied by the two queue indexes above plus this health index. The retry-exhausted health query must be scoped to the current environment and use the status/environment prefix of the queue indexes; mismatch and unassigned scans cover other environment states.
 
-The `status` field now also uses `canceled`. Fingerprints are lowercase SHA-256 hex. The lifecycle and attention fields are nullable except where a new order row records its initial fingerprint/event timestamps.
+The `status` field includes `pending`, `processing`, `retry`, `unknown_outcome`, `reconciling` (accepted, warehouse identity pending), `cancel_pending` (upstream cancellation not finalized), `sent`, `canceled`, and `not_required` (digital-only). Fingerprints are lowercase SHA-256 hex. The lifecycle and attention fields are nullable except where a new order row records its initial fingerprint/event timestamps.
 
 ### `ISendOrderLifecycleIntents`
 
 | Type | Field keys |
 | --- | --- |
 | Text | `orderKey`, `wixOrderId`, `environment`, `intentType`, `wixOrderStatus`, `wixPaymentStatus`, `orderSnapshotFingerprint`, `sourceEventId` |
-| Date and Time | `sourceEventTime`, `recordedAt` |
+| Date and Time | `sourceEventTime`, `recordedAt`, `outboxAppliedAt` |
 
 Index:
 
 - Compound index on `orderKey`, then `environment`, then `recordedAt` descending.
 
-`orderKey`, `wixOrderId`, `environment`, `intentType`, and `recordedAt` are required. `intentType` is `update` or `cancellation`; the remaining fields are nullable. Deterministic `_id` values deduplicate Wix event delivery. This append-only collection stores no order snapshot or other PII, but it has no automatic deletion path; production requires measured item occupancy and at least the accepted storage runway.
+`orderKey`, `wixOrderId`, `environment`, `intentType`, and `recordedAt` are required. `intentType` is `update` or `cancellation`; the remaining fields are nullable. Deterministic `_id` values deduplicate Wix event delivery. Rows are retained after the worker writes `outboxAppliedAt` to acknowledge terminal intent replay. The replay uses bounded current-environment terminal-intent scans ordered by `recordedAt` with empty `outboxAppliedAt`; retain target-site query evidence. This collection stores no order snapshot or other PII, but it has no automatic deletion path; production requires measured item occupancy and at least the accepted storage runway.
 
 ### `ISendOrderOutboxClaims`
 
@@ -256,7 +262,7 @@ This is mandatory for the three side-effect collections too: their stable legacy
    - cron expression: `45 * * * *`
 7. Verify the protected staging diagnostic at `GET /_functions/testISendLoginFromWix` using header `X-ISEND-POLLER-SECRET`. A valid response must show authenticated-session evidence without exposing session values.
 
-The outbox submits a bounded batch of five orders hourly, while the staggered poller reconciles five active mappings hourly as a webhook safety net. Both make iSend calls only inside 09:00-23:00 Malaysia Time. Claim retention makes no iSend request; it scans at most 1,000 old released claim rows and deletes at most 500 safe nonlatest rows per daily run. Operational health fails its hourly job on unresolved lifecycle, fulfillment, retention, capacity, or sensitive-data-policy state. A successful publication is not staging acceptance by itself.
+The outbox submits a bounded batch of five orders hourly, while the staggered poller reconciles five active mappings hourly as a webhook safety net. Staging calls run inside 09:00-23:00 Malaysia Time; production operations run throughout the day. Identity reconciliation and cancellation share the bounded outbox batch, with cancellation priority. Claim retention makes no iSend request; it scans at most 1,000 old released claim rows and deletes at most 500 safe nonlatest rows per daily run. Operational health fails its hourly job on unresolved lifecycle, fulfillment, retention, capacity, or sensitive-data-policy state. A successful publication is not staging acceptance by itself.
 
 ### Stale packaged artifact
 
@@ -320,7 +326,7 @@ Use one controlled, single-parcel Wix order. Before placing it, verify it has a 
 
 1. The Wix event creates one `ISendOrderOutbox` row with the expected `wix-order:<WIX_ORDER_ID>` key.
 2. The hourly worker submits exactly once and advances the row without an unexpected retry.
-3. The successful create-order response contains `custOrderNo`.
+3. Retain Add acceptance and the submitted external `orderId`/`orderNumber`. A successful `returnObject=null` is valid: prove the row enters `reconciling` and detail/warehouse reads eventually recover the real `custOrderNo` without another Add. An immediate canceled-before-allocation canary may never receive a warehouse number.
 4. `ISendOrderMap` contains the Wix order ID, `environment=staging`, and that same `custOrderNo` as `iSendOrderNo`.
 5. A signed webhook supplies one tracking number and drives the normal update path.
 6. Wix contains exactly one fulfillment with the expected line-item IDs, quantities, and tracking number.
@@ -332,10 +338,10 @@ Use one controlled, single-parcel Wix order. Before placing it, verify it has a 
 12. Retain the iSend query response showing authoritative `returnObject.totalRecord=1`, exactly one page row, and that row's exact `custOrderNo` equal to the selected mapping. Prove that a missing/non-unit total or empty, extra, or mismatched page response fails without a Wix order read, status update, or fulfillment.
 13. After `DELIVERED`, replay an earlier signed nonterminal status/tracking delivery and prove the mapping does not regress and no extra fulfillment, audit row, or email is created. For a separate controlled record, prove `RETURNED` is accepted after `DELIVERED` and remains final against later replays.
 14. On separate controlled orders, prove cancellation, full refund, and authoritative order changes before submit produce no iSend order. Prove a partial-refund state fails closed with durable attention.
-15. Inject a cancellation/update while submission or mapping persistence is in progress. Prove the durable lifecycle intent is not lost and the resulting sent/ambiguous row requires operator attention; do not claim iSend cancellation without the partner contract.
+15. Inject a cancellation/update while submission or mapping persistence is in progress. Prove the durable intent survives submission, mapping persistence, stale-worker recovery, and the final-read/lease-release gap. Cancellation/full-refund intent must reach `cancel_pending`, then verified `canceled`; an ambiguous cancellation must use read-only recovery.
 16. Submit multi-tracking, contradictory parcel-count, empty-parcel, partial-line-item, and sequential second-tracking cases. Prove each fails nonretryably without a second Wix fulfillment.
-17. On stable already-submitted orders, exercise cancellation, full refund, partial refund, and material order update. Prove each remains durable operator attention and no uncontracted iSend cancel/update is claimed.
-18. Seed an authoritative Wix order with any already-fulfilled quantity and submit one tracking, then prove the coordinator rejects it without another fulfillment.
+17. On stable already-submitted orders, exercise cancellation, full refund, partial refund, and material order update. Prove cancellation/full refund uses the documented cancel plus exact-order `CANCELLED` read-back and deactivates any mapping. Partial refund/material update and a rejected upstream cancel must retain durable attention.
+18. Seed an authoritative Wix order with an already-fulfilled physical quantity and submit one tracking, then prove the coordinator rejects it without another fulfillment. Separately prove a mixed order whose actual allocations contain only digital downloads can submit and fulfill its remaining physical lines; a digital-only order must never create a warehouse order.
 19. Remove the buyer/billing email on a controlled delivered order and prove delivery email processing fails retryably with `isend-delivery-email-missing`, the webhook remains unprocessed, the poller mapping stays active, and the configured alert is delivered.
 
 Do not use a multiple-tracking order for this first acceptance test.
@@ -375,7 +381,7 @@ Exercise these rules in staging and retain proof that completed claims replay sa
 
 ## 9. Accept Capacity
 
-The outbox runs hourly, handles at most five orders per run, and operates for twelve hours per MYT service day. Its nominal maximum is 60 submitted orders per service-window day before retries, starting backlog, or slow upstream calls consume capacity. The poller is scheduled hourly but only twelve service-window cycles can call iSend, so its maximum is also 60 mapping queries/day and it currently performs a fresh login per selected mapping. Daily claim retention scans at most 1,000 old released rows and deletes at most 500 safe nonlatest rows. The lifecycle-intent collection is append-only. None of these nominal bounds is capacity acceptance.
+The outbox and poller run hourly with at most five selected items each. The staging window permits fourteen cycles/day (70 work slots); production permits twenty-four (120 work slots). Outbox submission, identity reconciliation, and cancellation share those slots; retries, starting backlog, and slow upstream calls reduce throughput. The poller currently performs a fresh login per selected mapping. Daily claim retention scans at most 1,000 old released rows and deletes at most 500 safe nonlatest rows. The lifecycle-intent collection is append-only. None of these nominal bounds is capacity acceptance.
 
 Before production, measure staging runtime and agree on all of the following:
 
@@ -421,14 +427,17 @@ canary:
 The worker therefore performs only a bounded post-create identity recovery:
 when Add Order succeeds without `custOrderNo`, it queries by the submitted
 platform order number and accepts exactly one row with an exact `documentNo`
-match and a nonblank `custOrderNo`. Zero, duplicate, mismatched, delayed, or
-failed query results remain `unknown_outcome` and must not be resubmitted.
+match and a nonblank `custOrderNo`. Known Add acceptance with zero, duplicate,
+mismatched, delayed, or failed warehouse lookups enters `reconciling` and must
+not be resubmitted. Platform details verify the original external identity;
+later exact warehouse lookup can complete the mapping. Only an inconclusive
+Add outcome remains `unknown_outcome`.
 Webhook handling recognizes the documented `action`/`value` shape only after
 the existing HMAC check succeeds; do not register an unsigned webhook.
 
 Obtain written iSend confirmation for each item:
 
-1. A successful create-order response contains `custOrderNo`, that value is the correct query key for `/Json/WhseOrder/doQueryOrderPage`, and a successful query reports authoritative `returnObject.totalRecord=1` plus exactly one page row carrying the same `custOrderNo` when the order exists.
+1. A successful create-order response may have `returnObject=null`. Sections 5.4.2/5.4.3 verify the submitted external `orderId`/`orderNumber`; an exact section 5.5.3 warehouse lookup recovers `custOrderNo` when allocation has created it. That warehouse identity is the query key for `/Json/WhseOrder/doQueryOrderPage`; a successful tracking query must report authoritative `returnObject.totalRecord=1` plus exactly one row with the same `custOrderNo`. An immediate canceled-before-allocation order may never have a warehouse record.
 2. Tracking and status webhooks carry that same customer-order identity, not an unrelated internal `orderNo` or `orderId`.
 3. For multiple parcels, every tracking number is allocated to explicit Wix eCommerce line-item IDs and quantities. Until implemented and tested, multiple unique tracking numbers remain a production blocker and must continue to fail closed.
 4. Confirm signed webhooks as the primary tracking/status path and document signed-body delivery IDs, event names, retry timing, and retryable status handling. The staggered hourly `runISendPollerJob` is the bounded safety net; the protected `POST /_functions/runISendPoller` remains an operator diagnostic with the same fixed five-mapping, one-page, reconciliation-only boundary, not the production scheduler.
@@ -445,7 +454,7 @@ Do not start the canary until secrets, data, publication, strict staging probe, 
 
 1. Schedule the canary inside the iSend service window with Wix, iSend, and operations owners present.
 2. Freeze or tightly control normal order intake so only one identified single-parcel canary can enter the new path.
-3. Stop new staging intake and quiesce staging webhook delivery. Prove there are no staging outbox rows in `pending`, `processing`, or retryable `retry`; resolve every staging attention state; and require every staging mapping to have `reconciliationActive=false`. Require explicit, proven environment bindings on every environment-sensitive outbox/mapping row and every migrated webhook audit, inventory row, pending email, and raw-webhook claim. Append-only lease claims are not environment business records and are governed by their claim key/generation retention rule instead.
+3. Stop new staging intake and quiesce staging webhook delivery. Prove there are no staging outbox rows in `pending`, `processing`, `reconciling`, `cancel_pending`, or retryable `retry`; resolve every staging attention state; and require every staging mapping to have `reconciliationActive=false`. Require explicit, proven environment bindings on every environment-sensitive outbox/mapping row and every migrated webhook audit, inventory row, pending email, and raw-webhook claim. Append-only lease claims are not environment business records and are governed by their claim key/generation retention rule instead.
 4. Verify the production root is exactly `https://webapi.istoreisend-wms.com/IsisWMS-War` (or its host-only form), verify the credentials and recorded single-parcel approval gate, then change only the Wix environment selector to the production environment through Secrets Manager.
 5. Observe all scheduled jobs once, require zero missing- or other-environment conflicts, and require a green claim-retention summary before accepting a production order.
 6. Submit one controlled order and observe every evidence point from the staging checklist through fulfillment and email.

@@ -25,10 +25,12 @@ const SECRET_NAMES = {
   apiUserId: 'ISTORE_ISEND_API_USER_ID',
   apiPassword: 'ISTORE_ISEND_API_PASSWORD',
   orderOrigin: 'ISTORE_ISEND_ORDER_ORIGIN',
+  orderUserId: 'ISTORE_ISEND_USER_ID',
   productionStorageClientNo: 'ISTORE_ISEND_PROD_STORAGE_CLIENT_NO',
   productionApiUserId: 'ISTORE_ISEND_PRODUCTION_API_USER_ID',
   productionApiPassword: 'ISTORE_ISEND_PRODUCTION_API_PASSWORD',
   productionOrderOrigin: 'ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN',
+  productionOrderUserId: 'ISTORE_ISEND_PRODUCTION_USER_ID',
   environment: 'ISTORE_ISEND_ENV',
   sandboxUrl: 'ISTORE_ISEND_SANDBOX_URL',
   productionUrl: 'ISTORE_ISEND_PRODUCTION_URL',
@@ -204,6 +206,12 @@ export async function getISendConfig(options = {}) {
   ]);
 
   const sandboxUrl = await readOptionalSecret(SECRET_NAMES.sandboxUrl);
+  const configuredOrderUserId = await readOptionalSecret(environment === 'production'
+    ? SECRET_NAMES.productionOrderUserId : SECRET_NAMES.orderUserId);
+  // Order userId is the registered platform-order identity, distinct from the
+  // API login. Both environment registrations were verified by 5.4.2/.3.
+  const orderUserId = configuredOrderUserId || storageClientNo;
+  if (orderUserId.length > 30) throw new Error('Configured iSend order userId exceeds 30 characters');
   const productionUrl = await readOptionalSecret(SECRET_NAMES.productionUrl);
   const validatedSandboxUrl = sandboxUrl
     ? validateISendBaseUrl(sandboxUrl, 'staging')
@@ -217,13 +225,18 @@ export async function getISendConfig(options = {}) {
   if (!baseUrl) {
     throw new Error(`Missing iSend URL for ${environment} environment`);
   }
+  const productionStorageClientNo = environment === 'production' ? storageClientNo
+    : await readOptionalSecret(SECRET_NAMES.productionStorageClientNo);
+  const sharesProductionAccount = environment === 'staging' && Boolean(validatedProductionUrl)
+    && new URL(baseUrl).origin === new URL(validatedProductionUrl).origin
+    && (!productionStorageClientNo || storageClientNo === productionStorageClientNo);
 
   return {
     storageClientNo,
     userNo: apiUserId,
     userPassword: apiPassword,
     orderOrigin,
-    userId: apiUserId,
+    userId: orderUserId,
     orderSource: 'Wix Store',
     orderTimeZone: ISEND_ORDER_TIME_ZONE,
     baseUrl,
@@ -231,5 +244,6 @@ export async function getISendConfig(options = {}) {
     productionUrl: validatedProductionUrl,
     environment,
     useSandbox,
+    sharesProductionAccount,
   };
 }

@@ -254,7 +254,7 @@ describe('Wix eCommerce order mapping', () => {
     }), mappingConfig);
 
     expect(payload.orderDate).toBe(
-      field === '_createdDate' ? '15/7/2026 09:02:03' : '17/7/2026 04:05:06',
+      field === '_createdDate' ? '15/07/2026 09:02:03' : '17/07/2026 04:05:06',
     );
   });
 
@@ -432,7 +432,7 @@ describe('Wix eCommerce order mapping', () => {
         success: true,
         returnObject: {
           totalRecord: 1,
-          currentPageData: [{ documentNo: '1001', custOrderNo: '595900000001' }],
+          currentPageData: [{ documentNo: '1001', orderOrigin: 'WIX', custOrderNo: '595900000001' }],
         },
       }));
 
@@ -486,7 +486,8 @@ describe('Wix eCommerce order mapping', () => {
         returnObject: null,
         msgList: { actualAdd: true, msgList: [] },
       }))
-      .mockResolvedValueOnce(loginResponse({ success: true, returnObject: page }));
+      .mockResolvedValueOnce(loginResponse({ success: true, returnObject: page }))
+      .mockResolvedValueOnce(loginResponse({ success: false, returnObject: null }));
 
     try {
       await expect(sendOrderToISend(validOrder())).resolves.toMatchObject({
@@ -521,7 +522,7 @@ describe('Wix eCommerce order mapping', () => {
         success: true,
         returnObject: {
           totalRecord: 1,
-          currentPageData: [{ documentNo: '1001', custOrderNo: '595900000001' }],
+          currentPageData: [{ documentNo: '1001', orderOrigin: 'WIX', custOrderNo: '595900000001' }],
         },
       }));
 
@@ -564,19 +565,20 @@ describe('Wix eCommerce order mapping', () => {
         returnObject: { totalRecord: 0, currentPageData: [] },
       }));
     }
+    mocks.fetch.mockResolvedValueOnce(loginResponse({ success: false, returnObject: null }));
 
     try {
       await expect(sendOrderToISend(validOrder(), {
         postSubmitReconciliationDelayMs: 0,
       })).resolves.toMatchObject({ success: true, returnObject: null });
-      expect(mocks.fetch).toHaveBeenCalledTimes(6);
+      expect(mocks.fetch).toHaveBeenCalledTimes(7);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
   });
 
-  it('marks a failed post-create identity query as post-submit reconciliation', async () => {
+  it('preserves accepted submission when both post-create identity reads fail', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
     mocks.getISendConfig.mockResolvedValue(mappingConfig);
@@ -590,11 +592,14 @@ describe('Wix eCommerce order mapping', () => {
         returnObject: null,
         msgList: { actualAdd: true, msgList: [] },
       }))
-      .mockRejectedValueOnce(new TypeError('network failure'));
+      .mockRejectedValueOnce(new TypeError('network failure'))
+      .mockRejectedValueOnce(new TypeError('platform detail read failure'));
 
     try {
-      await expect(sendOrderToISend(validOrder())).rejects.toMatchObject({
-        isendPhase: 'post-submit-reconciliation',
+      await expect(sendOrderToISend(validOrder())).resolves.toMatchObject({
+        success: true,
+        submission: { accepted: true, source: 'add-order-response' },
+        reconciliation: { warehouseIdentityPending: true, platformQueryReason: 'platform-query-failed' },
       });
     } finally {
       vi.clearAllTimers();

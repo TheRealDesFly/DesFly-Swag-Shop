@@ -11,6 +11,53 @@ import {
   validateISendBaseUrl,
 } from '../src/backend/isendConfig';
 
+describe('registered order user and provider account isolation', () => {
+  function configure(overrides = {}) {
+    const secrets = {
+      ISTORE_ISEND_STORAGE_CLIENT_NO: 'merchant', ISTORE_ISEND_API_USER_ID: 'stage-login',
+      ISTORE_ISEND_API_PASSWORD: 'stage-password', ISTORE_ISEND_ORDER_ORIGIN: 'WIX',
+      ISTORE_ISEND_PROD_STORAGE_CLIENT_NO: 'merchant', ISTORE_ISEND_PRODUCTION_API_USER_ID: 'prod-login',
+      ISTORE_ISEND_PRODUCTION_API_PASSWORD: 'prod-password', ISTORE_ISEND_PRODUCTION_ORDER_ORIGIN: 'WIX',
+      ISTORE_ISEND_ENV: 'production',
+      ISTORE_ISEND_SANDBOX_URL: 'https://webapi.istoreisend-wms.com/IsisWMS-War',
+      ISTORE_ISEND_PRODUCTION_URL: 'https://webapi.istoreisend-wms.com/IsisWMS-War', ...overrides,
+    };
+    mocks.getSecret.mockImplementation(async (name) => secrets[name]);
+  }
+
+  it('uses separately registered per-environment order users without changing login credentials', async () => {
+    configure({ ISTORE_ISEND_PRODUCTION_USER_ID: 'registered-production', ISTORE_ISEND_USER_ID: 'registered-stage' });
+    await expect(getISendConfig({ environment: 'production' })).resolves.toMatchObject({
+      userId: 'registered-production', userNo: 'prod-login', userPassword: 'prod-password',
+    });
+    await expect(getISendConfig({ environment: 'staging' })).resolves.toMatchObject({
+      userId: 'registered-stage', userNo: 'stage-login', userPassword: 'stage-password',
+    });
+  });
+
+  it('defaults order user to the live-verified merchant registration in both environments', async () => {
+    configure();
+    await expect(getISendConfig({ environment: 'production' })).resolves.toMatchObject({ userId: 'merchant' });
+    await expect(getISendConfig({ environment: 'staging' })).resolves.toMatchObject({ userId: 'merchant' });
+  });
+
+  it('marks shared provider data despite different API users and order-origin labels', async () => {
+    configure({ ISTORE_ISEND_ORDER_ORIGIN: 'STAGING-LABEL' });
+    await expect(getISendConfig({ environment: 'staging' })).resolves.toMatchObject({ sharesProductionAccount: true });
+    await expect(getISendConfig({ environment: 'production' })).resolves.toMatchObject({ sharesProductionAccount: false });
+  });
+
+  it('recognizes a distinct staging API origin', async () => {
+    configure({ ISTORE_ISEND_SANDBOX_URL: 'https://staging.istoreisend-wms.com:5191/IsisWMS-War' });
+    await expect(getISendConfig({ environment: 'staging' })).resolves.toMatchObject({ sharesProductionAccount: false });
+  });
+
+  it('rejects a registered order-user ID beyond the documented maximum', async () => {
+    configure({ ISTORE_ISEND_PRODUCTION_USER_ID: 'x'.repeat(31) });
+    await expect(getISendConfig()).rejects.toThrow('order userId exceeds 30');
+  });
+});
+
 const OWNER_APPROVED_STAGING_LOGIN_ORIGIN_FINGERPRINT =
   '36dc1cea96d6bb7e9e448ebe63e4511488c3fc9c04f91adb4535a6d0e90a36cb';
 
@@ -138,6 +185,7 @@ describe('iSend endpoint policy', () => {
       storageClientNo: 'production-storage-1',
       userNo: 'production-user-1',
       userPassword: 'production-password-1',
+      userId: 'production-storage-1',
       orderOrigin: 'PRODUCTION-WIX',
     });
   });

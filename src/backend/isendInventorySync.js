@@ -16,6 +16,9 @@ import { buildInventoryPlan, inventoryQuantity, validateInventorySkus } from 'ba
 
 const READ_OPTIONS = { suppressAuth: true, consistentRead: true };
 const MAX_PRODUCTS = 1000;
+// The deployed provider API rejects the PDF's 1-100 example and requires
+// 1000 or 50000. Use the smaller supported page and require it to be complete.
+const ISEND_INVENTORY_PAGE_SIZE = 1000;
 const MAX_PLAN_AGE_MS = 60 * 1000;
 const MAX_MAINTENANCE_MS = 15 * 60 * 1000;
 
@@ -120,14 +123,15 @@ async function preparePlan(skus, settings, environment) {
   for (const sku of skus) {
     const result = await queryStorageClientInventory({
       environment, country: settings.country, storageClientSkuNo: sku,
-      currentLength: 1000, currentOffset: 0,
+      currentLength: ISEND_INVENTORY_PAGE_SIZE, currentOffset: 0,
       // Production does not inherit staging's limited opening hours.
       force: environment === 'production',
     });
     const page = result?.returnObject;
     const total = inventoryQuantity(page?.totalRecord);
     if (result?.success !== true || !Array.isArray(page?.currentPageData)
-      || total === null || total > 1000 || page.currentPageData.length !== total) {
+      || total === null || total > ISEND_INVENTORY_PAGE_SIZE || page.currentPageData.length !== total
+      || (page.currentOffset !== undefined && inventoryQuantity(page.currentOffset) !== 0)) {
       fail('incomplete-isend-inventory');
     }
     /** @type {WarehouseInventoryRow[]} */

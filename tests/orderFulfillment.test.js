@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => {
     claimProcessed: vi.fn(),
     createWixFulfillment: vi.fn(),
     getWixOrder: vi.fn(),
+    listWixFulfillments: vi.fn(),
     elevate: vi.fn((method) => {
       elevatedMethods.push(method);
       return (...args) => method(...args);
@@ -22,7 +23,10 @@ const mocks = vi.hoisted(() => {
 
 vi.mock('wix-auth', () => ({ elevate: mocks.elevate }));
 vi.mock('wix-ecom-backend', () => ({
-  orderFulfillments: { createFulfillment: mocks.createWixFulfillment },
+  orderFulfillments: {
+    createFulfillment: mocks.createWixFulfillment,
+    listFulfillmentsForSingleOrder: mocks.listWixFulfillments,
+  },
   orders: { getOrder: mocks.getWixOrder },
 }));
 vi.mock('backend/isendIdempotency', () => ({
@@ -62,6 +66,9 @@ describe('Wix eCommerce fulfillment creation', () => {
       callback({ iSendOrderNo })
     ));
     mocks.createWixFulfillment.mockResolvedValue({ fulfillmentId: 'fulfillment-1' });
+    mocks.listWixFulfillments.mockResolvedValue({
+      orderWithFulfillments: { orderId: 'wix-order-1', fulfillments: [] },
+    });
     mocks.getWixOrder.mockResolvedValue({
       _id: 'wix-order-1',
       status: 'APPROVED',
@@ -241,6 +248,103 @@ describe('Wix eCommerce fulfillment creation', () => {
       retryable: false,
     });
 
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  function mixedOrder(fulfillmentStatus = 'PARTIALLY_FULFILLED') {
+    return {
+      _id: 'wix-order-1', status: 'APPROVED', paymentStatus: 'PAID', fulfillmentStatus,
+      lineItems: [
+        { _id: 'hat', quantity: 2, itemType: { preset: 'PHYSICAL' } },
+        { _id: 'download', quantity: 1, itemType: { preset: 'DIGITAL' }, fulfilledQuantity: 1 },
+      ],
+    };
+  }
+  function fulfillments(lineItems) {
+    return { orderWithFulfillments: {
+      orderId: 'wix-order-1', fulfillments: [{ _id: 'digital-delivery', lineItems }],
+    } };
+  }
+
+  it('fulfills only physical lines after proving a mixed order partial fulfillment is digital delivery', async () => {
+    mocks.getWixOrder.mockResolvedValue(mixedOrder());
+    mocks.listWixFulfillments.mockResolvedValue(fulfillments([{ _id: 'download', quantity: 1 }]));
+    await createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123', lineItems: [{ _id: 'hat', quantity: 2 }],
+    });
+    expect(mocks.elevatedMethods).toContain(mocks.listWixFulfillments);
+    expect(mocks.listWixFulfillments).toHaveBeenCalledWith('wix-order-1');
+    expect(mocks.createWixFulfillment).toHaveBeenCalledWith('wix-order-1', {
+      lineItems: [{ _id: 'hat', quantity: 2 }], trackingInfo: { trackingNumber: 'TRACK123' },
+    });
+  });
+
+  it.each(['PARTIALLY_FULFILLED', 'NOT_FULFILLED'])('blocks an existing physical allocation in a mixed order despite global status %s', async (status) => {
+    mocks.getWixOrder.mockResolvedValue(mixedOrder(status));
+    mocks.listWixFulfillments.mockResolvedValue(fulfillments([
+      { _id: 'download', quantity: 1 }, { _id: 'hat', quantity: 1 },
+    ]));
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({ code: 'unsupported-isend-split-shipment', retryable: false });
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    undefined,
+    { orderWithFulfillments: { orderId: 'other', fulfillments: [] } },
+    { orderWithFulfillments: { orderId: 'wix-order-1', fulfillments: [] } },
+    fulfillments([{ _id: 'unknown', quantity: 1 }]),
+    fulfillments([{ _id: 'download' }]),
+    fulfillments([{ _id: 'download', quantity: 2 }]),
+  ])('blocks unverified mixed-order fulfillment allocation %j', async (response) => {
+    mocks.getWixOrder.mockResolvedValue(mixedOrder());
+    mocks.listWixFulfillments.mockResolvedValue(response);
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({ code: 'isend-fulfillment-allocation-unverified', retryable: false });
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('ignores digital lines even before a mixed order has any fulfillment', async () => {
+    mocks.getWixOrder.mockResolvedValue(mixedOrder('NOT_FULFILLED'));
+    await createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123',
+    });
+    expect(mocks.createWixFulfillment).toHaveBeenCalledWith('wix-order-1', {
+      lineItems: [{ _id: 'hat', quantity: 2 }], trackingInfo: { trackingNumber: 'TRACK123' },
+    });
+  });
+
+  it('does not create warehouse fulfillment for a digital-only order', async () => {
+    const order = mixedOrder('FULFILLED');
+    order.lineItems = order.lineItems.slice(1);
+    mocks.getWixOrder.mockResolvedValue(order);
+    expect(await createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123',
+    })).toEqual({ skipped: true, reason: 'no-physical-line-items' });
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, []])('does not mistake missing authoritative lines for a digital-only order: %j', async (lineItems) => {
+    mocks.getWixOrder.mockResolvedValue({ ...mixedOrder('NOT_FULFILLED'), lineItems });
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123',
+    })).rejects.toMatchObject({ code: 'isend-fulfillment-line-items-mismatch', retryable: false });
+    expect(mocks.claimProcessed).not.toHaveBeenCalled();
+    expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
+  });
+
+  it('rejects a caller assertion that includes digital items in a physical fulfillment', async () => {
+    mocks.getWixOrder.mockResolvedValue(mixedOrder('NOT_FULFILLED'));
+    await expect(createISendSingleParcelFulfillment('ISEND-1', 'wix-order-1', {
+      environment: 'staging', trackingNumber: 'TRACK123',
+      lineItems: [{ _id: 'hat', quantity: 2 }, { _id: 'download', quantity: 1 }],
+    })).rejects.toMatchObject({ code: 'isend-fulfillment-line-items-mismatch', retryable: false });
     expect(mocks.claimProcessed).not.toHaveBeenCalled();
     expect(mocks.createWixFulfillment).not.toHaveBeenCalled();
   });

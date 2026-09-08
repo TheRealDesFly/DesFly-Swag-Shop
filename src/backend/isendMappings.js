@@ -4,6 +4,7 @@
  */
 import wixData from 'wix-data';
 import crypto from 'crypto';
+import { evaluateISendStatusTransition } from 'backend/isendStatusPolicy';
 import {
   assertMappingMutationLock,
   withMappingMutationLock,
@@ -354,6 +355,43 @@ export async function updateMappingReconciliation(iSendOrderNo, fields = {}, env
   });
 }
 
+/** Retire warehouse polling only after the platform cancel read-back succeeded. */
+export async function finalizeVerifiedCancellation(wixOrderId, environment, options = {}) {
+  const boundEnvironment = requireEnvironment(environment);
+  const initial = await getByWixOrderId(wixOrderId);
+  if (!initial) {
+    if (options.iSendOrderNo) throw new Error('Verified cancellation has no expected warehouse mapping');
+    return null; // An order canceled before allocation may never have a warehouse number.
+  }
+  const iSendOrderNo = options.iSendOrderNo || initial.iSendOrderNo;
+  assertExactMapping(initial, wixOrderId, iSendOrderNo, boundEnvironment);
+  return withMappingMutationLock(iSendOrderNo, async (lock) => {
+    const mapping = await getByISendOrderNo(iSendOrderNo);
+    if (!mapping) throw new Error('Warehouse mapping disappeared during verified cancellation');
+    assertExactMapping(mapping, wixOrderId, iSendOrderNo, boundEnvironment);
+    const transition = evaluateISendStatusTransition(mapping.meta?.lastKnownISendStatus, 'CANCELLED');
+    if (transition.effectiveStatus !== 'CANCELLED') {
+      const error = new Error('Verified platform cancellation conflicts with the terminal warehouse status');
+      error.code = 'isend-cancellation-status-conflict';
+      throw error;
+    }
+    const verifiedAt = options.verifiedAt || new Date();
+    await assertMappingMutationLock(lock);
+    return wixData.update(COLLECTION, {
+      ...mapping,
+      reconciliationActive: false,
+      lastReconciledAt: verifiedAt,
+      meta: {
+        ...(mapping.meta || {}),
+        lastKnownISendStatus: 'CANCELLED',
+        lastStatusUpdatedAt: verifiedAt,
+        cancellationVerifiedAt: verifiedAt,
+        cancellationSource: 'platform-order-detail',
+      },
+    }, { suppressAuth: true });
+  });
+}
+
 export default {
   AmbiguousISendMappingError,
   saveMapping,
@@ -364,4 +402,5 @@ export default {
   findUnclassifiedMappingsForReconciliation,
   findReconciliationEnvironmentConflicts,
   updateMappingReconciliation,
+  finalizeVerifiedCancellation,
 };

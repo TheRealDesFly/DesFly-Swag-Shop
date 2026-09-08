@@ -1,13 +1,24 @@
 const FINAL_STATUSES = new Set(['CANCELLED', 'RETURNED']);
 const STATUS_RANK = new Map([
   ['PROCESSING', 1],
-  ['PICKED', 2],
-  ['SHIPPED', 3],
-  ['OUT FOR DELIVERY', 4],
-  ['DELIVERY IN PROGRESS', 4],
-  ['DELIVERY FAILED', 4],
-  ['UNDELIVERED', 4],
-  ['DELIVERED', 5],
+  // Warehouse stages documented in iStore API section 5.5.3. Loading is
+  // warehouse progress; it does not establish delivery to the customer.
+  ['ALLOCATING', 2],
+  ['ALLOCATED', 3],
+  ['PICKING', 4],
+  ['PICKED', 5],
+  ['PACKING', 6],
+  ['PACKED', 7],
+  ['STAGING', 8],
+  ['STAGED', 9],
+  ['LOADING', 10],
+  ['LOADED', 11],
+  ['SHIPPED', 12],
+  ['OUT FOR DELIVERY', 13],
+  ['DELIVERY IN PROGRESS', 13],
+  ['DELIVERY FAILED', 13],
+  ['UNDELIVERED', 13],
+  ['DELIVERED', 14],
 ]);
 
 export function mapISendStatus(iSendStatus) {

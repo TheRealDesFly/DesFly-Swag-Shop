@@ -3,6 +3,8 @@ import { elevate } from 'wix-auth';
 import { orderFulfillments, orders } from 'wix-ecom-backend';
 import { claimProcessed, updateProcessed } from 'backend/isendIdempotency';
 import { getByISendOrderNo } from 'backend/isendMappings';
+import { getISendPhysicalLineItems, isISendDigitalOnlyOrder } from 'backend/isendOrderItems';
+import { assertOnlyDigitalWixFulfillments } from 'backend/isendPhysicalFulfillment';
 import { isISendSingleParcelContractConfirmed } from 'backend/isendFulfillmentContract';
 import {
   assertMappingMutationLock,
@@ -241,12 +243,11 @@ export function validateISendSingleParcelEvidence(options = {}) {
   return trackingCandidates[0];
 }
 
-function hasAnyWixFulfillment(order) {
+function hasAnyWixFulfillment(order, lineItems = order && order.lineItems, inspectOrderStatus = true) {
   const status = String(order && order.fulfillmentStatus || '').trim().toUpperCase();
-  if (['PARTIALLY_FULFILLED', 'FULFILLED'].includes(status)) return true;
+  if (inspectOrderStatus && ['PARTIALLY_FULFILLED', 'FULFILLED'].includes(status)) return true;
 
-  const lineItems = Array.isArray(order && order.lineItems) ? order.lineItems : [];
-  return lineItems.some((lineItem) => {
+  return (Array.isArray(lineItems) ? lineItems : []).some((lineItem) => {
     const fulfilledQuantity = Number(lineItem && (
       lineItem.fulfilledQuantity
       ?? lineItem.quantityFulfilled
@@ -472,18 +473,29 @@ export async function createISendSingleParcelFulfillment(
     const wixFulfillmentStatus = String(wixOrder.fulfillmentStatus || '')
       .trim()
       .toUpperCase();
+    const physicalLineItems = getISendPhysicalLineItems(wixOrder);
+    if (isISendDigitalOnlyOrder(wixOrder)) {
+      return { skipped: true, reason: 'no-physical-line-items' };
+    }
+    if (!Array.isArray(wixOrder.lineItems) || wixOrder.lineItems.length === 0) {
+      throw lineItemsMismatchError(expectedOrderId);
+    }
     if (wixFulfillmentStatus === 'FULFILLED') {
       const error = new Error(`Wix order ${expectedOrderId} is already fulfilled`);
       error.code = 'isend-wix-order-already-fulfilled';
       error.retryable = false;
       throw error;
     }
-    if (hasAnyWixFulfillment(wixOrder)) {
+    const hasDigitalLineItems = physicalLineItems.length !== wixOrder.lineItems.length;
+    if (hasAnyWixFulfillment(wixOrder, physicalLineItems, !hasDigitalLineItems)) {
       throw unsupportedSplitShipmentError(
         `Wix order ${expectedOrderId} already contains fulfilled quantities`,
       );
     }
-    const authoritativeLineItems = canonicalLineItems(wixOrder.lineItems);
+    if (hasDigitalLineItems) {
+      await assertOnlyDigitalWixFulfillments(expectedOrderId, wixOrder, physicalLineItems);
+    }
+    const authoritativeLineItems = canonicalLineItems(physicalLineItems);
     if (options.lineItems !== undefined) {
       let matchesAuthoritativeOrder = false;
       try {

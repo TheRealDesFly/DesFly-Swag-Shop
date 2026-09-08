@@ -13,6 +13,7 @@ import {
   updateMappingReconciliation,
 } from 'backend/isendMappings';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
+import { getISendPhysicalLineItems } from 'backend/isendOrderItems';
 import { getTrackingInfo } from 'backend/isendService';
 import {
   createISendSingleParcelFulfillment,
@@ -413,7 +414,7 @@ export async function runPoller(options = {}) {
                 failMapping('getOrder', error);
                 continue;
               }
-              const lineItems = wixOrder.lineItems.map((lineItem) => ({
+              const lineItems = getISendPhysicalLineItems(wixOrder).map((lineItem) => ({
                 _id: lineItem._id || lineItem.id,
                 quantity: lineItem.quantity,
               }));

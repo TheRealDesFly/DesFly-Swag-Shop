@@ -63,7 +63,7 @@ describe('inventory reconciliation', () => {
     expect(await runISendInventorySync(options)).toMatchObject({ success: true, mode: 'preview', written: 0 });
     expect(mocks.lock).not.toHaveBeenCalled(); expect(mocks.updateStock).not.toHaveBeenCalled();
     expect(mocks.queryInventory).toHaveBeenCalledWith(expect.objectContaining({
-      environment: 'production', country: 'MALAYSIA', storageClientSkuNo: 'SKU-1', currentLength: 1000, force: true,
+      environment: 'production', country: 'MALAYSIA', storageClientSkuNo: 'SKU-1', currentLength: 1000, currentOffset: 0, force: true,
     }));
   });
   it('joins a managed variant SKU to its actual inventory ID', async () => {
@@ -109,6 +109,26 @@ describe('inventory reconciliation', () => {
   ])('rejects failed or incomplete provider pages %j', async (response) => {
     source = response;
     await expect(runISendInventorySync(options)).rejects.toMatchObject({ code: 'incomplete-isend-inventory' });
+    expect(mocks.updateStock).not.toHaveBeenCalled();
+  });
+  it('rejects results beyond the bounded provider page even when all rows are returned', async () => {
+    const row = source.returnObject.currentPageData[0];
+    source.returnObject = { totalRecord: 1001, currentPageData: Array.from({ length: 1001 }, () => ({ ...row })) };
+    await expect(runISendInventorySync(options)).rejects.toMatchObject({ code: 'incomplete-isend-inventory' });
+    expect(mocks.updateStock).not.toHaveBeenCalled();
+  });
+  it('blocks a provider page that starts beyond the requested first row', async () => {
+    source.returnObject.currentOffset = 1;
+    await expect(runISendInventorySync(options)).rejects.toMatchObject({ code: 'incomplete-isend-inventory' });
+    expect(mocks.updateStock).not.toHaveBeenCalled();
+  });
+  it('retains ambiguity instead of summing stock across a complete provider page', async () => {
+    source.returnObject.currentPageData.push({ ...source.returnObject.currentPageData[0], availableQty: 0 });
+    source.returnObject.totalRecord = 2;
+    source.returnObject.currentOffset = 0;
+    expect(await runISendInventorySync(options)).toMatchObject({
+      success: false, entries: [{ sku: 'SKU-1', status: 'blocked', reason: 'duplicate-isend-sku' }],
+    });
     expect(mocks.updateStock).not.toHaveBeenCalled();
   });
   it('does not interpret an absent SKU as zero', async () => {

@@ -122,6 +122,7 @@ const mocks = vi.hoisted(() => {
     collections,
     findOptions,
     insertImpl: insert,
+    updateImpl: update,
     resetData,
     wixData: {
       insert: vi.fn(insert),
@@ -133,9 +134,17 @@ const mocks = vi.hoisted(() => {
     getByWixOrderId: vi.fn(),
     getConfiguredISendEnvironment: vi.fn(),
     getWixOrder: vi.fn(),
+    listWixFulfillments: vi.fn(),
     elevate: vi.fn((method) => (...args) => method(...args)),
     saveMapping: vi.fn(),
+    finalizeVerifiedCancellation: vi.fn(),
     sendOrderToISend: vi.fn(),
+    getISendOrderDetails: vi.fn(),
+    cancelISendOrder: vi.fn(),
+    getISendExternalOrderIdentity: vi.fn((order) => ({
+      orderId: order._id || order.id,
+      orderNumber: order.number || order.orderNumber,
+    })),
   };
 });
 
@@ -143,6 +152,7 @@ vi.mock('wix-data', () => ({ default: mocks.wixData }));
 vi.mock('wix-auth', () => ({ elevate: mocks.elevate }));
 vi.mock('wix-ecom-backend', () => ({
   orders: { getOrder: mocks.getWixOrder },
+  orderFulfillments: { listFulfillmentsForSingleOrder: mocks.listWixFulfillments },
 }));
 vi.mock('backend/isendConfig', () => ({
   getConfiguredISendEnvironment: mocks.getConfiguredISendEnvironment,
@@ -150,9 +160,13 @@ vi.mock('backend/isendConfig', () => ({
 vi.mock('backend/isendMappings', () => ({
   getByWixOrderId: mocks.getByWixOrderId,
   saveMapping: mocks.saveMapping,
+  finalizeVerifiedCancellation: mocks.finalizeVerifiedCancellation,
 }));
 vi.mock('backend/isendService', () => ({
   sendOrderToISend: mocks.sendOrderToISend,
+  getISendOrderDetails: mocks.getISendOrderDetails,
+  cancelISendOrder: mocks.cancelISendOrder,
+  getISendExternalOrderIdentity: mocks.getISendExternalOrderIdentity,
 }));
 
 import {
@@ -203,11 +217,16 @@ describe('durable iSend order outbox', () => {
     vi.setSystemTime(withinServiceWindow);
     vi.clearAllMocks();
     mocks.wixData.insert.mockImplementation(mocks.insertImpl);
+    mocks.wixData.update.mockImplementation(mocks.updateImpl);
     mocks.resetData();
     mocks.getByWixOrderId.mockResolvedValue(null);
+    mocks.finalizeVerifiedCancellation.mockResolvedValue(null);
     mocks.getWixOrder.mockImplementation(async () => (
       JSON.parse(JSON.stringify(modernOrderEvent().data.order))
     ));
+    mocks.listWixFulfillments.mockResolvedValue({
+      orderWithFulfillments: { orderId: 'wix-order-1', fulfillments: [] },
+    });
     mocks.getConfiguredISendEnvironment.mockImplementation(async (options = {}) => (
       options.environment || 'staging'
     ));
@@ -215,6 +234,14 @@ describe('durable iSend order outbox', () => {
       success: true,
       returnObject: { custOrderNo: 'ISEND-1001' },
       msgList: { actualAdd: true },
+    });
+    mocks.getISendOrderDetails.mockResolvedValue({
+      success: true, accepted: true, identityVerified: true,
+      orderId: 'wix-order-1', orderNumber: '1001', orderStatus: 'PROCESSING',
+      custOrderNo: 'ISEND-1001',
+    });
+    mocks.cancelISendOrder.mockResolvedValue({
+      success: true, outcome: 'canceled', orderStatus: 'CANCELLED', cancelRequestCount: 1,
     });
     mocks.saveMapping.mockImplementation(async (wixOrderId, iSendOrderNo, meta, environment) => ({
       wixOrderId,
@@ -253,11 +280,11 @@ describe('durable iSend order outbox', () => {
     expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
   });
 
-  it('rejects an event that has an entity ID but no durable order snapshot', async () => {
+  it('hydrates an ID-only approval from the authoritative Wix order', async () => {
     await expect(enqueueISendOrderEvent({
       metadata: { entityId: 'wix-order-1' },
-    }, { now: withinServiceWindow })).rejects.toThrow('without an order snapshot');
-    expect(mocks.collections.ISendOrderOutbox).toHaveLength(0);
+    }, { now: withinServiceWindow })).resolves.toMatchObject({ enqueued: true, item: { wixOrderId: 'wix-order-1' } });
+    expect(mocks.collections.ISendOrderOutbox).toHaveLength(1);
   });
 
   it('converges duplicate event deliveries on one unique order key', async () => {
@@ -468,12 +495,12 @@ describe('durable iSend order outbox', () => {
       processed: 1,
       requiresAttention: 1,
       details: [{
-        status: 'sent',
+        status: 'cancel_pending',
         recoveredFromMapping: true,
       }],
     });
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       iSendOrderNo: 'ISEND-ALREADY-SENT',
       lifecycleRequiresAttention: true,
       attentionReason: 'wix-order-canceled-after-isend-submit',
@@ -596,7 +623,7 @@ describe('durable iSend order outbox', () => {
     expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
   });
 
-  it('keeps an already-sent order sent and raises durable attention when Wix cancels it', async () => {
+  it('durably queues a post-submit cancellation and verifies it in the worker', async () => {
     await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
     await runISendOrderOutbox({ now: withinServiceWindow, limit: 1 });
     const cancellationEvent = modernOrderEvent();
@@ -608,10 +635,10 @@ describe('durable iSend order outbox', () => {
     });
 
     expect(canceled).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       requiresAttention: true,
       item: {
-        status: 'sent',
+        status: 'cancel_pending',
         lifecycleRequiresAttention: true,
         attentionReason: 'wix-order-canceled-after-isend-submit',
       },
@@ -619,7 +646,7 @@ describe('durable iSend order outbox', () => {
     await expect(runISendOrderOutboxJob({
       now: withinServiceWindow,
       limit: 1,
-    })).rejects.toThrow('requires attention for 1 item');
+    })).resolves.toMatchObject({ success: true, details: [{ status: 'canceled' }] });
     expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
   });
 
@@ -647,7 +674,7 @@ describe('durable iSend order outbox', () => {
     expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
   });
 
-  it('quarantines a successful response with no queryable customer order number', async () => {
+  it('reconciles an accepted order while its warehouse number is pending', async () => {
     mocks.sendOrderToISend.mockResolvedValue({
       success: true,
       returnObject: {},
@@ -657,12 +684,11 @@ describe('durable iSend order outbox', () => {
 
     const result = await runISendOrderOutbox({ now: withinServiceWindow, limit: 1 });
 
-    expect(result.details[0]).toMatchObject({ status: 'unknown_outcome' });
+    expect(result.details[0]).toMatchObject({ status: 'reconciling' });
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
-      status: 'unknown_outcome',
-      unknownOutcomeReason: 'successful-response-without-customer-order-number',
-      retryExhausted: true,
-      nextAttemptAt: null,
+      status: 'reconciling',
+      retryExhausted: false,
+      nextAttemptAt: expect.any(Date),
     });
     expect(mocks.saveMapping).not.toHaveBeenCalled();
   });
@@ -677,9 +703,9 @@ describe('durable iSend order outbox', () => {
 
     const result = await runISendOrderOutbox({ now: withinServiceWindow, limit: 1 });
 
-    expect(result.details[0]).toMatchObject({ status: 'unknown_outcome' });
+    expect(result.details[0]).toMatchObject({ status: 'reconciling' });
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
-      unknownOutcomeReason: 'successful-response-without-customer-order-number',
+      status: 'reconciling',
     });
     expect(mocks.saveMapping).not.toHaveBeenCalled();
   });
@@ -948,7 +974,7 @@ describe('durable iSend order outbox', () => {
 
   it('forbids automatic requeue of an unknown outcome even with operator confirmation', async () => {
     mocks.sendOrderToISend.mockResolvedValue({
-      success: true,
+      success: false,
       returnObject: {},
       msgList: { actualAdd: true },
     });
@@ -1002,7 +1028,7 @@ describe('durable iSend order outbox', () => {
 
   it('fails consecutive scheduled jobs for the same durable unknown outcome', async () => {
     mocks.sendOrderToISend.mockResolvedValue({
-      success: true,
+      success: false,
       returnObject: {},
       msgList: { actualAdd: true },
     });
@@ -1129,11 +1155,11 @@ describe('durable iSend order outbox', () => {
     const result = await worker;
 
     expect(result.details[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       iSendOrderNo: 'ISEND-CANCEL-RACE',
     });
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       lifecycleRequiresAttention: true,
       attentionReason: 'wix-order-canceled-during-isend-submit',
     });
@@ -1168,11 +1194,11 @@ describe('durable iSend order outbox', () => {
     const result = await worker;
 
     expect(result.details[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       iSendOrderNo: 'ISEND-1001',
     });
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       lifecycleRequiresAttention: true,
       attentionReason: 'wix-order-canceled-during-isend-submit',
     });
@@ -1205,13 +1231,13 @@ describe('durable iSend order outbox', () => {
     const result = await worker;
 
     expect(result.details[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       iSendOrderNo: 'ISEND-RECOVERED',
       recoveredFromMapping: true,
     });
     expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
     expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
-      status: 'sent',
+      status: 'cancel_pending',
       lifecycleRequiresAttention: true,
       attentionReason: 'wix-order-canceled-during-isend-submit',
     });
@@ -1259,6 +1285,261 @@ describe('durable iSend order outbox', () => {
       lifecycleRequiresAttention: true,
       wixPaymentStatus: 'PARTIALLY_REFUNDED',
     });
+  });
+
+  it('recovers a late warehouse identity without resubmitting AddOrder', async () => {
+    mocks.sendOrderToISend.mockResolvedValue({ success: true, msgList: { actualAdd: true } });
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox({ now: withinServiceWindow });
+    vi.setSystemTime(new Date('2026-07-17T04:06:00Z'));
+    const result = await runISendOrderOutbox();
+    expect(result.details[0].status).toBe('sent');
+    expect(mocks.getISendOrderDetails).toHaveBeenCalledWith('wix-order-1', {
+      environment: 'staging', orderNumber: '1001', reconcileWarehouse: true,
+    });
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+    expect(mocks.saveMapping).toHaveBeenCalledWith('wix-order-1', 'ISEND-1001',
+      expect.any(Object), 'staging');
+  });
+
+  it('does not overwrite cancellation when a stale-processing query loses the race', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent());
+    const current = mocks.collections.ISendOrderOutbox[0];
+    mocks.collections.ISendOrderOutbox[0] = {
+      ...current, status: 'processing', leaseExpiresAt: new Date('2026-07-17T03:00:00Z'),
+    };
+    mocks.wixData.insert.mockImplementation(async (collection, value) => {
+      if (collection === 'ISendOrderOutboxClaims') {
+        const item = mocks.collections.ISendOrderOutbox[0];
+        mocks.collections.ISendOrderOutbox[0] = {
+          ...item, status: 'cancel_pending', cancellationRequestMayHaveSucceeded: true,
+          nextAttemptAt: new Date('2026-07-17T05:00:00Z'), lifecycleRequiresAttention: true,
+          _revision: String(Number(item._revision) + 1),
+        };
+      }
+      return mocks.insertImpl(collection, value);
+    });
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'cancel_pending', cancellationRequestMayHaveSucceeded: true,
+    });
+    expect(mocks.getByWixOrderId).not.toHaveBeenCalled();
+    expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
+  });
+
+  it('fences an expired worker before stale mapping recovery and preserves its cancellation intent', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent());
+    const current = mocks.collections.ISendOrderOutbox[0];
+    mocks.collections.ISendOrderOutbox[0] = {
+      ...current, status: 'processing', leaseExpiresAt: new Date('2026-07-17T03:00:00Z'),
+    };
+    mocks.getByWixOrderId.mockResolvedValue({ wixOrderId: 'wix-order-1', iSendOrderNo: 'ISEND-1001', environment: 'staging' });
+    mocks.getWixOrder.mockImplementation(async () => {
+      const event = modernOrderEvent();
+      event.metadata.id = 'cancel-stale-recovery';
+      event.data.order.status = 'CANCELED';
+      expect(await cancelISendOrderEvent(event)).toMatchObject({ deferred: true });
+      return modernOrderEvent().data.order;
+    });
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'canceled', cancellationOutcome: 'canceled',
+    });
+    expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
+    expect(mocks.cancelISendOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries mapping finalization by read-back when upstream cancellation already succeeded', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent());
+    await runISendOrderOutbox();
+    await cancelISendOrderEvent({ metadata: { entityId: 'wix-order-1', id: 'cancel-mapping-failure' } });
+    mocks.finalizeVerifiedCancellation.mockRejectedValueOnce(new Error('mapping lock busy'));
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'cancel_pending', cancellationRequestMayHaveSucceeded: true,
+    });
+    vi.setSystemTime(new Date('2026-07-17T04:06:00Z'));
+    await runISendOrderOutbox();
+    expect(mocks.cancelISendOrder.mock.calls.map((call) => call[1].readOnly)).toEqual([false, true]);
+    expect(mocks.finalizeVerifiedCancellation).toHaveBeenLastCalledWith('wix-order-1', 'staging', {
+      iSendOrderNo: 'ISEND-1001', verifiedAt: expect.any(Date),
+    });
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('canceled');
+  });
+
+  it('keeps missing or mismatched platform identity pending without Add or a mapping', async () => {
+    mocks.sendOrderToISend.mockResolvedValue({ success: true, msgList: { actualAdd: true } });
+    mocks.getISendOrderDetails.mockResolvedValue({
+      accepted: false, identityVerified: false, custOrderNo: 'WRONG-ORDER',
+      reason: 'platform-order-identity-mismatch',
+    });
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    vi.setSystemTime(new Date('2026-07-17T04:06:00Z'));
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('reconciling');
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+    expect(mocks.saveMapping).not.toHaveBeenCalled();
+  });
+
+  it('cancels an accepted order even while its warehouse identity is pending', async () => {
+    mocks.sendOrderToISend.mockResolvedValue({ success: true, msgList: { actualAdd: true } });
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    await cancelISendOrderEvent({ entity: { orderId: 'wix-order-1' }, metadata: { id: 'cancel-id-only' } });
+    await runISendOrderOutbox();
+    expect(mocks.cancelISendOrder).toHaveBeenCalledWith('wix-order-1', {
+      environment: 'staging', orderNumber: '1001', readOnly: false,
+    });
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'canceled', cancellationOutcome: 'canceled', upstreamCanceledAt: expect.any(Date),
+    });
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+  });
+
+  it('only reads back after an ambiguous cancellation instead of repeating the mutation', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    await cancelISendOrderEvent({ metadata: { entityId: 'wix-order-1', id: 'cancel-timeout' } });
+    mocks.cancelISendOrder.mockRejectedValueOnce(Object.assign(new Error('network timeout'), { isendPhase: 'cancel' }));
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'cancel_pending', cancellationRequestMayHaveSucceeded: true,
+    });
+    vi.setSystemTime(new Date('2026-07-17T04:06:00Z'));
+    await runISendOrderOutbox();
+    expect(mocks.cancelISendOrder.mock.calls.map((call) => call[1].readOnly)).toEqual([false, true]);
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('canceled');
+  });
+
+  it('retries a cancellation only when failure was definitively before the request', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    await cancelISendOrderEvent({ metadata: { entityId: 'wix-order-1', id: 'cancel-login' } });
+    mocks.cancelISendOrder.mockRejectedValueOnce(Object.assign(new Error('login unavailable'), { isendPhase: 'login' }));
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0].cancellationRequestMayHaveSucceeded).toBe(false);
+    vi.setSystemTime(new Date('2026-07-17T04:06:00Z'));
+    await runISendOrderOutbox();
+    expect(mocks.cancelISendOrder.mock.calls.map((call) => call[1].readOnly)).toEqual([false, false]);
+  });
+
+  it('keeps a refused upstream cancellation visible without claiming it was canceled', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    await cancelISendOrderEvent({ metadata: { entityId: 'wix-order-1', id: 'cancel-shipped' } });
+    mocks.cancelISendOrder.mockResolvedValue({ success: false, outcome: 'rejected', orderStatus: 'DELIVERED', cancelRequestCount: 0 });
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'cancel_pending', retryExhausted: true, nextAttemptAt: null,
+      lifecycleRequiresAttention: true, attentionReason: 'isend-cancellation-rejected',
+    });
+    vi.setSystemTime(new Date('2026-07-17T05:00:00Z'));
+    await expect(runISendOrderOutboxJob()).rejects.toThrow('requires attention for 1 item');
+    expect(mocks.cancelISendOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('hydrates an ID-only full-refund event and durably queues cancellation', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    mocks.getWixOrder.mockResolvedValue({ ...modernOrderEvent().data.order, paymentStatus: 'FULLY_REFUNDED' });
+    const result = await refreshISendOrderEvent({ entity: { orderId: 'wix-order-1' }, metadata: { id: 'full-refund' } });
+    expect(result.status).toBe('cancel_pending');
+    expect(mocks.collections.ISendOrderLifecycleIntents[0].wixPaymentStatus).toBe('FULLY_REFUNDED');
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('canceled');
+  });
+
+  it('keeps a partial refund as manual review without canceling the remaining order', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    await runISendOrderOutbox();
+    const event = modernOrderEvent();
+    event.metadata.id = 'partial-refund';
+    event.data.order.paymentStatus = 'PARTIALLY_REFUNDED';
+    await refreshISendOrderEvent(event);
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0]).toMatchObject({
+      status: 'sent', lifecycleRequiresAttention: true,
+      attentionReason: 'wix-order-refund-review-after-isend-submit',
+    });
+    expect(mocks.cancelISendOrder).not.toHaveBeenCalled();
+  });
+
+  it('replays a cancellation landing after the final intent read while the claim is held', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    let injected = false;
+    mocks.wixData.update.mockImplementation(async (collection, value, options) => {
+      if (collection === 'ISendOrderOutbox' && value.status === 'sent' && !injected) {
+        injected = true;
+        const event = modernOrderEvent();
+        event.metadata.id = 'cancel-final-write-race';
+        event.data.order.status = 'CANCELED';
+        const deferred = await cancelISendOrderEvent(event);
+        expect(deferred.deferred).toBe(true);
+      }
+      return mocks.updateImpl(collection, value, options);
+    });
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('sent');
+    await runISendOrderOutbox();
+    expect(mocks.collections.ISendOrderOutbox[0].status).toBe('canceled');
+    expect(mocks.collections.ISendOrderLifecycleIntents[0].outboxAppliedAt).toEqual(withinServiceWindow);
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+    expect(mocks.cancelISendOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('continues production submission outside the staging MYT window', async () => {
+    const outsideWindow = new Date('2026-07-17T15:00:00Z');
+    vi.setSystemTime(outsideWindow);
+    await enqueueISendOrderEvent(modernOrderEvent(), { environment: 'production' });
+    const result = await runISendOrderOutbox({ environment: 'production' });
+    expect(result).toMatchObject({ success: true, skipped: false, processed: 1 });
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves digital-only purchases to Wix without any warehouse submission', async () => {
+    const order = modernOrderEvent().data.order;
+    order.lineItems = [{ _id: 'download-1', itemType: { preset: 'DIGITAL' }, quantity: 1 }];
+    order.fulfillmentStatus = 'FULFILLED';
+    mocks.getWixOrder.mockResolvedValue(order);
+    await enqueueISendOrderEvent(modernOrderEvent(), { now: withinServiceWindow });
+    const result = await runISendOrderOutbox();
+    expect(result.details[0]).toMatchObject({ status: 'not_required', reason: 'digital-only-order' });
+    expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
+    expect(mocks.saveMapping).not.toHaveBeenCalled();
+  });
+
+  it('submits mixed physical items when only digital downloads are already fulfilled', async () => {
+    const order = modernOrderEvent().data.order;
+    order.lineItems[0]._id = 'physical-1';
+    order.lineItems[0].itemType = { preset: 'PHYSICAL' };
+    order.lineItems.push({ _id: 'download-1', itemType: { preset: 'DIGITAL' }, quantity: 1 });
+    order.fulfillmentStatus = 'PARTIALLY_FULFILLED';
+    mocks.getWixOrder.mockResolvedValue(order);
+    mocks.listWixFulfillments.mockResolvedValue({ orderWithFulfillments: {
+      orderId: order._id,
+      fulfillments: [{ lineItems: [{ _id: 'download-1', quantity: 1 }] }],
+    } });
+    await enqueueISendOrderEvent(modernOrderEvent());
+    const result = await runISendOrderOutbox();
+    expect(result.details[0].status).toBe('sent');
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks mixed orders when fulfillment allocations include physical items', async () => {
+    const order = modernOrderEvent().data.order;
+    order.lineItems[0]._id = 'physical-1';
+    order.lineItems.push({ _id: 'download-1', itemType: { preset: 'DIGITAL' }, quantity: 1 });
+    order.fulfillmentStatus = 'PARTIALLY_FULFILLED';
+    mocks.getWixOrder.mockResolvedValue(order);
+    mocks.listWixFulfillments.mockResolvedValue({ orderWithFulfillments: {
+      orderId: order._id,
+      fulfillments: [{ lineItems: [{ _id: 'physical-1', quantity: 1 }] }],
+    } });
+    await enqueueISendOrderEvent(modernOrderEvent());
+    const result = await runISendOrderOutbox();
+    expect(result.details[0]).toMatchObject({ status: 'retry', retryExhausted: true });
+    expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
   });
 
   it('does no work outside the MYT service window', async () => {
