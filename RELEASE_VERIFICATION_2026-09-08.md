@@ -4,12 +4,15 @@ The owner authorized code fixes, testing, and Wix publication, and selected a ca
 
 ## Candidate checks
 
-- `npm run check`: ESLint, strict inventory TypeScript checking against Wix types, and 631 tests across 28 files passed.
+- `npm run check`: ESLint, strict inventory TypeScript checking against Wix types, and 646 tests across 28 files passed.
 - Wix local preview build completed successfully without forcing past build errors.
 - Provider order dates now use `dd/MM/yyyy HH:mm:ss`. The former unpadded date produced HTTP 400; the corrected real-source submission succeeded.
 - Order `userId` uses the registered merchant identity independently of the API login. Exact production test-order reads through sections 5.4.2 and 5.4.3 passed.
 - Accepted orders without a warehouse number reconcile through read-only lookups. Add is not repeated. Cancellation requires exact `CANCELLED` readback and retires warehouse polling under a mapping lock.
 - Lifecycle tests cover duplicate/ambiguous submissions, cancellation races, stale claims, refunds, and physical versus digital fulfillment allocation.
+- Final browser checks found that existing checkouts retain old product SKUs. Compatibility is restricted to each of the three verified product identities plus its exact former SKU; modern catalog references must belong to Wix Stores. New catalog SKUs remain canonical.
+- The cancellation footer link now appends only the Refund Policy paragraph from Wix's grouped policy text. A real-source check preserved all five original links and verified repeat initialization adds no duplicates.
+- Both webhook and poller fulfillment requests exclude explicitly digital lines from mixed orders while preserving every physical allocation.
 
 ## Live state verified
 

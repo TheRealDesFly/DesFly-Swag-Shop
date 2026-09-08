@@ -11,6 +11,7 @@ import wixData from 'wix-data';
 import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { hasProcessed, markProcessed } from 'backend/isendIdempotency';
 import { getByISendOrderNo } from 'backend/isendMappings';
+import { getISendPhysicalLineItems } from 'backend/isendOrderItems';
 import {
   createISendSingleParcelFulfillment,
   extractISendParcelContractMetadata,
@@ -407,12 +408,10 @@ export async function handleWebhook(request) {
 
       // The eCommerce Orders API returns the Order directly, including GUID line-item IDs.
       const wixOrder = await getOrder(wixOrderId);
-      const lineItems = Array.isArray(wixOrder?.lineItems)
-        ? wixOrder.lineItems.map((lineItem) => ({
-          _id: lineItem._id || lineItem.id,
-          quantity: lineItem.quantity,
-        }))
-        : [];
+      const lineItems = getISendPhysicalLineItems(wixOrder).map((lineItem) => ({
+        _id: lineItem._id || lineItem.id,
+        quantity: lineItem.quantity,
+      }));
 
       if (trackingCandidates.length === 0 && payload.tracking) {
         // try common fields

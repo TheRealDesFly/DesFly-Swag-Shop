@@ -5,7 +5,7 @@
  */
 import { fetch } from 'wix-fetch';
 import crypto from 'crypto';
-import { getISendPhysicalLineItems, isISendDigitalOnlyOrder } from 'backend/isendOrderItems';
+import { getISendOrderItemSku, getISendPhysicalLineItems, isISendDigitalOnlyOrder } from 'backend/isendOrderItems';
 import {
   getISendConfig,
   ISEND_ORDER_TIME_ZONE,
@@ -560,10 +560,9 @@ function getAddressValue(shipping, key) {
 }
 
 function getItemSku(item) {
-  const source = item || {};
   // Warehouse submission requires an explicit SKU. Wix catalog/product IDs
   // are internal identifiers and must never be substituted for an iSend SKU.
-  return source.sku || '';
+  return getISendOrderItemSku(item);
 }
 
 function normalizeISendExternalId(value, prefix) {

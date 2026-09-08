@@ -219,6 +219,50 @@ describe('verified provider cancellation', () => {
 });
 
 describe('platform acceptance and physical order routing', () => {
+  const correctedProducts = [
+    ['ca7f27c5-732c-abf0-86e6-55968b50dbae', '604634081598', 'SKU-604634081598'],
+    ['f8e036e5-adc1-113a-69f0-89a72a3fa161', '604634365452', 'SKU-604634365452'],
+    ['30c73a7c-bf48-5b9e-ea54-7a4eb5d75379', '604634105454', 'SKU-604634105454'],
+  ];
+  const storesAppId = '1380b703-ce81-ff05-f115-39571d94dfcd';
+
+  it.each(correctedProducts)('maps the verified old modern-checkout SKU for product %s', (productId, previous, current) => {
+    const item = {
+      name: 'Hat', physicalProperties: { sku: previous }, quantity: 1, price: 10,
+      catalogReference: { appId: storesAppId, catalogItemId: productId },
+    };
+    expect(mapOrderToISend(validOrder({ lineItems: [item] }), config).detailList[0].skuNo).toBe(current);
+    expect(item.physicalProperties.sku).toBe(previous);
+  });
+
+  it.each(correctedProducts)('maps the verified old legacy-checkout SKU for product %s', (productId, previous, current) => {
+    const item = { name: 'Hat', productId, sku: previous, quantity: 1, price: 10 };
+    expect(mapOrderToISend(validOrder({ lineItems: [item] }), config).detailList[0].skuNo).toBe(current);
+    expect(item.sku).toBe(previous);
+  });
+
+  it.each([
+    { productId: 'another-product' },
+    { productId: '30c73a7c-bf48-5b9e-ea54-7a4eb5d75379' },
+    { catalogReference: { appId: 'another-catalog-app', catalogItemId: 'ca7f27c5-732c-abf0-86e6-55968b50dbae' } },
+    { catalogReference: { catalogItemId: 'ca7f27c5-732c-abf0-86e6-55968b50dbae' } },
+    { productId: 'ca7f27c5-732c-abf0-86e6-55968b50dbae',
+      catalogReference: { appId: 'another-catalog-app', catalogItemId: 'ca7f27c5-732c-abf0-86e6-55968b50dbae' } },
+    { productId: '30c73a7c-bf48-5b9e-ea54-7a4eb5d75379',
+      catalogReference: { appId: storesAppId, catalogItemId: 'ca7f27c5-732c-abf0-86e6-55968b50dbae' } },
+  ])('does not alias an old SKU without matching verified catalog identity %j', (identity) => {
+    const item = { name: 'Hat', sku: '604634081598', quantity: 1, price: 10, ...identity };
+    expect(mapOrderToISend(validOrder({ lineItems: [item] }), config).detailList[0].skuNo).toBe('604634081598');
+  });
+
+  it('preserves a canonical or unknown SKU and never invents one for a known product', () => {
+    const base = { name: 'Hat', productId: 'ca7f27c5-732c-abf0-86e6-55968b50dbae', quantity: 1, price: 10 };
+    for (const sku of ['SKU-604634081598', 'CUSTOM-SKU']) {
+      expect(mapOrderToISend(validOrder({ lineItems: [{ ...base, sku }] }), config).detailList[0].skuNo).toBe(sku);
+    }
+    expect(() => mapOrderToISend(validOrder({ lineItems: [base] }), config)).toThrow('SKU is required');
+  });
+
   it('accepts a verified platform order while warehouse allocation is not visible', async () => {
     loginThen({ success: true, returnObject: null, msgList: { actualAdd: true } });
     for (let attempt = 0; attempt < 4; attempt += 1) {

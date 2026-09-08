@@ -26,13 +26,15 @@ function addCancellationFooterLink() {
     // These are existing Text elements in the generated master-page types.
     // Match the policy label before changing content; never guess a footer ID.
     const textIds = ['#text44', '#text24', '#text32', '#text33', '#text37', '#text25', '#text36'];
+    const refundParagraph = /<p\b[^>]*>(?:(?!<\/p>)[\s\S])*?refund(?:\s|&nbsp;|&#160;)+policy(?:(?!<\/p>)[\s\S])*?<\/p>/i;
     const policyText = textIds.map((id) => $w(id))
-        .find((element) => /^refund\s+policy$/i.test(String(element.text || '').trim()));
+        .find((element) => refundParagraph.test(String(element.html || '')));
     if (!policyText || !policyText.html || policyText.html.includes(CANCELLATION_REQUEST_URL)) return;
 
     // Clone the existing styled paragraph, keeping the original policy intact.
-    let requestHtml = policyText.html.replace(/refund(?:\s|&nbsp;|&#160;)+policy/i, CANCELLATION_REQUEST_LABEL);
-    if (requestHtml === policyText.html) return;
+    const originalParagraph = policyText.html.match(refundParagraph)[0];
+    let requestHtml = originalParagraph.replace(/refund(?:\s|&nbsp;|&#160;)+policy/i, CANCELLATION_REQUEST_LABEL);
+    if (requestHtml === originalParagraph) return;
     if (/<a\b/i.test(requestHtml)) {
         requestHtml = requestHtml.replace(/<a\b[^>]*>/i, (tag) => (
             tag.replace(/\s+(?:href|target)\s*=\s*(?:"[^"]*"|'[^']*')/gi, '')

@@ -121,6 +121,32 @@ describe('iSend webhook handling', () => {
     warnSpy.mockRestore();
   });
 
+  it.each([
+    { itemType: { preset: 'DIGITAL' } },
+    { lineItemType: 'DIGITAL' },
+  ])('forwards only the physical allocation for a mixed digital/physical tracking webhook: %j', async (digitalType) => {
+    mocks.getOrder.mockResolvedValue({
+      _id: 'wix-order-1', status: 'APPROVED', fulfillmentStatus: 'PARTIALLY_FULFILLED',
+      lineItems: [
+        { _id: 'hat-white', quantity: 2, itemType: { preset: 'PHYSICAL' } },
+        { _id: 'download', quantity: 1, ...digitalType },
+        { _id: 'hat-black', quantity: 1, itemType: { preset: 'PHYSICAL' } },
+      ],
+    });
+    const { request } = signedRequest({
+      eventType: 'tracking.updated', deliveryId: 'mixed-tracking',
+      custOrderNo: 'ORDER123', tracking: { trackingNo: 'TRACK123' },
+    });
+
+    expect(await handleWebhook(request)).toMatchObject({ success: true, status: 200, processed: true });
+    expect(mocks.createFulfillment).toHaveBeenCalledExactlyOnceWith('ORDER123', 'wix-order-1',
+      expect.objectContaining({
+        environment: 'staging', trackingNumber: 'TRACK123',
+        lineItems: [{ _id: 'hat-white', quantity: 2 }, { _id: 'hat-black', quantity: 1 }],
+      }));
+    expect(mocks.markProcessed).toHaveBeenCalledWith('staging:mixed-tracking', expect.any(Object));
+  });
+
   it('verifies the exact raw stream once before parsing', async () => {
     const { request, text } = signedRequest(
       {
