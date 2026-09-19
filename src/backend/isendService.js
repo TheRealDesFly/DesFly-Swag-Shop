@@ -872,10 +872,15 @@ async function queryPlatformOrder(config, session, orderId, options = {}) {
 }
 
 async function recoverWarehouseIdentity(config, session, detail) {
+  const expectedOrderStatus = detail.orderStatus === 'CANCELLED' ? 'CANCELLED' : null;
   const result = await postJson(
     buildSessionUrl(config, session, '/Json/WhseOrder/doQueryOrderPage'),
     {
-      orderQuery: { documentNo: detail.orderNumber, orderOrigin: config.orderOrigin },
+      orderQuery: {
+        documentNo: detail.orderNumber,
+        orderOrigin: config.orderOrigin,
+        ...(expectedOrderStatus ? { orderStatus: expectedOrderStatus } : {}),
+      },
       pageData: { currentLength: 2, currentOffset: 0 },
     }, getSessionHeaders(session),
   );
@@ -887,6 +892,8 @@ async function recoverWarehouseIdentity(config, session, detail) {
   if (result?.success === true && Number(page?.totalRecord) === 1
     && String(row?.documentNo || '').trim() === detail.orderNumber
     && String(row?.orderOrigin || '').trim() === config.orderOrigin
+    && (!expectedOrderStatus
+      || String(row?.orderStatus || '').trim().toUpperCase() === expectedOrderStatus)
     && custOrderNo && custOrderNo.length <= 200) {
     return {
       ...detail, custOrderNo,

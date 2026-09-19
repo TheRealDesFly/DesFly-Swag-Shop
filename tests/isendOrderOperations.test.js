@@ -99,6 +99,50 @@ describe('documented platform order lookup', () => {
     await expect(getISendOrderDetails('wix-order-1', { reconcileWarehouse: true }))
       .resolves.toMatchObject({ accepted: true, custOrderNo: 'WAREHOUSE-1',
         reconciliation: { warehouseIdentityPending: false } });
+    expect(JSON.parse(mocks.fetch.mock.calls[2][1].body).orderQuery).toEqual({
+      documentNo: '1001', orderOrigin: 'WIX',
+    });
+  });
+
+  it('uses the documented CANCELLED warehouse scope after authoritative cancellation', async () => {
+    loginThen(queryResponse({ orderStatus: 'CANCELLED' }), { success: true, returnObject: { totalRecord: 1,
+      currentPageData: [{ documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'CANCELLED',
+        custOrderNo: 'WAREHOUSE-1' }] } });
+    await expect(getISendOrderDetails('wix-order-1', { reconcileWarehouse: true }))
+      .resolves.toMatchObject({ accepted: true, custOrderNo: 'WAREHOUSE-1',
+        reconciliation: { warehouseIdentityPending: false } });
+    expect(JSON.parse(mocks.fetch.mock.calls[2][1].body).orderQuery).toEqual({
+      documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'CANCELLED',
+    });
+  });
+
+  it.each([
+    ['a non-cancelled row', { documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'PROCESSING',
+      custOrderNo: 'WAREHOUSE-1' }],
+    ['a mismatched origin', { documentNo: '1001', orderOrigin: 'OTHER', orderStatus: 'CANCELLED',
+      custOrderNo: 'WAREHOUSE-1' }],
+    ['a mismatched document', { documentNo: '1002', orderOrigin: 'WIX', orderStatus: 'CANCELLED',
+      custOrderNo: 'WAREHOUSE-1' }],
+    ['a missing warehouse identity', { documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'CANCELLED' }],
+    ['an oversized warehouse identity', { documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'CANCELLED',
+      custOrderNo: 'x'.repeat(201) }],
+  ])('keeps cancelled warehouse identity ambiguous for %s', async (_label, row) => {
+    loginThen(queryResponse({ orderStatus: 'CANCELLED' }), { success: true, returnObject: { totalRecord: 1,
+      currentPageData: [row] } });
+    await expect(getISendOrderDetails('wix-order-1', { reconcileWarehouse: true }))
+      .resolves.toMatchObject({ accepted: true, custOrderNo: null,
+        reconciliation: { warehouseIdentityPending: true } });
+  });
+
+  it('keeps duplicate cancelled warehouse rows ambiguous', async () => {
+    loginThen(queryResponse({ orderStatus: 'CANCELLED' }), { success: true, returnObject: { totalRecord: 2,
+      currentPageData: [
+        { documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'CANCELLED', custOrderNo: 'ONE' },
+        { documentNo: '1001', orderOrigin: 'WIX', orderStatus: 'CANCELLED', custOrderNo: 'TWO' },
+      ] } });
+    await expect(getISendOrderDetails('wix-order-1', { reconcileWarehouse: true }))
+      .resolves.toMatchObject({ accepted: true, custOrderNo: null,
+        reconciliation: { warehouseIdentityPending: true } });
   });
 
   it.each([

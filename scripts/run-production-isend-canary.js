@@ -224,10 +224,11 @@ function buildCanaryOrder(config, candidate, now = new Date()) {
   };
 }
 
-async function queryOrder(config, session, orderReference, customerOrderNo) {
+async function queryOrder(config, session, orderReference, customerOrderNo, expectedOrderStatus) {
   const orderQuery = customerOrderNo
     ? { custOrderNo: customerOrderNo, orderOrigin: config.orderOrigin }
     : { documentNo: orderReference, orderOrigin: config.orderOrigin };
+  if (expectedOrderStatus) orderQuery.orderStatus = expectedOrderStatus;
   const { payload } = await postJson(
     `${config.rootUrl}/Json/WhseOrder/doQueryOrderPage`,
     { orderQuery, pageData: { currentLength: 2, currentOffset: 0 } },
@@ -236,14 +237,36 @@ async function queryOrder(config, session, orderReference, customerOrderNo) {
   const rows = Array.isArray(payload?.returnObject?.currentPageData)
     ? payload.returnObject.currentPageData
     : [];
-  const exactRows = rows.filter((row) => String(row?.documentNo || '').trim() === orderReference);
+  const exactRows = payload?.success === true
+    && Number(payload?.returnObject?.totalRecord) === 1
+    && rows.length === 1
+    && String(rows[0]?.documentNo || '').trim() === orderReference
+    && String(rows[0]?.orderOrigin || '').trim() === config.orderOrigin
+    && (!expectedOrderStatus
+      || String(rows[0]?.orderStatus || '').trim().toUpperCase() === expectedOrderStatus)
+    && String(rows[0]?.custOrderNo || '').trim()
+    && String(rows[0].custOrderNo).trim().length <= 200
+    ? rows
+    : [];
   return { payload, exactRows };
 }
 
-async function queryOrderWithRetry(config, session, orderReference, customerOrderNo) {
+async function queryOrderWithRetry(
+  config,
+  session,
+  orderReference,
+  customerOrderNo,
+  expectedOrderStatus,
+) {
   let result;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
-    result = await queryOrder(config, session, orderReference, customerOrderNo);
+    result = await queryOrder(
+      config,
+      session,
+      orderReference,
+      customerOrderNo,
+      expectedOrderStatus,
+    );
     if (result.exactRows.length === 1 || customerOrderNo || attempt === 4) {
       return { ...result, attempt };
     }
@@ -322,6 +345,7 @@ async function executeCanary(config, session, candidate) {
       session,
       orderReference,
       customerOrderNo,
+      'CANCELLED',
     );
     evidence.postCancelQuerySucceeded = postCancel.payload?.success === true;
     const exact = postCancel.exactRows[0];
@@ -402,4 +426,5 @@ module.exports = {
   formatMytDate,
   getProductionConfig,
   hashPrefix,
+  queryOrder,
 };
