@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   getSecret: vi.fn(),
   handleWebhook: vi.fn(),
   requeueISendOrder: vi.fn(),
+  runISendOrderOutboxItem: vi.fn(),
   runPoller: vi.fn(),
   runInventorySync: vi.fn(),
   testISendLogin: vi.fn(),
@@ -47,7 +48,10 @@ vi.mock('backend/isendInventorySync', () => ({
   runISendInventorySync: mocks.runInventorySync,
   InventorySyncError: class extends Error {},
 }));
-vi.mock('backend/isendOrderOutbox', () => ({ requeueISendOrder: mocks.requeueISendOrder }));
+vi.mock('backend/isendOrderOutbox', () => ({
+  requeueISendOrder: mocks.requeueISendOrder,
+  runISendOrderOutboxItem: mocks.runISendOrderOutboxItem,
+}));
 
 import {
   get_testISendLoginFromWix,
@@ -56,6 +60,7 @@ import {
   post_createFulfillmentFromWix,
   post_isendWebhook,
   post_requeueISendOrder,
+  post_runISendOrderOutboxItem,
   post_runISendPoller,
   post_runISendInventorySync,
 } from '../src/backend/http-functions';
@@ -92,6 +97,8 @@ describe('Wix HTTP functions', () => {
       maxAttempts: 5,
       nextAttemptAt: new Date('2026-07-17T04:00:00.000Z'),
     });
+    mocks.runISendOrderOutboxItem.mockResolvedValue({ success: true,
+      orderKey: 'wix-order:wix-order-1', status: 'sent', skipped: false, iSendOrderNo: 'ISEND-1001' });
   });
 
   it('protects the staging diagnostic before touching Wix secrets or iSend', async () => {
@@ -596,6 +603,52 @@ describe('Wix HTTP functions', () => {
     });
 
     expect(response).toMatchObject({ status: 409, body: { success: false } });
+  });
+
+  it('requires the operator recovery secret before executing one ready order', async () => {
+    const request = { headers: { 'x-isend-poller-secret': 'trigger-secret' },
+      body: { text: vi.fn().mockResolvedValue('{"orderKey":"wix-order:wix-order-1"}') } };
+    expect(await post_runISendOrderOutboxItem(request)).toMatchObject({ status: 401 });
+    expect(mocks.runISendOrderOutboxItem).not.toHaveBeenCalled();
+    expect(request.body.text).not.toHaveBeenCalled();
+  });
+
+  it('executes one key and exposes only allowlisted result metadata', async () => {
+    mocks.runISendOrderOutboxItem.mockResolvedValueOnce({ success: true, status: 'sent', skipped: false,
+      iSendOrderNo: 'ISEND-1001', orderSnapshot: { buyer: 'private' }, error: 'sensitive',
+      submissionResponseEvidence: { bodyText: 'private' }, item: { private: true } });
+    const result = await post_runISendOrderOutboxItem({
+      headers: { 'x-isend-recovery-secret': 'recovery-secret' },
+      body: { text: vi.fn().mockResolvedValue('{"orderKey":" wix-order:wix-order-1 "}') },
+    });
+    expect(mocks.runISendOrderOutboxItem).toHaveBeenCalledExactlyOnceWith('wix-order:wix-order-1');
+    expect(result).toMatchObject({ status: 200, body: { success: true, status: 'sent' } });
+    expect(Object.keys(result.body).sort()).toEqual(['iSendOrderNo', 'orderKey', 'skipped', 'status', 'success']);
+  });
+
+  it.each([
+    { orderKey: 'wix-order:wix-order-1', environment: 'production' },
+    { orderKey: 'wix-order:wix-order-1', now: '2099-01-01' },
+    { orderKey: 'wix-order:wix-order-1', confirmNoISendOrder: true },
+    { orderKey: '' },
+  ])('rejects unsupported exact-item execution options %j', async (payload) => {
+    const result = await post_runISendOrderOutboxItem({
+      headers: { 'x-isend-recovery-secret': 'recovery-secret' },
+      body: { text: vi.fn().mockResolvedValue(JSON.stringify(payload)) },
+    });
+    expect(result).toMatchObject({ status: 400 });
+    expect(mocks.runISendOrderOutboxItem).not.toHaveBeenCalled();
+  });
+
+  it('reports an unknown outcome as ineligible without attempting recovery', async () => {
+    mocks.runISendOrderOutboxItem.mockResolvedValueOnce({ success: false, status: 'unknown_outcome',
+      skipped: true, reason: 'order-not-ready' });
+    const result = await post_runISendOrderOutboxItem({
+      headers: { 'x-isend-recovery-secret': 'recovery-secret' },
+      body: { text: vi.fn().mockResolvedValue('{"orderKey":"wix-order:wix-order-1"}') },
+    });
+    expect(result).toMatchObject({ status: 409, body: { success: false, status: 'unknown_outcome', reason: 'order-not-ready' } });
+    expect(mocks.requeueISendOrder).not.toHaveBeenCalled();
   });
 
   it('requires an iSend order identity on the protected fulfillment boundary', async () => {

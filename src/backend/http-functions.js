@@ -14,7 +14,7 @@ import { getConfiguredISendEnvironment } from 'backend/isendConfig';
 import { handleWebhook } from 'backend/isendWebhookHandler';
 import { runPoller } from 'backend/isendPoller';
 import { InventorySyncError, runISendInventorySync } from 'backend/isendInventorySync';
-import { requeueISendOrder } from 'backend/isendOrderOutbox';
+import { requeueISendOrder, runISendOrderOutboxItem } from 'backend/isendOrderOutbox';
 import { getSecret } from 'wix-secrets-backend';
 import { consumeJsonRequestBody, RequestBodyError } from 'backend/requestBody';
 
@@ -411,6 +411,36 @@ export async function post_requeueISendOrder(request) {
       headers: { 'Content-Type': 'application/json' },
       body: { success: false, message: 'Failed to requeue iSend order' },
     });
+  }
+}
+
+/** Operator-only execution of one already-ready row; this cannot requeue it. */
+export async function post_runISendOrderOutboxItem(request) {
+  try {
+    if (!await requireSecretHeader(request, 'x-isend-recovery-secret', 'ISEND_RECOVERY_TRIGGER_SECRET')) {
+      return jsonResponse(401, { success: false, message: 'Unauthorized' });
+    }
+    const { payload } = await consumeJsonRequestBody(request, { allowEmpty: false, maxBytes: 4096 });
+    if (Object.keys(payload).some((key) => key !== 'orderKey')
+      || typeof payload.orderKey !== 'string' || !payload.orderKey.trim()
+      || payload.orderKey.trim().length > 250) {
+      return jsonResponse(400, { success: false, code: 'invalid-order-execution-request' });
+    }
+    const result = await runISendOrderOutboxItem(payload.orderKey.trim());
+    const body = {
+      success: result.success === true,
+      orderKey: payload.orderKey.trim(),
+      skipped: result.skipped === true,
+      ...(typeof result.status === 'string' ? { status: result.status } : {}),
+      ...(typeof result.iSendOrderNo === 'string' ? { iSendOrderNo: result.iSendOrderNo } : {}),
+      ...(['order-not-found', 'order-not-ready', 'outside-service-window'].includes(result.reason)
+        ? { reason: result.reason } : {}),
+    };
+    return jsonResponse(result.reason === 'order-not-found' ? 404 : body.success ? 200 : 409, body);
+  } catch (error) {
+    if (error instanceof SecretConfigurationError) return endpointConfigurationErrorResponse();
+    if (error instanceof RequestBodyError) return requestBodyErrorResponse(error);
+    return jsonResponse(503, { success: false, code: 'order-execution-unavailable' });
   }
 }
 

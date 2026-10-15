@@ -150,6 +150,8 @@ function summarizeError(error) {
     attemptedPaths: error && Array.isArray(error.attemptedPaths)
       ? error.attemptedPaths.slice(0, 5)
       : [],
+    ...(error?.submissionResponseEvidence
+      ? { submissionResponseEvidence: error.submissionResponseEvidence } : {}),
   };
 }
 
@@ -162,6 +164,8 @@ function summarizeResponse(result, iSendOrderNo = null) {
     reason: result && result.reason ? truncate(result.reason, 500) : null,
     iSendOrderNo,
     msgList: result && result.msgList ? result.msgList : null,
+    ...(result?.submissionResponseEvidence
+      ? { submissionResponseEvidence: result.submissionResponseEvidence } : {}),
   };
 }
 
@@ -2326,7 +2330,8 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       claimGeneration,
       'before mapping-failure transition',
     );
-    const details = Object.assign({ iSendOrderNo }, summarizeError(error));
+    const details = Object.assign({ iSendOrderNo }, summarizeError(error),
+      result?.submissionResponseEvidence ? { submissionResponseEvidence: result.submissionResponseEvidence } : {});
     await markUnknownOutcome(
       processingItem,
       'mapping-save-failed-after-submit',
@@ -2357,6 +2362,8 @@ async function processClaimedItem(item, leaseToken, claimGeneration, options, no
       iSendOrderNo,
       mappedWixOrderId: mapping && mapping.wixOrderId,
       mappedISendOrderNo: mapping && mapping.iSendOrderNo,
+      ...(result?.submissionResponseEvidence
+        ? { submissionResponseEvidence: result.submissionResponseEvidence } : {}),
     };
     await assertClaimOwnership(
       item.orderKey,
@@ -2558,6 +2565,44 @@ async function processItem(item, options, now) {
       });
     }
   }
+}
+
+/** Execute one already-ready row through the normal lease and lifecycle checks. */
+export async function runISendOrderOutboxItem(orderKey) {
+  if (typeof orderKey !== 'string' || !orderKey.trim() || orderKey.trim().length > 250) {
+    throw new TypeError('A valid iSend orderKey is required');
+  }
+  const normalizedKey = orderKey.trim();
+  const environment = await getConfiguredISendEnvironment();
+  const now = new Date();
+  const item = await findByOrderKey(normalizedKey);
+  if (!item) return { success: false, orderKey: normalizedKey, skipped: true, reason: 'order-not-found' };
+  assertEnvironmentBinding(item, environment, `iSend outbox item ${normalizedKey}`);
+
+  const serviceWindow = getServiceWindow(now, environment);
+  if (!serviceWindow.withinServiceWindow) {
+    return { success: false, orderKey: normalizedKey, status: item.status,
+      skipped: true, reason: 'outside-service-window' };
+  }
+  const nextAttemptAt = item.nextAttemptAt ? new Date(item.nextAttemptAt).getTime() : NaN;
+  const ready = [OUTBOX_STATUS.PENDING, OUTBOX_STATUS.RETRY, OUTBOX_STATUS.RECONCILING,
+    OUTBOX_STATUS.CANCEL_PENDING].includes(item.status)
+    && !item.retryExhausted && Number.isFinite(nextAttemptAt) && nextAttemptAt <= now.getTime();
+  if (!ready) {
+    return { success: false, orderKey: normalizedKey, status: item.status,
+      skipped: true, reason: 'order-not-ready' };
+  }
+
+  const result = await processItem(item, { environment }, now);
+  const status = result.status || item.status;
+  return {
+    success: !result.error && !result.workerFailure && [OUTBOX_STATUS.SENT,
+      OUTBOX_STATUS.RECONCILING, OUTBOX_STATUS.CANCELED, OUTBOX_STATUS.NOT_REQUIRED].includes(status),
+    orderKey: normalizedKey,
+    status,
+    skipped: Boolean(result.skipped),
+    ...(result.iSendOrderNo ? { iSendOrderNo: result.iSendOrderNo } : {}),
+  };
 }
 
 async function findReadyItems(status, now, limit, environment) {
@@ -2948,5 +2993,6 @@ export default {
   refreshISendOrderEvent,
   requeueISendOrder,
   runISendOrderOutbox,
+  runISendOrderOutboxItem,
   runISendOrderOutboxJob,
 };

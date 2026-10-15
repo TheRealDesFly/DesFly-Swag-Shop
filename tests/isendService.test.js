@@ -245,6 +245,18 @@ describe('iSend diagnostic error classification', () => {
 });
 
 describe('Wix eCommerce order mapping', () => {
+  beforeEach(() => {
+    mocks.fetch.mockReset();
+    mocks.getISendConfig.mockReset();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T04:00:00.000Z'));
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
   it.each([
     ['_createdDate', '2026-07-15T01:02:03.000Z'],
     ['purchasedDate', '2026-07-16T20:05:06.000Z'],
@@ -256,6 +268,40 @@ describe('Wix eCommerce order mapping', () => {
     expect(payload.orderDate).toBe(
       field === '_createdDate' ? '15/07/2026 09:02:03' : '17/07/2026 04:05:06',
     );
+  });
+
+  it.each(['US', 'us', ' US '])('maps %s to the partner-confirmed United States name in both addresses', (country) => {
+    const order = validOrder();
+    order.shippingInfo.shippingDetails.country = country;
+
+    const payload = mapOrderToISend(order, mappingConfig);
+
+    expect(payload.buyerCustAddr.country).toBe('United States');
+    expect(payload.deliverToCustAddr.country).toBe('United States');
+    expect(order.shippingInfo.shippingDetails.country).toBe(country);
+  });
+
+  it('maps the nested Wix US address without changing the order identity', () => {
+    const order = validOrder();
+    delete order.shippingInfo.shippingDetails.country;
+    order.shippingInfo.shippingDetails.address = { country: 'US' };
+
+    const payload = mapOrderToISend(order, mappingConfig);
+
+    expect(payload.buyerCustAddr.country).toBe('United States');
+    expect(payload.deliverToCustAddr.country).toBe('United States');
+    expect(payload.orderId).toBe(order._id);
+    expect(payload.orderNumber).toBe(order.number);
+  });
+
+  it.each(['United States', 'Malaysia', 'Singapore', 'CA'])('preserves the existing country value %s', (country) => {
+    const order = validOrder();
+    order.shippingInfo.shippingDetails.country = country;
+
+    const payload = mapOrderToISend(order, mappingConfig);
+
+    expect(payload.buyerCustAddr.country).toBe(country);
+    expect(payload.deliverToCustAddr.country).toBe(country);
   });
 
   it('normalizes numeric values and permits an explicitly free promotional line in a paid order', () => {
@@ -412,6 +458,42 @@ describe('Wix eCommerce order mapping', () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+
+  it('retains the original rejected Add response body and status without login or cookie headers', async () => {
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    const bodyText = '{\n  "success": false, "returnObject": null, "msgList": {"actualAdd": true, "msgList": [{"msgCode": "Country not exist in Country List!"}]}\n}';
+    const headers = { get: (name) => name === 'content-type' ? 'application/json' : 'private-cookie' };
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({ success: true, returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' } }))
+      .mockResolvedValueOnce({ ok: true, status: 200, headers, text: async () => bodyText });
+
+    const result = await sendOrderToISend(validOrder());
+
+    expect(result.submissionResponseEvidence).toEqual({
+      httpStatus: 200,
+      contentType: 'application/json',
+      bodyText,
+      receivedAt: expect.any(String),
+    });
+    expect(JSON.stringify(result.submissionResponseEvidence)).not.toMatch(/session-id|session-password|private-cookie/);
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['a non-JSON rejection', 400, '<html>invalid country</html>'],
+    ['a JSON HTTP rejection', 422, '{ "success": false, "error": "invalid country" }'],
+  ])('retains the original body for %s without resubmission', async (_label, status, bodyText) => {
+    mocks.getISendConfig.mockResolvedValue(mappingConfig);
+    mocks.fetch
+      .mockResolvedValueOnce(loginResponse({ success: true, returnObject: { sessionId: 'session-id', sessionPassword: 'session-password' } }))
+      .mockResolvedValueOnce({ ok: false, status, headers: { get: () => 'application/json' }, text: async () => bodyText });
+
+    await expect(sendOrderToISend(validOrder())).rejects.toMatchObject({
+      isendPhase: 'submit',
+      submissionResponseEvidence: { httpStatus: status, bodyText },
+    });
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
   });
 
   it('recovers custOrderNo from one exact documented documentNo query after a null add response', async () => {

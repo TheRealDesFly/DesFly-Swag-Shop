@@ -175,6 +175,7 @@ import {
   refreshISendOrderEvent,
   requeueISendOrder,
   runISendOrderOutbox,
+  runISendOrderOutboxItem,
   runISendOrderOutboxJob,
 } from '../src/backend/isendOrderOutbox';
 
@@ -253,6 +254,79 @@ describe('durable iSend order outbox', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('executes only the selected ready row and returns no customer or response data', async () => {
+    const first = modernOrderEvent();
+    const second = modernOrderEvent();
+    second.metadata.id = 'event-2';
+    second.metadata.entityId = 'wix-order-2';
+    second.data.order._id = 'wix-order-2';
+    second.data.order.number = '1002';
+    await enqueueISendOrderEvent(first);
+    await enqueueISendOrderEvent(second);
+    mocks.getWixOrder.mockImplementation(async (id) => (
+      JSON.parse(JSON.stringify(id === 'wix-order-2' ? second.data.order : first.data.order))
+    ));
+    const evidence = { httpStatus: 200, contentType: 'application/json',
+      bodyText: '{ "success": true, "private": "retained body" }', receivedAt: withinServiceWindow.toISOString() };
+    mocks.sendOrderToISend.mockResolvedValue({ success: true,
+      returnObject: { custOrderNo: 'ISEND-1002' }, msgList: { actualAdd: true }, submissionResponseEvidence: evidence });
+
+    const result = await runISendOrderOutboxItem(' wix-order:wix-order-2 ');
+
+    expect(result).toEqual({ success: true, orderKey: 'wix-order:wix-order-2',
+      status: 'sent', skipped: false, iSendOrderNo: 'ISEND-1002' });
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+    expect(mocks.sendOrderToISend.mock.calls[0][0]._id).toBe('wix-order-2');
+    expect(mocks.collections.ISendOrderOutbox.find((item) => item.wixOrderId === 'wix-order-1').status).toBe('pending');
+    expect(mocks.collections.ISendOrderOutbox.find((item) => item.wixOrderId === 'wix-order-2')
+      .responseSummary.submissionResponseEvidence).toEqual(evidence);
+    expect(mocks.getConfiguredISendEnvironment).toHaveBeenLastCalledWith();
+  });
+
+  it.each(['unknown_outcome', 'sent'])('does not execute an ineligible %s row', async (status) => {
+    await enqueueISendOrderEvent(modernOrderEvent());
+    Object.assign(mocks.collections.ISendOrderOutbox[0], { status, retryExhausted: true, nextAttemptAt: null });
+    const result = await runISendOrderOutboxItem('wix-order:wix-order-1');
+    expect(result).toEqual({ success: false, orderKey: 'wix-order:wix-order-1',
+      status, skipped: true, reason: 'order-not-ready' });
+    expect(mocks.sendOrderToISend).not.toHaveBeenCalled();
+    expect(mocks.collections.ISendOrderOutboxClaims).toHaveLength(0);
+  });
+
+  it('preserves the normal lease when two exact-item executions race', async () => {
+    await enqueueISendOrderEvent(modernOrderEvent());
+    const result = await Promise.all([
+      runISendOrderOutboxItem('wix-order:wix-order-1'),
+      runISendOrderOutboxItem('wix-order:wix-order-1'),
+    ]);
+    expect(mocks.sendOrderToISend).toHaveBeenCalledTimes(1);
+    expect(result.filter((item) => item.success)).toHaveLength(1);
+    expect(result.filter((item) => item.skipped)).toHaveLength(1);
+  });
+
+  it('retains the exact new Add response text when its outcome is ambiguous', async () => {
+    const evidence = { httpStatus: 200, contentType: 'application/json', bodyText: '{ "success": false }',
+      receivedAt: withinServiceWindow.toISOString() };
+    mocks.sendOrderToISend.mockResolvedValue({ success: false, msgList: { actualAdd: true },
+      submissionResponseEvidence: evidence });
+    await enqueueISendOrderEvent(modernOrderEvent());
+    const result = await runISendOrderOutboxItem('wix-order:wix-order-1');
+    expect(result).toMatchObject({ success: false, status: 'unknown_outcome' });
+    expect(result).not.toHaveProperty('submissionResponseEvidence');
+    expect(mocks.collections.ISendOrderOutbox[0].unknownOutcomeDetails.submissionResponseEvidence).toEqual(evidence);
+  });
+
+  it('retains a non-JSON or non-OK Add response from a submit error', async () => {
+    const evidence = { httpStatus: 503, contentType: 'text/plain', bodyText: 'Exact response\n',
+      receivedAt: withinServiceWindow.toISOString() };
+    mocks.sendOrderToISend.mockRejectedValue(Object.assign(new Error('upstream error'), {
+      isendPhase: 'submit', submissionResponseEvidence: evidence,
+    }));
+    await enqueueISendOrderEvent(modernOrderEvent());
+    await runISendOrderOutboxItem('wix-order:wix-order-1');
+    expect(mocks.collections.ISendOrderOutbox[0].unknownOutcomeDetails.submissionResponseEvidence).toEqual(evidence);
   });
 
   it('durably normalizes a modern order before any upstream submit', async () => {

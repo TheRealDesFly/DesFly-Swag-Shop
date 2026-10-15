@@ -381,6 +381,12 @@ async function postJson(url, body, headers = {}, options = {}) {
       return { response: fetched, text: responseText };
     },
   );
+  const responseEvidence = options.captureResponse ? {
+    httpStatus: response.status,
+    contentType: response.headers?.get('content-type') || null,
+    bodyText: text,
+    receivedAt: new Date().toISOString(),
+  } : null;
   let data;
   try {
     data = text ? JSON.parse(text) : {};
@@ -394,6 +400,7 @@ async function postJson(url, body, headers = {}, options = {}) {
       ? response.headers.get('content-type')
       : undefined;
     responseError.requestPath = getUrlPath(url);
+    if (responseEvidence) responseError.submissionResponseEvidence = responseEvidence;
     throw responseError;
   }
 
@@ -407,11 +414,12 @@ async function postJson(url, body, headers = {}, options = {}) {
       ? response.headers.get('content-type')
       : undefined;
     responseError.requestPath = getUrlPath(url);
+    if (responseEvidence) responseError.submissionResponseEvidence = responseEvidence;
     throw responseError;
   }
 
   if (options.includeResponse) {
-    return { data, headers: response.headers };
+    return { data, headers: response.headers, ...(responseEvidence ? { responseEvidence } : {}) };
   }
 
   return data;
@@ -423,7 +431,7 @@ function withISendPhase(error, phase) {
   wrapped.name = source.name || wrapped.name;
   wrapped.isendPhase = phase;
   wrapped.cause = error;
-  ['code', 'validationErrors', 'requestPath', 'upstreamStatus', 'upstreamContentType', 'attemptedPaths'].forEach((field) => {
+  ['code', 'validationErrors', 'requestPath', 'upstreamStatus', 'upstreamContentType', 'attemptedPaths', 'submissionResponseEvidence'].forEach((field) => {
     if (source[field] !== undefined) wrapped[field] = source[field];
   });
   return wrapped;
@@ -709,6 +717,13 @@ function validateOrderPayload(payload) {
   return payload;
 }
 
+function getISendCountry(country) {
+  // iStore iSend confirmed this country name for Wix's US country code.
+  return typeof country === 'string' && country.trim().toUpperCase() === 'US'
+    ? 'United States'
+    : country;
+}
+
 function buildCustomerAddress(order, shipping, config) {
   const name = getCustomerName(shipping, order);
   const buyerInfo = order.buyerInfo || {};
@@ -721,7 +736,7 @@ function buildCustomerAddress(order, shipping, config) {
     city: shipping.city || getAddressValue(shipping, 'city'),
     postcode: shipping.zipCode || shipping.postalCode || getAddressValue(shipping, 'postalCode'),
     state: shipping.subdivision || shipping.state || getAddressValue(shipping, 'subdivision'),
-    country: shipping.country || getAddressValue(shipping, 'country'),
+    country: getISendCountry(shipping.country || getAddressValue(shipping, 'country')),
     telNo: shipping.phone || getBuyerPhone(order),
     faxNo: '',
     email: shipping.email || getBuyerEmail(order),
@@ -1083,7 +1098,16 @@ export async function sendOrderToISend(order, options = {}) {
   let createResult;
   try {
     const url = buildSessionUrl(config, session, '/Json/WebApiOrder/doAddWebApiOrder');
-    createResult = await postJson(url, payload, getSessionHeaders(session));
+    const response = await postJson(url, payload, getSessionHeaders(session), {
+      includeResponse: true,
+      captureResponse: true,
+    });
+    // Retain the original Add response before normalization/reconciliation.
+    // Session and authentication headers are deliberately excluded.
+    createResult = {
+      ...response.data,
+      submissionResponseEvidence: response.responseEvidence,
+    };
   } catch (error) {
     throw withISendPhase(error, 'submit');
   }
